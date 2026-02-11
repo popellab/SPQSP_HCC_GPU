@@ -89,7 +89,7 @@
     </Fib>
   </ABM>
   <Molecular>
-    <stepPerSlice>36</stepPerSlice>
+    <stepPerSlice>1</stepPerSlice>  <!-- Implicit CG solver: unconditionally stable, solves entire ABM timestep at once -->
     <biofvm>
       <IFNg>
         <diffusivity>1e-7</diffusivity>

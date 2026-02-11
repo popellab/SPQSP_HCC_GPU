@@ -154,18 +154,24 @@ void collect_chemical_from_agents(
     
     // Get PDE source device pointer
     float* d_pde_sources = g_pde_solver->get_device_source_ptr(substrate_idx);
-    
+
+    // Get voxel size from environment and compute volume (in cm³)
+    const float voxel_size_um = host_api.environment.getProperty<float>("voxel_size");
+    const float voxel_size_cm = voxel_size_um * 1.0e-4f;  // Convert µm to cm
+    const float voxel_volume = voxel_size_cm * voxel_size_cm * voxel_size_cm;  // cm³
+
     // Launch kernel
     int threads = 256;
     int blocks = (agent_count + threads - 1) / threads;
-    
+
     add_sources_from_agents<<<blocks, threads>>>(
         d_pde_sources,
         d_x, d_y, d_z,
         d_source_rates,
         agent_count,
         substrate_idx,
-        grid_x, grid_y, grid_z
+        grid_x, grid_y, grid_z,
+        voxel_volume
     );
     
     cudaDeviceSynchronize();

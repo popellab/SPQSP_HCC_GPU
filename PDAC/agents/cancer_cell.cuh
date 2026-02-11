@@ -926,20 +926,20 @@ FLAMEGPU_AGENT_FUNCTION(cancer_compute_chemical_sources, flamegpu::MessageNone, 
     const int dead = FLAMEGPU->getVariable<int>("dead");
     
     // Dead cells don't produce or consume
-    if (dead == 1 || cell_state == CANCER_PROGENITOR) {
+    if (dead == 1) {
         return flamegpu::ALIVE;
     }
 
-    float TGFB_release;
-    float VEGFA_release;
     // Get base rates from environment
     float CCL2_release = FLAMEGPU->environment.getProperty<float>("PARAM_CCL2_RELEASE");
+    float TGFB_release = 0.0f;
+    float VEGFA_release = 0.0f;
     if (cell_state == CANCER_STEM){
-        float TGFB_release = FLAMEGPU->environment.getProperty<float>("PARAM_STEM_TGFB_RELEASE");
-        float VEGFA_release = FLAMEGPU->environment.getProperty<float>("PARAM_STEM_VEGFA_RELEASE");
+        TGFB_release = FLAMEGPU->environment.getProperty<float>("PARAM_STEM_TGFB_RELEASE");
+        VEGFA_release = FLAMEGPU->environment.getProperty<float>("PARAM_STEM_VEGFA_RELEASE");
     } else if (cell_state == CANCER_PROGENITOR){
-        float TGFB_release = FLAMEGPU->environment.getProperty<float>("PARAM_PROG_TGFB_RELEASE");
-        float VEGFA_release = FLAMEGPU->environment.getProperty<float>("PARAM_PROG_VEGFA_RELEASE");
+        TGFB_release = FLAMEGPU->environment.getProperty<float>("PARAM_PROG_TGFB_RELEASE");
+        VEGFA_release = FLAMEGPU->environment.getProperty<float>("PARAM_PROG_VEGFA_RELEASE");
     }
     float O2_uptake = FLAMEGPU->environment.getProperty<float>("PARAM_O2_UPTAKE");
     float IFNg_uptake = FLAMEGPU->environment.getProperty<float>("PARAM_CANCER_IFNG_UPTAKE");

@@ -21,7 +21,7 @@ SimulationConfig::SimulationConfig()
     , num_tregs(10)
     , num_mdscs(5)
     , abm_out(true)
-    , pde_out(false)
+    , pde_out(true)
     , interval_out(1)
 {
 }

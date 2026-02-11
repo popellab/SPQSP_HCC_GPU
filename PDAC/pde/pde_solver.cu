@@ -154,7 +154,8 @@ __global__ void add_sources_from_agents(
     const float* __restrict__ d_agent_source_rates,
     int num_agents,
     int substrate_idx,
-    int nx, int ny, int nz)
+    int nx, int ny, int nz,
+    float voxel_volume)
 {
     int agent_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (agent_idx >= num_agents) return;
@@ -169,17 +170,20 @@ __global__ void add_sources_from_agents(
     }
     
     float source_rate = d_agent_source_rates[agent_idx];
-    
+
     // Skip if no source
     if (source_rate == 0.0f) return;
-    
+
+    // Convert from amount/(cell*time) to concentration/time by dividing by voxel volume
+    float concentration_rate = source_rate / voxel_volume;
+
     // Compute flat index
     int voxel_idx = z * (nx * ny) + y * nx + x;
     int total_voxels = nx * ny * nz;
     int source_idx = substrate_idx * total_voxels + voxel_idx;
-    
+
     // Atomic add (multiple agents may be in same voxel)
-    atomicAdd(&d_sources[source_idx], source_rate);
+    atomicAdd(&d_sources[source_idx], concentration_rate);
 }
 
 __global__ void add_source_kernel(
@@ -193,14 +197,154 @@ __global__ void add_source_kernel(
 }
 
 // ============================================================================
+// Conjugate Gradient Solver Kernels (Implicit Method)
+// ============================================================================
+
+// Apply the implicit diffusion-decay operator: A*x = (I + dt*λ - dt*D*∇²)x
+__global__ void apply_diffusion_operator(
+    const float* __restrict__ x,
+    float* __restrict__ Ax,
+    int nx, int ny, int nz,
+    float D, float lambda, float dt, float dx)
+{
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int iz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+
+    int idx = iz * (nx * ny) + iy * nx + ix;
+    float x_center = x[idx];
+
+    // Compute Laplacian using 7-point stencil
+    float laplacian = 0.0f;
+    float dx2 = dx * dx;
+
+    // X-direction
+    if (ix > 0) {
+        laplacian += (x[idx - 1] - x_center) / dx2;
+    }
+    if (ix < nx - 1) {
+        laplacian += (x[idx + 1] - x_center) / dx2;
+    }
+
+    // Y-direction
+    if (iy > 0) {
+        laplacian += (x[idx - nx] - x_center) / dx2;
+    }
+    if (iy < ny - 1) {
+        laplacian += (x[idx + nx] - x_center) / dx2;
+    }
+
+    // Z-direction
+    if (iz > 0) {
+        laplacian += (x[idx - nx * ny] - x_center) / dx2;
+    }
+    if (iz < nz - 1) {
+        laplacian += (x[idx + nx * ny] - x_center) / dx2;
+    }
+
+    // Apply operator: A*x = x + dt*λ*x - dt*D*∇²x
+    // (equivalent to: (I + dt*λ - dt*D*∇²)x)
+    Ax[idx] = x_center + dt * lambda * x_center - dt * D * laplacian;
+}
+
+// Vector addition: y = y + alpha*x
+__global__ void vector_axpy(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    float alpha,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] += alpha * x[idx];
+    }
+}
+
+// Vector scaling: y = alpha*x
+__global__ void vector_scale(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    float alpha,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] = alpha * x[idx];
+    }
+}
+
+// Vector copy: dst = src
+__global__ void vector_copy(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = src[idx];
+    }
+}
+
+// Dot product kernel (partial reduction)
+__global__ void dot_product_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ partial_sums,
+    int n)
+{
+    __shared__ float sdata[256];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load and compute partial dot product
+    float sum = 0.0f;
+    if (idx < n) {
+        sum = x[idx] * y[idx];
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Reduce within block
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Write block result
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+// Clamp negative values to zero
+__global__ void clamp_nonnegative(float* __restrict__ x, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n && x[idx] < 0.0f) {
+        x[idx] = 0.0f;
+    }
+}
+
+// ============================================================================
 // PDESolver Implementation
 // ============================================================================
 
-PDESolver::PDESolver(const PDEConfig& config) 
+PDESolver::PDESolver(const PDEConfig& config)
     : config_(config),
       d_concentrations_current_(nullptr),
       d_concentrations_next_(nullptr),
       d_sources_(nullptr),
+      d_cg_r_(nullptr),
+      d_cg_p_(nullptr),
+      d_cg_Ap_(nullptr),
+      d_cg_temp_(nullptr),
+      d_dot_buffer_(nullptr),
+      cg_reduction_blocks_(0),
       h_temp_buffer_(nullptr)
 {
     // Validate config
@@ -216,82 +360,175 @@ PDESolver::~PDESolver() {
     if (d_concentrations_current_) CUDA_CHECK(cudaFree(d_concentrations_current_));
     if (d_concentrations_next_) CUDA_CHECK(cudaFree(d_concentrations_next_));
     if (d_sources_) CUDA_CHECK(cudaFree(d_sources_));
+    if (d_cg_r_) CUDA_CHECK(cudaFree(d_cg_r_));
+    if (d_cg_p_) CUDA_CHECK(cudaFree(d_cg_p_));
+    if (d_cg_Ap_) CUDA_CHECK(cudaFree(d_cg_Ap_));
+    if (d_cg_temp_) CUDA_CHECK(cudaFree(d_cg_temp_));
+    if (d_dot_buffer_) CUDA_CHECK(cudaFree(d_dot_buffer_));
     if (h_temp_buffer_) delete[] h_temp_buffer_;
 }
 
 void PDESolver::initialize() {
     int total_voxels = config_.nx * config_.ny * config_.nz;
     size_t total_size = total_voxels * config_.num_substrates * sizeof(float);
-    
-    // Allocate device memory
+    size_t voxel_size = total_voxels * sizeof(float);
+
+    // Allocate device memory for concentration fields
     CUDA_CHECK(cudaMalloc(&d_concentrations_current_, total_size));
     CUDA_CHECK(cudaMalloc(&d_concentrations_next_, total_size));
     CUDA_CHECK(cudaMalloc(&d_sources_, total_size));
-    
+
     // Initialize to zero
     CUDA_CHECK(cudaMemset(d_concentrations_current_, 0, total_size));
     CUDA_CHECK(cudaMemset(d_concentrations_next_, 0, total_size));
     CUDA_CHECK(cudaMemset(d_sources_, 0, total_size));
-    
+
+    // Allocate CG workspace (per voxel, not per substrate)
+    CUDA_CHECK(cudaMalloc(&d_cg_r_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_cg_p_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_cg_Ap_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_cg_temp_, voxel_size));
+
+    // Allocate reduction buffer for dot products
+    int threads_per_block = 256;
+    cg_reduction_blocks_ = (total_voxels + threads_per_block - 1) / threads_per_block;
+    CUDA_CHECK(cudaMalloc(&d_dot_buffer_, cg_reduction_blocks_ * sizeof(float)));
+
     // Allocate host buffer for transfers
     h_temp_buffer_ = new float[total_voxels];
-    
-    std::cout << "PDE Solver initialized:" << std::endl;
+
+    float cg_workspace_mb = 5.0f * voxel_size / (1024.0f * 1024.0f);
+    std::cout << "PDE Solver initialized (Implicit CG):" << std::endl;
     std::cout << "  Grid: " << config_.nx << "x" << config_.ny << "x" << config_.nz << std::endl;
     std::cout << "  Substrates: " << config_.num_substrates << std::endl;
-    std::cout << "  Total memory: " << (3 * total_size) / (1024.0 * 1024.0) << " MB" << std::endl;
+    std::cout << "  Concentration memory: " << (3 * total_size) / (1024.0 * 1024.0) << " MB" << std::endl;
+    std::cout << "  CG workspace: " << cg_workspace_mb << " MB" << std::endl;
     std::cout << "  PDE timestep: " << config_.dt_pde << " s" << std::endl;
     std::cout << "  Substeps per ABM step: " << config_.substeps_per_abm << std::endl;
 }
 
-void PDESolver::solve_timestep() {
+// Solve implicit system using Conjugate Gradient: A*x = b
+// where A = (I + dt*λ - dt*D*∇²)
+void PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
+    const int n = config_.nx * config_.ny * config_.nz;
+    const int max_iters = 100;  // Usually converges in 10-30 iterations
+    const float tolerance = 1e-6f;
+
     // CUDA grid configuration
-    dim3 block(8, 8, 8);
-    dim3 grid(
-        (config_.nx + block.x - 1) / block.x,
-        (config_.ny + block.y - 1) / block.y,
-        (config_.nz + block.z - 1) / block.z
+    dim3 block_3d(8, 8, 8);
+    dim3 grid_3d(
+        (config_.nx + block_3d.x - 1) / block_3d.x,
+        (config_.ny + block_3d.y - 1) / block_3d.y,
+        (config_.nz + block_3d.z - 1) / block_3d.z
     );
-    
-    int voxels_per_substrate = config_.nx * config_.ny * config_.nz;
-    
-    // Solve for each substrate
+
+    int threads_1d = 256;
+    int blocks_1d = (n + threads_1d - 1) / threads_1d;
+
+    // Helper lambda for dot product (with final reduction on host)
+    auto dot_product = [&](const float* x, const float* y) -> float {
+        dot_product_kernel<<<cg_reduction_blocks_, threads_1d>>>(x, y, d_dot_buffer_, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Final reduction on host
+        std::vector<float> h_partial(cg_reduction_blocks_);
+        CUDA_CHECK(cudaMemcpy(h_partial.data(), d_dot_buffer_,
+                              cg_reduction_blocks_ * sizeof(float), cudaMemcpyDeviceToHost));
+        float sum = 0.0f;
+        for (int i = 0; i < cg_reduction_blocks_; i++) {
+            sum += h_partial[i];
+        }
+        return sum;
+    };
+
+    // Initialize: r = b - A*x0 (where x0 = d_C is current concentration)
+    apply_diffusion_operator<<<grid_3d, block_3d>>>(d_C, d_cg_Ap_,
+                                                     config_.nx, config_.ny, config_.nz,
+                                                     D, lambda, dt, dx);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // r = b - A*x0
+    vector_copy<<<blocks_1d, threads_1d>>>(d_cg_r_, d_rhs, n);
+    vector_axpy<<<blocks_1d, threads_1d>>>(d_cg_r_, d_cg_Ap_, -1.0f, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // p = r
+    vector_copy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_r_, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float rsold = dot_product(d_cg_r_, d_cg_r_);
+    float rs_initial = rsold;
+
+    // CG iteration
+    for (int iter = 0; iter < max_iters; iter++) {
+        // Ap = A*p
+        apply_diffusion_operator<<<grid_3d, block_3d>>>(d_cg_p_, d_cg_Ap_,
+                                                         config_.nx, config_.ny, config_.nz,
+                                                         D, lambda, dt, dx);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // alpha = rsold / (p . Ap)
+        float pAp = dot_product(d_cg_p_, d_cg_Ap_);
+        float alpha = rsold / (pAp + 1e-30f);  // Add epsilon to avoid division by zero
+
+        // x = x + alpha*p
+        vector_axpy<<<blocks_1d, threads_1d>>>(d_C, d_cg_p_, alpha, n);
+
+        // r = r - alpha*Ap
+        vector_axpy<<<blocks_1d, threads_1d>>>(d_cg_r_, d_cg_Ap_, -alpha, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Check convergence
+        float rsnew = dot_product(d_cg_r_, d_cg_r_);
+        float residual_norm = sqrtf(rsnew / (rs_initial + 1e-30f));
+
+        if (residual_norm < tolerance) {
+            // Converged!
+            break;
+        }
+
+        // beta = rsnew / rsold
+        float beta = rsnew / (rsold + 1e-30f);
+
+        // p = r + beta*p
+        vector_scale<<<blocks_1d, threads_1d>>>(d_cg_temp_, d_cg_p_, beta, n);
+        vector_copy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_r_, n);
+        vector_axpy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_temp_, 1.0f, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        rsold = rsnew;
+    }
+
+    // Ensure non-negative concentrations (CG can produce small negative values due to roundoff)
+    clamp_nonnegative<<<blocks_1d, threads_1d>>>(d_C, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void PDESolver::solve_timestep() {
+    int n = config_.nx * config_.ny * config_.nz;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+
+    // Solve for each substrate independently using implicit CG
     for (int sub = 0; sub < config_.num_substrates; sub++) {
         float D = config_.diffusion_coeffs[sub];
         float lambda = config_.decay_rates[sub];
-        
+
         // Pointers to this substrate's data
-        float* C_curr = d_concentrations_current_ + sub * voxels_per_substrate;
-        float* C_next = d_concentrations_next_ + sub * voxels_per_substrate;
-        float* sources = d_sources_ + sub * voxels_per_substrate;
-        
-        // Run substeps (explicit scheme requires small timesteps for stability)
-        for (int step = 0; step < config_.substeps_per_abm; step++) {
-            // Launch diffusion kernel
-            diffusion_reaction_kernel<<<grid, block>>>(
-                C_curr, C_next, sources,
-                config_.nx, config_.ny, config_.nz,
-                D, lambda, config_.dt_pde, config_.voxel_size
-            );
-            CUDA_CHECK(cudaGetLastError());
-            
-            // Swap buffers for next iteration
-            float* temp = C_curr;
-            C_curr = C_next;
-            C_next = temp;
-        }
-        
-        // Copy final result back to current buffer
-        if (config_.substeps_per_abm % 2 == 1) {
-            int threads = 256;
-            int blocks = (voxels_per_substrate + threads - 1) / threads;
-            copy_substrate_kernel<<<blocks, threads>>>(
-                C_next, C_curr, voxels_per_substrate
-            );
-            CUDA_CHECK(cudaGetLastError());
-        }
+        float* C_curr = d_concentrations_current_ + sub * n;
+        float* sources = d_sources_ + sub * n;
+
+        // Build right-hand side: rhs = C^n + dt_abm*S
+        // We solve for the entire ABM timestep at once (implicit method is unconditionally stable!)
+        vector_copy<<<blocks, threads>>>(d_cg_temp_, C_curr, n);
+        vector_axpy<<<blocks, threads>>>(d_cg_temp_, sources, config_.dt_abm, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Solve implicit system: (I + dt*λ - dt*D*∇²)C^(n+1) = rhs
+        // using dt = dt_abm (entire ABM timestep, no substeps needed!)
+        solve_implicit_cg(C_curr, d_cg_temp_, D, lambda, config_.dt_abm, config_.voxel_size);
     }
-    
+
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 

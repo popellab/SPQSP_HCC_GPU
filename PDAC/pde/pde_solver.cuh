@@ -78,24 +78,35 @@ public:
     
 private:
     PDEConfig config_;
-    
+
     // Device memory
     float* d_concentrations_current_;   // [num_substrates][nz][ny][nx]
-    float* d_concentrations_next_;      // Double buffering
+    float* d_concentrations_next_;      // Double buffering (for output)
     float* d_sources_;                   // [num_substrates][nz][ny][nx]
-    
+
+    // CG solver workspace (per voxel, not per substrate)
+    float* d_cg_r_;      // Residual vector
+    float* d_cg_p_;      // Search direction
+    float* d_cg_Ap_;     // A*p product
+    float* d_cg_temp_;   // Temporary storage
+    float* d_dot_buffer_; // Reduction buffer for dot products
+    int cg_reduction_blocks_;
+
     // Host memory (for transfers)
     float* h_temp_buffer_;
-    
+
     // Internal indexing
     inline int idx(int x, int y, int z) const {
         return z * (config_.nx * config_.ny) + y * config_.nx + x;
     }
-    
+
     inline int idx_substrate(int x, int y, int z, int substrate) const {
         return substrate * (config_.nx * config_.ny * config_.nz) + idx(x, y, z);
     }
-    
+
+    // CG solver internals
+    void solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx);
+
     // Swap current and next buffers
     void swap_buffers();
 };
@@ -133,7 +144,42 @@ __global__ void add_sources_from_agents(
     const float* __restrict__ d_agent_source_rates,
     int num_agents,
     int substrate_idx,
-    int nx, int ny, int nz);
+    int nx, int ny, int nz,
+    float voxel_volume);
+
+// CG solver kernels
+__global__ void apply_diffusion_operator(
+    const float* __restrict__ x,
+    float* __restrict__ Ax,
+    int nx, int ny, int nz,
+    float D, float lambda, float dt, float dx);
+
+__global__ void vector_axpy(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    float alpha,
+    int n);
+
+__global__ void vector_scale(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    float alpha,
+    int n);
+
+__global__ void vector_copy(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int n);
+
+__global__ void dot_product_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ partial_sums,
+    int n);
+
+__global__ void clamp_nonnegative(
+    float* __restrict__ x,
+    int n);
 
 } // namespace PDAC
 
