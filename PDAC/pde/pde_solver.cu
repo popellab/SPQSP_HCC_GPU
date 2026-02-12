@@ -2,6 +2,8 @@
 #include <iostream>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
+#include <numeric>
 
 namespace PDAC {
 
@@ -159,28 +161,37 @@ __global__ void add_sources_from_agents(
 {
     int agent_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (agent_idx >= num_agents) return;
-    
+
     int x = d_agent_x[agent_idx];
     int y = d_agent_y[agent_idx];
     int z = d_agent_z[agent_idx];
-    
+
     // Bounds check
     if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) {
         return;
     }
-    
+
     float source_rate = d_agent_source_rates[agent_idx];
 
     // Skip if no source
     if (source_rate == 0.0f) return;
 
-    // Convert from amount/(cell*time) to concentration/time by dividing by voxel volume
-    float concentration_rate = source_rate / voxel_volume;
+    // Unit conversion:
+    // - Release rates (positive): amount/(cell*time) -> divide by voxel volume to get concentration/time
+    // - Uptake rates (negative): already in correct units -> use as-is
+    float concentration_rate;
+    if (source_rate > 0.0f) {
+        concentration_rate = source_rate / voxel_volume;  // Source: convert units
+    } else {
+        concentration_rate = source_rate;  // Sink: already correct units
+    }
 
     // Compute flat index
     int voxel_idx = z * (nx * ny) + y * nx + x;
-    int total_voxels = nx * ny * nz;
-    int source_idx = substrate_idx * total_voxels + voxel_idx;
+
+    // NOTE: d_sources is already offset to this substrate's data by get_device_source_ptr(),
+    // so we just use voxel_idx, NOT substrate_idx * total_voxels + voxel_idx
+    int source_idx = voxel_idx;
 
     // Atomic add (multiple agents may be in same voxel)
     atomicAdd(&d_sources[source_idx], concentration_rate);
@@ -411,8 +422,8 @@ void PDESolver::initialize() {
 // where A = (I + dt*λ - dt*D*∇²)
 void PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
     const int n = config_.nx * config_.ny * config_.nz;
-    const int max_iters = 100;  // Usually converges in 10-30 iterations
-    const float tolerance = 1e-6f;
+    const int max_iters = 1000;  // Increased for stiff problems (high diffusion coefficients)
+    const float tolerance = 1e-4f;  // Relaxed tolerance for practical convergence
 
     // CUDA grid configuration
     dim3 block_3d(8, 8, 8);
@@ -509,6 +520,10 @@ void PDESolver::solve_timestep() {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
 
+    static int step_count = 0;
+    bool print_debug = (step_count <= 5);  // Print first 5 timesteps for debugging
+    step_count++;
+
     // Solve for each substrate independently using implicit CG
     for (int sub = 0; sub < config_.num_substrates; sub++) {
         float D = config_.diffusion_coeffs[sub];
@@ -523,6 +538,27 @@ void PDESolver::solve_timestep() {
         vector_copy<<<blocks, threads>>>(d_cg_temp_, C_curr, n);
         vector_axpy<<<blocks, threads>>>(d_cg_temp_, sources, config_.dt_abm, n);
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Debug output for O2, TGFB, CCL2, VEGFA (substrates 0, 4, 5, 9)
+        // if (print_debug && (sub == 0 || sub == 4 || sub == 5 || sub == 9)) {
+        //     std::vector<float> h_C(n), h_S(n), h_rhs(n);
+        //     cudaMemcpy(h_C.data(), C_curr, n*sizeof(float), cudaMemcpyDeviceToHost);
+        //     cudaMemcpy(h_S.data(), sources, n*sizeof(float), cudaMemcpyDeviceToHost);
+        //     cudaMemcpy(h_rhs.data(), d_cg_temp_, n*sizeof(float), cudaMemcpyDeviceToHost);
+
+        //     float sum_C = std::accumulate(h_C.begin(), h_C.end(), 0.0f);
+        //     float sum_S = std::accumulate(h_S.begin(), h_S.end(), 0.0f);
+        //     float sum_rhs = std::accumulate(h_rhs.begin(), h_rhs.end(), 0.0f);
+
+        //     const char* sub_name = "UNKNOWN";
+        //     if (sub == 0) sub_name = "O2";
+        //     else if (sub == 4) sub_name = "TGFB";
+        //     else if (sub == 5) sub_name = "CCL2";
+        //     else if (sub == 9) sub_name = "VEGFA";
+
+        //     printf("[PDE Step %d] %s (sub %d): C_total=%.3e, S_total=%.3e, RHS_total=%.3e, dt=%.1f\n",
+        //            step_count - 1, sub_name, sub, sum_C, sum_S, sum_rhs, config_.dt_abm);
+        // }
 
         // Solve implicit system: (I + dt*λ - dt*D*∇²)C^(n+1) = rhs
         // using dt = dt_abm (entire ABM timestep, no substeps needed!)
@@ -626,16 +662,34 @@ void PDESolver::set_initial_concentration(int substrate_idx, float value) {
     if (substrate_idx < 0 || substrate_idx >= config_.num_substrates) {
         throw std::runtime_error("Invalid substrate index");
     }
-    
+
     int voxels = get_total_voxels();
     std::vector<float> init_values(voxels, value);
-    
+
     CUDA_CHECK(cudaMemcpy(
         d_concentrations_current_ + substrate_idx * voxels,
         init_values.data(),
         voxels * sizeof(float),
         cudaMemcpyHostToDevice
     ));
+}
+
+float PDESolver::get_total_source(int substrate_idx) {
+    if (substrate_idx < 0 || substrate_idx >= config_.num_substrates) {
+        return 0.0f;
+    }
+
+    int voxels = get_total_voxels();
+    std::vector<float> h_sources(voxels);
+
+    CUDA_CHECK(cudaMemcpy(
+        h_sources.data(),
+        d_sources_ + substrate_idx * voxels,
+        voxels * sizeof(float),
+        cudaMemcpyDeviceToHost
+    ));
+
+    return std::accumulate(h_sources.begin(), h_sources.end(), 0.0f);
 }
 
 void PDESolver::swap_buffers() {

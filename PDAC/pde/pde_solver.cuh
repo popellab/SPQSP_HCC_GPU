@@ -72,7 +72,10 @@ public:
     
     // Set uniform initial concentration for a substrate
     void set_initial_concentration(int substrate_idx, float value);
-    
+
+    // Get total source for a substrate (for debugging)
+    float get_total_source(int substrate_idx);
+
     // Utility
     int get_total_voxels() const { return config_.nx * config_.ny * config_.nz; }
     

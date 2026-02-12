@@ -130,7 +130,7 @@ void collect_chemical_from_agents(
         h_x[idx] = agent_vec[idx].getVariable<int>("x");
         h_y[idx] = agent_vec[idx].getVariable<int>("y");
         h_z[idx] = agent_vec[idx].getVariable<int>("z");
-        
+
         h_source_rates[idx] = agent_vec[idx].getVariable<float>(source_var_name);
     }
     
@@ -155,10 +155,11 @@ void collect_chemical_from_agents(
     // Get PDE source device pointer
     float* d_pde_sources = g_pde_solver->get_device_source_ptr(substrate_idx);
 
-    // Get voxel size from environment and compute volume (in cm³)
-    const float voxel_size_um = host_api.environment.getProperty<float>("voxel_size");
-    const float voxel_size_cm = voxel_size_um * 1.0e-4f;  // Convert µm to cm
-    const float voxel_volume = voxel_size_cm * voxel_size_cm * voxel_size_cm;  // cm³
+    // Calculate voxel volume in cm^3 for unit conversion
+    // Release rates (amount/cell/time) need division by volume to get concentration/time
+    // Uptake rates are already in correct units and should NOT be divided
+    const float voxel_size_cm = host_api.environment.getProperty<float>("voxel_size") * 1e-4f;  // µm to cm
+    const float voxel_volume = voxel_size_cm * voxel_size_cm * voxel_size_cm;  // cm^3
 
     // Launch kernel
     int threads = 256;
@@ -173,9 +174,9 @@ void collect_chemical_from_agents(
         grid_x, grid_y, grid_z,
         voxel_volume
     );
-    
+
     cudaDeviceSynchronize();
-    
+
     // Cleanup
     cudaFree(d_x);
     cudaFree(d_y);
@@ -190,26 +191,22 @@ void collect_chemical_from_agents(
 FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
     if (!g_pde_solver) return;
     
-    // Read O2 for all agents
+    // Read O2
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_O2, "local_O2");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_O2, "local_O2");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_O2, "local_O2");
     read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_O2, "local_O2");
     
     // Read IFN-gamma
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_IFN, "local_IFNg");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IFN, "local_IFNg");
     
     // Read IL-2
     read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "local_IL2");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_IL2, "local_IL2");
     
     // Read IL-10 (immunosuppressive)
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL10, "local_IL10");
     
     // Read TGF-beta (immunosuppressive)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_TGFB, "local_TGFB");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_TGFB, "local_TGFB");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_TGFB, "local_TGFB");
     read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_TGFB, "local_TGFB");
     
@@ -218,16 +215,13 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
 
     // Read ArgI (MDSC-produced, T cell response modifier)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_ARGI, "local_ArgI");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_ARGI, "local_ArgI");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_ARGI, "local_ArgI");
 
     // Read NO (MDSC-produced, T cell response modifier)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_NO, "local_NO");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_NO, "local_NO");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_NO, "local_NO");
 
     // Read IL-12 (macrophage-produced, T cell activator)
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL12, "local_IL12");
 
     // Read VEGF-A (cancer-produced, pro-angiogenic)
     // read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_VEGFA, "local_VEGFA");
@@ -255,14 +249,14 @@ FLAMEGPU_HOST_FUNCTION(collect_agent_sources) {
     collect_chemical_from_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_O2, "O2_uptake_rate");
     
     // Collect IFN-gamma production from T cells
-    collect_chemical_from_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IFN, "PARAM_IFNG_RELEASE");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IFN, "IFNg_release_rate");
     collect_chemical_from_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_IFN, "IFNg_uptake_rate");
 
     // Collect IL-2 production from T cells
-    collect_chemical_from_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "PARAM_IL2_RELEASE");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "IL2_release_rate");
     
     // Collect IL-2 consumption from Tregs (should be negative)
-    collect_chemical_from_agents(*FLAMEGPU, AGENT_TREG, CHEM_IL2, "PARAM_IL2_UPTAKE");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_TREG, CHEM_IL2, "IL2_uptake_rate");
     
     // Collect IL-10 production from Tregs
     collect_chemical_from_agents(*FLAMEGPU, AGENT_TREG, CHEM_IL10, "PARAM_TREG_IL10_RELEASE");

@@ -28,7 +28,6 @@ __device__ __forceinline__ void get_moore_direction_t(int idx, int& dx, int& dy,
 // Von Neumann mask: only face neighbors (bits 0-5)
 constexpr unsigned int VON_NEUMANN_MASK_T = 0x3Fu;  // binary: 00111111
 
-
 // TCell agent function: Broadcast location
 FLAMEGPU_AGENT_FUNCTION(tcell_broadcast_location, flamegpu::MessageNone, flamegpu::MessageSpatial3D) {
     const int x = FLAMEGPU->getVariable<int>("x");
@@ -37,7 +36,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_broadcast_location, flamegpu::MessageNone, flamegp
     const float voxel_size = FLAMEGPU->environment.getProperty<float>("voxel_size");
 
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
-    FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+    FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getID());
     FLAMEGPU->message_out.setVariable<int>("cell_state", FLAMEGPU->getVariable<int>("cell_state"));
     FLAMEGPU->message_out.setVariable<float>("PDL1", 0.0f);  // T cells don't have PDL1
     FLAMEGPU->message_out.setVariable<int>("voxel_x", x);
@@ -75,8 +74,8 @@ FLAMEGPU_AGENT_FUNCTION(tcell_scan_neighbors, flamegpu::MessageSpatial3D, flameg
     float max_PDL1 = 0.0f;
     int found_progenitor = 0;
 
-    // Per-neighbor counts: [direction][0=cancer, 1=tcell, 2=treg]
-    int neighbor_counts[26][3] = {{0}};
+    // Per-neighbor counts: [direction][0=cancer, 1=tcell, 2=treg, 3=anything else (all big)]
+    int neighbor_counts[26][4] = {{0}};
 
     for (const auto& msg : FLAMEGPU->message_in(my_pos_x, my_pos_y, my_pos_z)) {
         const int msg_x = msg.getVariable<int>("voxel_x");
@@ -121,6 +120,8 @@ FLAMEGPU_AGENT_FUNCTION(tcell_scan_neighbors, flamegpu::MessageSpatial3D, flameg
                 } else if (agent_type == CELL_TYPE_TREG) {
                     treg_count++;
                     neighbor_counts[dir_idx][2]++;
+                } else { //block for all other cells
+                    neighbor_counts[dir_idx][3] = 1;
                 }
             }
         }
@@ -140,7 +141,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_scan_neighbors, flamegpu::MessageSpatial3D, flameg
             int t_count = neighbor_counts[i][1] + neighbor_counts[i][2];
             int max_cap = has_cancer ? MAX_T_PER_VOXEL_WITH_CANCER : MAX_T_PER_VOXEL;
 
-            if (t_count < max_cap) {
+            if ((t_count < max_cap) && (neighbor_counts[i][1] == 0)) {
                 available_neighbors |= (1u << i);
             }
         }
@@ -156,11 +157,58 @@ FLAMEGPU_AGENT_FUNCTION(tcell_scan_neighbors, flamegpu::MessageSpatial3D, flameg
     return flamegpu::ALIVE;
 }
 
+__device__ __forceinline__ float get_PD1_PDL1_TCELL(float PDL1, float Nivo,
+     float T1, float k1, float k2, float k3) {
+    
+    double T2 = PDL1;
+    double a = 1;
+	double b = (Nivo*k2/k1*(2*k3/k1-1) - 2*T2 - T1 - 1/k1)/T2;
+	double c = (Nivo*k2/k1 + 1/k1  +T2 + 2*T1 )/T2;
+	double d = -T1/T2;
+
+	//Newton_Raphson_root
+	int max_iter = 20;
+	double tol_rel = 1E-5;
+	double root = 0;
+	double res, root_new, f, f1;
+	int i = 0;
+	while (i < max_iter){
+		f = a*std::pow(root, 3) + b*std::pow(root, 2)+ c*root + d;
+		f1 = 3.0*a*std::pow(root, 2) + 2.0*b*root + c;
+		root_new = root - f/f1;
+		res = std::abs(root_new - root) / root_new;
+		if (res > tol_rel){
+			i++;
+			root = root_new;
+		}
+		else{
+			break;
+		}
+	}
+
+	return T2*root;
+}
+
+// Helper: Hill equation for PD1-PDL1 suppression
+__device__ __forceinline__ float hill_equation_TCELL(float x, float k50, float n) {
+    if (x <= 0.0f) return 0.0f;
+    const float xn = powf(x, n);
+    const float kn = powf(k50, n);
+    return xn / (kn + xn);
+}
+
+__device__ __forceinline__ float get_PD1_supp_TCELL(float conc, float n, float k50) {
+    return hill_equation_TCELL(conc, k50, n);
+}
+
 // TCell agent function: State transitions
 FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::MessageNone) {
     if (FLAMEGPU->getVariable<int>("dead") == 1) {
         return flamegpu::DEAD;
     }
+
+    // TODO: need coupling from QSP to get this
+    float nivo = 0.0f;
 
     int cell_state = FLAMEGPU->getVariable<int>("cell_state");
 
@@ -173,46 +221,56 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
     }
     FLAMEGPU->setVariable<int>("life", life);
 
+    //Get cell specific parameters
+    const int found_progenitor = FLAMEGPU->getVariable<int>("found_progenitor");
+
     // Get environment parameters
     const float sec_per_slice = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
-    const float IL2_prolif_th = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_PROLIF_THRESHOLD");
-    const float IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IFNG_RELEASE_RATE");
-    const float IL2_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_RELEASE_RATE");
-    const float exhaust_base_PDL1 = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_EXHAUST_BASE_PDL1");
-    const float exhaust_base_Treg = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_EXHAUST_BASE_TREG");
+    const float IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
+    const float IL2_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
+    const float IL2_uptake_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_UPTAKE");
+
+    const float param_cell = FLAMEGPU->environment.getProperty<float>("PARAM_CELL");
+    const float exhaust_base_Treg = FLAMEGPU->environment.getProperty<float>("PARAM_EXHUAST_BASE_TREG");
+
+
+    const float exhaust_base_PDL1 = FLAMEGPU->environment.getProperty<float>("PARAM_EXHUAST_BASE_PDL1");
     const float PD1_PDL1_half = FLAMEGPU->environment.getProperty<float>("PARAM_PD1_PDL1_HALF");
     const float n_PD1_PDL1 = FLAMEGPU->environment.getProperty<float>("PARAM_N_PD1_PDL1");
-    const float param_cell = FLAMEGPU->environment.getProperty<float>("PARAM_PARAM_CELL");
+
 
     // Update IL2 exposure (simplified - would need grid coupling for full implementation)
+    float IL2 = FLAMEGPU->getVariable<float>("local_IL2");
     float IL2_exposure = FLAMEGPU->getVariable<float>("IL2_exposure");
-    // TODO: Get IL2 from molecular grid when coupled
-    // For now, assume some baseline IL2 exposure rate
-    // IL2_exposure += sec_per_slice * local_IL2;
+    IL2_exposure += IL2 * sec_per_slice;
 
     // Effector cells proliferate on IL2 exposure
-    if (IL2_exposure > IL2_prolif_th) {
+    if (IL2_exposure > FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_PROLIF_TH")) {
         FLAMEGPU->setVariable<int>("divide_flag", 1);
+        FLAMEGPU->setVariable<float>("IL2_exposure", 0.0f);
+    } else {
+        FLAMEGPU->setVariable<float>("IL2_exposure",IL2_exposure);
     }
 
     // EFF -> CYT: Found cancer progenitor in neighborhood
     if (cell_state == T_CELL_EFF) {
-        const int found_progenitor = FLAMEGPU->getVariable<int>("found_progenitor");
         if (found_progenitor == 1) {
             FLAMEGPU->setVariable<int>("cell_state", T_CELL_CYT);
             FLAMEGPU->setVariable<int>("divide_flag", 1);
             FLAMEGPU->setVariable<float>("IFNg_release_rate", IFNg_release_rate);
             FLAMEGPU->setVariable<float>("IL2_release_rate", IL2_release_rate);
+            FLAMEGPU->setVariable<float>("IL2_uptake_rate", -IL2_uptake_rate);
             cell_state = T_CELL_CYT;
         }
     }
 
     // CYT state: update release timers and check exhaustion
     if (cell_state == T_CELL_CYT) {
-        // Decrement release timers
+        if (found_progenitor == 0){
+            FLAMEGPU->setVariable<float>("IFNg_release_rate", 0.0f);
+        }
+        // Decrement release timer for IL2
         float IL2_release_remain = FLAMEGPU->getVariable<float>("IL2_release_remain");
-        float IFN_release_remain = FLAMEGPU->getVariable<float>("IFN_release_remain");
-
         if (IL2_release_remain > 0) {
             IL2_release_remain -= sec_per_slice;
             FLAMEGPU->setVariable<float>("IL2_release_remain", IL2_release_remain);
@@ -220,53 +278,43 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
             FLAMEGPU->setVariable<float>("IL2_release_rate", 0.0f);
         }
 
-        if (IFN_release_remain > 0) {
-            IFN_release_remain -= sec_per_slice;
-            FLAMEGPU->setVariable<float>("IFN_release_remain", IFN_release_remain);
-        } else {
-            FLAMEGPU->setVariable<float>("IFNg_release_rate", 0.0f);
-        }
-
         // Check for exhaustion
         const int neighbor_Treg = FLAMEGPU->getVariable<int>("neighbor_Treg_count");
         const int neighbor_all = FLAMEGPU->getVariable<int>("neighbor_all_count");
         const float max_PDL1 = FLAMEGPU->getVariable<float>("max_neighbor_PDL1");
 
-        // Exhaustion from Treg
-        const float q_exh = static_cast<float>(neighbor_Treg) / (neighbor_all + param_cell);
-        const float p_exhaust_treg = 1.0f - powf(exhaust_base_Treg, q_exh);
 
-        // Exhaustion from PDL1 (simplified - using max neighbor PDL1)
-        const float supp = hill_equation(max_PDL1, PD1_PDL1_half, n_PD1_PDL1);
-        const float p_exhaust_pdl1 = 1.0f - powf(exhaust_base_PDL1, supp);
+        bool exhausted = false;
+        if (neighbor_Treg > 0){
+            const float q_exh = static_cast<float>(neighbor_Treg) / (neighbor_all + param_cell);
+            const float p_exhaust_treg = 1.0f - powf(exhaust_base_Treg, q_exh);
 
-        // Probabilistic exhaustion
-        if (p_exhaust_treg > 0.0f || p_exhaust_pdl1 > 0.0f) {
-            float exh_treg_weight = 0.0f;
-            if (p_exhaust_treg > 0.0f && p_exhaust_pdl1 > 0.0f) {
-                exh_treg_weight = logf(1.0f - p_exhaust_treg) /
-                    (logf(1.0f - p_exhaust_treg) + logf(1.0f - p_exhaust_pdl1));
-            }
-
-            const float rnd1 = FLAMEGPU->random.uniform<float>();
-            const float rnd2 = FLAMEGPU->random.uniform<float>();
-            const float rnd3 = FLAMEGPU->random.uniform<float>();
-
-            bool exhausted = false;
-            if (rnd1 < exh_treg_weight && rnd2 < p_exhaust_treg) {
-                exhausted = true;
-            } else if (rnd1 >= exh_treg_weight && rnd3 < p_exhaust_pdl1) {
+            if (FLAMEGPU->random.uniform<float>() < p_exhaust_treg){
                 exhausted = true;
             }
+        }
+        else if (neighbor_all > 0){
+            float bond = get_PD1_PDL1_TCELL(max_PDL1, nivo,
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PD1_SYN"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K1"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K2"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K3"));
+            float supp = get_PD1_supp_TCELL(bond, PD1_PDL1_half, n_PD1_PDL1);
+            float p_exhaust_pdl1 = 1 - powf(exhaust_base_PDL1, supp);
 
-            if (exhausted) {
+            if (FLAMEGPU->random.uniform<float>() < p_exhaust_pdl1){
+                exhausted = true;
+            }
+        }
+
+        if (exhausted) {
                 // Transition to suppressed
                 FLAMEGPU->setVariable<int>("cell_state", T_CELL_SUPP);
                 FLAMEGPU->setVariable<int>("divide_flag", 0);
                 FLAMEGPU->setVariable<int>("divide_limit", 0);
                 FLAMEGPU->setVariable<float>("IFNg_release_rate", 0.0f);
                 FLAMEGPU->setVariable<float>("IL2_release_rate", 0.0f);
-            }
+                FLAMEGPU->setVariable<float>("IL2_uptake_rate", 0.0f);
         }
     }
 
@@ -276,8 +324,6 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
         divide_cd--;
         FLAMEGPU->setVariable<int>("divide_cd", divide_cd);
     }
-
-    FLAMEGPU->setVariable<float>("IL2_exposure", IL2_exposure);
 
     return flamegpu::ALIVE;
 }
@@ -309,7 +355,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_select_move_target, flamegpu::MessageNone, flamegp
 
     if (FLAMEGPU->getVariable<int>("dead") == 1) {
         FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
-        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
         FLAMEGPU->message_out.setVariable<int>("intent_action", INTENT_NONE);
         FLAMEGPU->message_out.setVariable<int>("target_x", -1);
         FLAMEGPU->message_out.setVariable<int>("target_y", -1);
@@ -323,50 +369,62 @@ FLAMEGPU_AGENT_FUNCTION(tcell_select_move_target, flamegpu::MessageNone, flamegp
 
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
 
-    float move_prob;
-    if (cell_state == T_CELL_EFF) {
-        move_prob = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_MOVE_PROB");
-    } else {
-        move_prob = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_CYT_MOVE_PROB");
+    //TODO: Add ECM Check for movement probability
+    float ECM_sat = 0.2;
+
+    // Density too high, do not move, but still broadcast intent for conflict resolution
+    if (FLAMEGPU->random.uniform<float>() < ECM_sat) {
+        // Output dummy message (required)
+        FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_CANCER);
+        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
+        FLAMEGPU->message_out.setVariable<int>("intent_action", INTENT_NONE);
+        FLAMEGPU->message_out.setVariable<int>("target_x", -1);
+        FLAMEGPU->message_out.setVariable<int>("target_y", -1);
+        FLAMEGPU->message_out.setVariable<int>("target_z", -1);
+        FLAMEGPU->message_out.setVariable<int>("source_x", my_x);
+        FLAMEGPU->message_out.setVariable<int>("source_y", my_y);
+        FLAMEGPU->message_out.setVariable<int>("source_z", my_z);
+        FLAMEGPU->message_out.setLocation(-voxel_size, -voxel_size, -voxel_size);
+        return flamegpu::ALIVE;
     }
+
+    // TODO Gradient based chemotaxis/tumble implementation
 
     int target_x = -1, target_y = -1, target_z = -1;
     int intent_action = INTENT_NONE;
 
-    if (FLAMEGPU->random.uniform<float>() < move_prob) {
-        // Use cached available_neighbors mask, but only Von Neumann directions for movement
-        const unsigned int available_all = FLAMEGPU->getVariable<unsigned int>("available_neighbors");
-        const unsigned int available = available_all & VON_NEUMANN_MASK_T;  // Only face neighbors (6 directions)
-        int num_available = __popc(available);
+    // Use cached available_neighbors mask, but only Von Neumann directions for movement
+    const unsigned int available_all = FLAMEGPU->getVariable<unsigned int>("available_neighbors");
+    const unsigned int available = available_all & VON_NEUMANN_MASK_T;  // Only face neighbors (6 directions)
+    int num_available = __popc(available);
 
-        if (num_available > 0) {
-            int selected = FLAMEGPU->random.uniform<int>(0, num_available - 1);
-            int count = 0;
-            for (int i = 0; i < 6; i++) {  // Only iterate through Von Neumann directions
-                if (available & (1u << i)) {
-                    if (count == selected) {
-                        int dx, dy, dz;
-                        get_moore_direction_t(i, dx, dy, dz);
-                        target_x = my_x + dx;
-                        target_y = my_y + dy;
-                        target_z = my_z + dz;
-                        intent_action = INTENT_MOVE;
-                        break;
-                    }
-                    count++;
+    if (num_available > 0) {
+        int selected = FLAMEGPU->random.uniform<int>(0, num_available - 1);
+        int count = 0;
+        for (int i = 0; i < 6; i++) {  // Only iterate through Von Neumann directions
+            if (available & (1u << i)) {
+                if (count == selected) {
+                    int dx, dy, dz;
+                    get_moore_direction_t(i, dx, dy, dz);
+                    target_x = my_x + dx;
+                    target_y = my_y + dy;
+                    target_z = my_z + dz;
+                    intent_action = INTENT_MOVE;
+                    break;
                 }
+                count++;
             }
-
-            FLAMEGPU->setVariable<int>("intent_action", intent_action);
-            FLAMEGPU->setVariable<int>("target_x", target_x);
-            FLAMEGPU->setVariable<int>("target_y", target_y);
-            FLAMEGPU->setVariable<int>("target_z", target_z);
         }
+
+        FLAMEGPU->setVariable<int>("intent_action", intent_action);
+        FLAMEGPU->setVariable<int>("target_x", target_x);
+        FLAMEGPU->setVariable<int>("target_y", target_y);
+        FLAMEGPU->setVariable<int>("target_z", target_z);
     }
 
     // Broadcast intent message with source position for conflict resolution
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
-    FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+    FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
     FLAMEGPU->message_out.setVariable<int>("intent_action", intent_action);
     FLAMEGPU->message_out.setVariable<int>("target_x", target_x);
     FLAMEGPU->message_out.setVariable<int>("target_y", target_y);
@@ -402,7 +460,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_execute_move, flamegpu::MessageSpatial3D, flamegpu
     const int target_x = FLAMEGPU->getVariable<int>("target_x");
     const int target_y = FLAMEGPU->getVariable<int>("target_y");
     const int target_z = FLAMEGPU->getVariable<int>("target_z");
-    const unsigned int my_id = FLAMEGPU->getVariable<unsigned int>("id");
+    const unsigned int my_id = FLAMEGPU->getID();
     const int my_x = FLAMEGPU->getVariable<int>("x");
     const int my_y = FLAMEGPU->getVariable<int>("y");
     const int my_z = FLAMEGPU->getVariable<int>("z");
@@ -430,7 +488,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_execute_move, flamegpu::MessageSpatial3D, flamegpu
             if ((msg_agent_type == CELL_TYPE_T || msg_agent_type == CELL_TYPE_TREG) &&
                 msg_intent == INTENT_MOVE) {
                 // Skip self
-                if (msg_src_x == my_x && msg_src_y == my_y && msg_src_z == my_z) {
+                if (my_id == msg_id) {
                     continue;
                 }
                 // Count agents with higher priority
@@ -443,6 +501,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_execute_move, flamegpu::MessageSpatial3D, flamegpu
     }
 
     // If fewer than MAX_T_PER_VOXEL agents have higher priority, we can move
+    // But if its a cancer voxel, only 1 T Cell can go (we don't know if its a cancer voxel, just location)
     bool can_move = (higher_priority_count < MAX_T_PER_VOXEL);
 
     if (can_move) {
@@ -476,7 +535,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_select_divide_target, flamegpu::MessageNone, flame
 
     if (FLAMEGPU->getVariable<int>("dead") == 1) {
         FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
-        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
         FLAMEGPU->message_out.setVariable<int>("intent_action", INTENT_NONE);
         FLAMEGPU->message_out.setVariable<int>("target_x", -1);
         FLAMEGPU->message_out.setVariable<int>("target_y", -1);
@@ -491,10 +550,11 @@ FLAMEGPU_AGENT_FUNCTION(tcell_select_divide_target, flamegpu::MessageNone, flame
     const int divide_flag = FLAMEGPU->getVariable<int>("divide_flag");
     const int divide_cd = FLAMEGPU->getVariable<int>("divide_cd");
     const int divide_limit = FLAMEGPU->getVariable<int>("divide_limit");
+    int cell_state = FLAMEGPU->getVariable<int>("cell_state");
 
-    if (divide_flag == 0 || divide_cd > 0 || divide_limit <= 0) {
+    if (divide_flag == 0 || divide_cd > 0 || divide_limit <= 0 || cell_state != T_CELL_CYT) {
         FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
-        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
         FLAMEGPU->message_out.setVariable<int>("intent_action", INTENT_NONE);
         FLAMEGPU->message_out.setVariable<int>("target_x", -1);
         FLAMEGPU->message_out.setVariable<int>("target_y", -1);
@@ -539,7 +599,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_select_divide_target, flamegpu::MessageNone, flame
 
     // Broadcast intent message with source position for conflict resolution
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
-    FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+    FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
     FLAMEGPU->message_out.setVariable<int>("intent_action", intent_action);
     FLAMEGPU->message_out.setVariable<int>("target_x", target_x);
     FLAMEGPU->message_out.setVariable<int>("target_y", target_y);
@@ -572,7 +632,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_execute_divide, flamegpu::MessageSpatial3D, flameg
     const int target_x = FLAMEGPU->getVariable<int>("target_x");
     const int target_y = FLAMEGPU->getVariable<int>("target_y");
     const int target_z = FLAMEGPU->getVariable<int>("target_z");
-    const unsigned int my_id = FLAMEGPU->getVariable<unsigned int>("id");
+    const unsigned int my_id = FLAMEGPU->getID();
     const int my_x = FLAMEGPU->getVariable<int>("x");
     const int my_y = FLAMEGPU->getVariable<int>("y");
     const int my_z = FLAMEGPU->getVariable<int>("z");
@@ -698,123 +758,44 @@ FLAMEGPU_AGENT_FUNCTION(tcell_update_chemicals, flamegpu::MessageNone, flamegpu:
     const int voxel_idx = z * (grid_x * grid_y) + y * grid_x + x;
     
     // ========== READ CHEMICAL CONCENTRATIONS FROM PDE ==========
-    
-    const float* d_O2 = reinterpret_cast<const float*>(
-        FLAMEGPU->environment.getProperty<unsigned long long>("pde_concentration_ptr_0"));
-    const float* d_IFN = reinterpret_cast<const float*>(
-        FLAMEGPU->environment.getProperty<unsigned long long>("pde_concentration_ptr_1"));
     const float* d_IL2 = reinterpret_cast<const float*>(
         FLAMEGPU->environment.getProperty<unsigned long long>("pde_concentration_ptr_2"));
-    const float* d_IL10 = reinterpret_cast<const float*>(
-        FLAMEGPU->environment.getProperty<unsigned long long>("pde_concentration_ptr_3"));
-    const float* d_TGFB = reinterpret_cast<const float*>(
-        FLAMEGPU->environment.getProperty<unsigned long long>("pde_concentration_ptr_4"));
-    const float* d_NIVO = reinterpret_cast<const float*>(
-        FLAMEGPU->environment.getProperty<unsigned long long>("pde_concentration_ptr_6"));
     
     // Read concentrations at this voxel
-    float local_O2 = d_O2[voxel_idx];
-    float local_IFNg = d_IFN[voxel_idx];
     float local_IL2 = d_IL2[voxel_idx];
-    float local_IL10 = d_IL10[voxel_idx];
-    float local_TGFB = d_TGFB[voxel_idx];
     // Note: NIVO is managed by QSP model on CPU, not in PDE
 
     // Set local concentration variables
-    FLAMEGPU->setVariable<float>("local_O2", local_O2);
-    FLAMEGPU->setVariable<float>("local_IFNg", local_IFNg);
     FLAMEGPU->setVariable<float>("local_IL2", local_IL2);
-    FLAMEGPU->setVariable<float>("local_IL10", local_IL10);
-    FLAMEGPU->setVariable<float>("local_TGFB", local_TGFB);
     
     // ========== COMPUTE DERIVED STATES ==========
     
-    // 1. Update cumulative IL2 exposure
-    float IL2_exposure = FLAMEGPU->getVariable<float>("IL2_exposure");
-    const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
-    IL2_exposure += local_IL2 * dt;  // Integrate over time
-    FLAMEGPU->setVariable<float>("IL2_exposure", IL2_exposure);
-    
-    // 2. Check if IL2 threshold met for proliferation
-    const float IL2_prolif_threshold = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_PROLIF_THRESHOLD");
-    int can_proliferate = (IL2_exposure > IL2_prolif_threshold) ? 1 : 0;
-    FLAMEGPU->setVariable<int>("can_proliferate", can_proliferate);
-    
-    // 3. Update cumulative suppressive factor exposure
-    float IL10_exposure = FLAMEGPU->getVariable<float>("IL10_exposure");
-    float TGFB_exposure = FLAMEGPU->getVariable<float>("TGFB_exposure");
-    IL10_exposure += local_IL10 * dt;
-    TGFB_exposure += local_TGFB * dt;
-    FLAMEGPU->setVariable<float>("IL10_exposure", IL10_exposure);
-    FLAMEGPU->setVariable<float>("TGFB_exposure", TGFB_exposure);
-    
-    // 4. Compute activation level (suppressed by IL10 and TGF-beta)
-    const float IL10_suppress_EC50 = FLAMEGPU->environment.getProperty<float>("PARAM_IL10_T_CELL_SUPPRESS_EC50");
-    const float TGFB_suppress_EC50 = FLAMEGPU->environment.getProperty<float>("PARAM_TGFB_T_CELL_SUPPRESS_EC50");
-    const float suppression_max = FLAMEGPU->environment.getProperty<float>("PARAM_SUPPRESSION_MAX");
-    
-    float H_IL10 = hill_equation(local_IL10, IL10_suppress_EC50, 2.0f);
-    float H_TGFB = hill_equation(local_TGFB, TGFB_suppress_EC50, 2.0f);
-    
-    // Combined suppression
-    float suppression = suppression_max * (H_IL10 + H_TGFB - H_IL10 * H_TGFB);
-    float activation_level = 1.0f - suppression;
-    activation_level = fmaxf(0.0f, fminf(1.0f, activation_level));
-    
-    FLAMEGPU->setVariable<float>("activation_level", activation_level);
-
-    // 5. PD1 occupancy by Nivolumab (managed by QSP model - placeholder)
-    // TODO: Get NIVO concentration from QSP model via environment property
-    float PD1_occupancy = 0.0f;  // Nivolumab effect handled by CPU-side QSP model
-    FLAMEGPU->setVariable<float>("PD1_occupancy", PD1_occupancy);
+    // 1. Update cumulative IL2 exposure ///// UPDATES IN STATE STEP NOW /////
+    // float IL2_exposure = FLAMEGPU->getVariable<float>("IL2_exposure");
+    // const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
+    // IL2_exposure += local_IL2 * dt;  // Integrate over time
+    // FLAMEGPU->setVariable<float>("IL2_exposure", IL2_exposure);
     
     return flamegpu::ALIVE;
 }
 
 // T Cell agent function: Compute chemical sources
+// Updates in state step now
 FLAMEGPU_AGENT_FUNCTION(tcell_compute_chemical_sources, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
     const int dead = FLAMEGPU->getVariable<int>("dead");
-    const float activation_level = FLAMEGPU->getVariable<float>("activation_level");
     
     // Dead cells don't produce
     if (dead == 1) {
-        FLAMEGPU->setVariable<float>("IFNg_release_rate", 0.0f);
-        FLAMEGPU->setVariable<float>("IL2_release_rate", 0.0f);
-        return flamegpu::ALIVE;
+        return flamegpu::DEAD;
     }
     
     // Get base rates and release timers
-    const float IFNg_base = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE_RATE_BASE");
-    const float IL2_base = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE_RATE_BASE");
-    const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
-    
-    float IFN_remain = FLAMEGPU->getVariable<float>("IFN_release_remain");
-    float IL2_remain = FLAMEGPU->getVariable<float>("IL2_release_remain");
-    
-    // ========== IFN-GAMMA RELEASE ==========
-    float IFN_rate = 0.0f;
-    if ((cell_state == T_CELL_CYT || cell_state == T_CELL_EFF) && IFN_remain > 0.0f) {
-        IFN_rate = IFNg_base * activation_level;
-        
-        // Decrement timer
-        IFN_remain -= dt;
-        if (IFN_remain < 0.0f) IFN_remain = 0.0f;
-        FLAMEGPU->setVariable<float>("IFN_release_remain", IFN_remain);
-    }
-    FLAMEGPU->setVariable<float>("IFNg_release_rate", IFN_rate);
-    
-    // ========== IL-2 RELEASE ==========
-    float IL2_rate = 0.0f;
-    if ((cell_state == T_CELL_CYT || cell_state == T_CELL_EFF) && IL2_remain > 0.0f) {
-        IL2_rate = IL2_base * activation_level;
-        
-        // Decrement timer
-        IL2_remain -= dt;
-        if (IL2_remain < 0.0f) IL2_remain = 0.0f;
-        FLAMEGPU->setVariable<float>("IL2_release_remain", IL2_remain);
-    }
-    FLAMEGPU->setVariable<float>("IL2_release_rate", IL2_rate);
+    // const float IFNg_release = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
+    // const float IL2_release = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
+
+    // FLAMEGPU->setVariable<float>("IFNg_release_rate", IFNg_release);
+    // FLAMEGPU->setVariable<float>("IL2_release_rate", IL2_release);
     
     return flamegpu::ALIVE;
 }

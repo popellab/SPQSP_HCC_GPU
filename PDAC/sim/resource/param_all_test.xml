@@ -163,7 +163,7 @@
       <O2>
         <diffusivity>2.8e-5</diffusivity>
         <uptake>1e-3</uptake>
-        <decayRate>1e-5</decayRate>
+        <decayRate>0</decayRate> <!--1e-5, currently turned off -->
         <molecularWeight>16</molecularWeight>
       </O2>
     </biofvm>

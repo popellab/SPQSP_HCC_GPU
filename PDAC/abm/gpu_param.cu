@@ -245,7 +245,7 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     env.newProperty<int>("PARAM_PROG_DIV_MAX", getInt(PARAM_PROG_DIV_MAX));
     env.newProperty<int>("PARAM_CANCER_MOVE_STEPS", getInt(PARAM_CANCER_MOVE_STEPS));
     env.newProperty<int>("PARAM_CANCER_MOVE_STEPS_STEM", getInt(PARAM_CANCER_MOVE_STEPS_STEM));
-    env.newProperty<float>(" ", getFloat(PARAM_TKILL_SCALAR));
+    env.newProperty<float>("PARAM_TKILL_SCALAR", getFloat(PARAM_TKILL_SCALAR));
     env.newProperty<float>("PARAM_MIN_CC", getFloat(PARAM_MIN_CC));
     env.newProperty<float>("PARAM_C1_CD47", getFloat(PARAM_C1_CD47));
     //T CELL PARAMETERS
@@ -287,20 +287,20 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     env.newProperty<float>("PARAM_VEGFA_DECAY_RATE", getFloat(PARAM_VEGFA_DECAY_RATE));
     env.newProperty<float>("PARAM_O2_DECAY_RATE", getFloat(PARAM_O2_DECAY_RATE));
 
-    env.newProperty<float>("PARAM_IFNG_RELEASE", getFloat(PARAM_IFNG_RELEASE));
-    env.newProperty<float>("PARAM_IL2_RELEASE", getFloat(PARAM_IL2_RELEASE));
-    env.newProperty<float>("PARAM_CCL2_RELEASE", getFloat(PARAM_CCL2_RELEASE));
+    env.newProperty<float>("PARAM_IFNG_RELEASE", getFloat(PARAM_IFNG_RELEASE));              // Cyt TCells
+    env.newProperty<float>("PARAM_IL2_RELEASE", getFloat(PARAM_IL2_RELEASE));                // Cyt TCells
+    env.newProperty<float>("PARAM_CCL2_RELEASE", getFloat(PARAM_CCL2_RELEASE));              // Cancer
     env.newProperty<float>("PARAM_ARGI_RELEASE", getFloat(PARAM_ARGI_RELEASE));
     env.newProperty<float>("PARAM_NO_RELEASE", getFloat(PARAM_NO_RELEASE));
-    env.newProperty<float>("PARAM_TREG_TGFB_RELEASE", getFloat(PARAM_TREG_TGFB_RELEASE));
-    env.newProperty<float>("PARAM_STEM_TGFB_RELEASE", getFloat(PARAM_STEM_TGFB_RELEASE));
-    env.newProperty<float>("PARAM_PROG_TGFB_RELEASE", getFloat(PARAM_PROG_TGFB_RELEASE));
-    env.newProperty<float>("PARAM_TREG_IL10_RELEASE", getFloat(PARAM_TREG_IL10_RELEASE));
+    env.newProperty<float>("PARAM_TREG_TGFB_RELEASE", getFloat(PARAM_TREG_TGFB_RELEASE));    // TRegs
+    env.newProperty<float>("PARAM_STEM_TGFB_RELEASE", getFloat(PARAM_STEM_TGFB_RELEASE));    // Stem Cancer
+    env.newProperty<float>("PARAM_PROG_TGFB_RELEASE", getFloat(PARAM_PROG_TGFB_RELEASE));    // Prog Cancer
+    env.newProperty<float>("PARAM_TREG_IL10_RELEASE", getFloat(PARAM_TREG_IL10_RELEASE));    // TRegs
     env.newProperty<float>("PARAM_IL12_RELEASE", getFloat(PARAM_IL12_RELEASE));
-    env.newProperty<float>("PARAM_STEM_VEGFA_RELEASE", getFloat(PARAM_STEM_VEGFA_RELEASE));
-    env.newProperty<float>("PARAM_PROG_VEGFA_RELEASE", getFloat(PARAM_PROG_VEGFA_RELEASE));
+    env.newProperty<float>("PARAM_STEM_VEGFA_RELEASE", getFloat(PARAM_STEM_VEGFA_RELEASE));  // Stem Cancer
+    env.newProperty<float>("PARAM_PROG_VEGFA_RELEASE", getFloat(PARAM_PROG_VEGFA_RELEASE));  // Prog Cancer
 
-    env.newProperty<float>("PARAM_IL2_UPTAKE", getFloat(PARAM_IL2_UPTAKE));
+    env.newProperty<float>("PARAM_IL2_UPTAKE", getFloat(PARAM_IL2_UPTAKE));      // Cyt TCells
     env.newProperty<float>("PARAM_CCL2_UPTAKE", getFloat(PARAM_CCL2_UPTAKE));
     env.newProperty<float>("PARAM_VEGFA_UPTAKE", getFloat(PARAM_VEGFA_UPTAKE));
     env.newProperty<float>("PARAM_O2_UPTAKE", getFloat(PARAM_O2_UPTAKE));

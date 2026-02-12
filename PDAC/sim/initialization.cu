@@ -27,14 +27,26 @@ SimulationConfig::SimulationConfig()
 }
 
 void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC::GPUParam gpu_params) {
+    // First, get defaults from XML
+    grid_x     = gpu_params.getInt(PARAM_X_SIZE);
+    grid_y     = gpu_params.getInt(PARAM_Y_SIZE);
+    grid_z     = gpu_params.getInt(PARAM_Z_SIZE);
+    voxel_size = gpu_params.getInt(PARAM_VOXEL_SIZE);
+
+    // Then, parse command line to allow overrides
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        
+
         if ((arg == "--param-file" || arg == "-p") && i + 1 < argc);
         //param file already accounted for
         else if ((arg == "--initialization " || arg == "-i") && i + 1 < argc);
         //need to write still
-        else if ((arg == "--steps" || arg == "-s") && i + 1 < argc) {
+        else if ((arg == "--grid-size" || arg == "-g") && i + 1 < argc) {
+            int size = std::atoi(argv[++i]);
+            grid_x = size;
+            grid_y = size;
+            grid_z = size;
+        } else if ((arg == "--steps" || arg == "-s") && i + 1 < argc) {
             steps = std::atoi(argv[++i]);
         } else if ((arg == "--out_abm" || arg == "-oa") && i + 1 < argc) {
             abm_out =  std::atoi(argv[++i]);
@@ -49,6 +61,7 @@ void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC:
                       << "\nOptions:\n"
                       << "  -p, --param-file FILE    Path to parameter XML file [default: param_all_test.xml]\n"
                       << "  -i, --initialization N   initialization type [default: 0] (not implemented)\n"
+                      << "  -g, --grid-size N        Grid dimensions NxNxN [default: from XML]\n"
                       << "  -s, --steps N            Number of simulation steps [default: 200]\n"
                       << "  -oa, --out_abm Bool      Output ABM at interval frequency [default: true]\n"
                       << "  -op, --out_pde Bool      Output PDE at interval frequency [default: true]\n"
@@ -58,11 +71,6 @@ void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC:
             exit(0);
         }
     }
-
-    grid_x     = gpu_params.getInt(PARAM_X_SIZE);
-    grid_y     = gpu_params.getInt(PARAM_Y_SIZE);
-    grid_z     = gpu_params.getInt(PARAM_Z_SIZE);
-    voxel_size = gpu_params.getInt(PARAM_VOXEL_SIZE);
 
     cancer_move_steps = gpu_params.getInt(PARAM_CANCER_MOVE_STEPS);
     tcell_move_steps = gpu_params.getInt(PARAM_TCELL_MOVE_STEPS);
@@ -126,9 +134,11 @@ void initializeCancerCellCluster(
                 // Stem cells at center, progenitors at periphery
                 bool is_stem = (dist < cluster_radius * 0.3f);
                 int cell_state = is_stem ? CANCER_STEM : CANCER_PROGENITOR;
-                int div_cd = is_stem ? 
-                    static_cast<int>(stem_div_interval) : 
-                    static_cast<int>(progenitor_div_interval);
+
+                // Randomize division cooldown from uniform distribution [0.0×interval, 1.0×interval]
+                float base_interval = is_stem ? stem_div_interval : progenitor_div_interval;
+                float random_factor = (static_cast<float>(rand()) / RAND_MAX);  // Range: [0.5, 1.5]
+                int div_cd = static_cast<int>((base_interval * random_factor) + 0.5);
 
                 // Basic identity and state
                 const int id = agent.getID();
@@ -299,23 +309,11 @@ void initializeTCells(
         // Chemical production/exposure
         agent.setVariable<float>("IL2_exposure", 0.0f);
         agent.setVariable<float>("IL2_release_remain", IL2_release_time);
-        agent.setVariable<float>("IFNg_release_remain", IFNg_release_time);
         agent.setVariable<float>("IFNg_release_rate", 0.0f);
         agent.setVariable<float>("IL2_release_rate", 0.0f);
         
         // Local chemical concentrations (from PDE)
-        agent.setVariable<float>("local_O2", 0.001f);
-        agent.setVariable<float>("local_IFNg", 0.0f);
         agent.setVariable<float>("local_IL2", 0.0f);
-        agent.setVariable<float>("local_IL10", 0.0f);
-        agent.setVariable<float>("local_TGFB", 0.0f);
-
-        // Cumulative exposures and functional state
-        agent.setVariable<float>("IL10_exposure", 0.0f);
-        agent.setVariable<float>("TGFB_exposure", 0.0f);
-        agent.setVariable<float>("PD1_occupancy", 0.0f);
-        agent.setVariable<float>("activation_level", 1.0f);
-        agent.setVariable<int>("can_proliferate", 0);
         
         // Neighbor counts
         agent.setVariable<int>("neighbor_cancer_count", 0);
@@ -542,17 +540,17 @@ void initializeAllAgents(
         simulation.setPopulationData(cancer_pop);
     }
     
-    // // Initialize T cells
-    // if (config.num_tcells > 0) {
-    //     flamegpu::AgentVector tcell_pop(model.Agent(AGENT_TCELL));
-    //     initializeTCells(
-    //         tcell_pop, 
-    //         config.grid_x, config.grid_y, config.grid_z,
-    //         config.cluster_radius, config.num_tcells, 
-    //         tcell_life, tcell_div_limit,
-    //         IL2_release_time, IFN_release_time);
-    //     simulation.setPopulationData(tcell_pop);
-    // }
+    // Initialize T cells
+    if (config.num_tcells > 0) {
+        flamegpu::AgentVector tcell_pop(model.Agent(AGENT_TCELL));
+        initializeTCells(
+            tcell_pop, 
+            config.grid_x, config.grid_y, config.grid_z,
+            config.cluster_radius, config.num_tcells, 
+            tcell_life, tcell_div_limit,
+            IL2_release_time, IFN_release_time);
+        simulation.setPopulationData(tcell_pop);
+    }
     
     // // Initialize TRegs
     // if (config.num_tregs > 0) {

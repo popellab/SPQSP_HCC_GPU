@@ -82,12 +82,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_count_neighbors, flamegpu::MessageSpatial3D, flam
     bool neighbor_blocked[26] = {false};
     int neighbor_tcells[26] = {0};
 
-    // DEBUG: Count total messages by type to verify all broadcasts are visible
-    int total_cancer_msgs = 0;
-    int total_tcell_msgs = 0;
-    int total_treg_msgs = 0;
-    int total_mdsc_msgs = 0;
-
     for (const auto& msg : FLAMEGPU->message_in(my_pos_x, my_pos_y, my_pos_z)) {
         const int msg_x = msg.getVariable<int>("voxel_x");
         const int msg_y = msg.getVariable<int>("voxel_y");
@@ -225,7 +219,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_select_move_target, flamegpu::MessageNone, flameg
         // Randomly select one of the available Von Neumann neighbors
         int selected = FLAMEGPU->random.uniform<int>(0, num_available - 1);
         int count = 0;
-        int selected_dir = -1;
         for (int i = 0; i < 6; i++) {  // Only iterate through Von Neumann directions
             if (available & (1u << i)) {
                 if (count == selected) {
@@ -235,7 +228,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_select_move_target, flamegpu::MessageNone, flameg
                     target_y = my_y + dy;
                     target_z = my_z + dz;
                     intent_action = INTENT_MOVE;
-                    selected_dir = i;
                     break;
                 }
                 count++;
@@ -824,6 +816,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_execute_divide, flamegpu::MessageSpatial3D, flame
     }
 
     // Set common daughter variables
+    // This should set to the default value if we don't manually call
     FLAMEGPU->agent_out.setVariable<int>("neighbor_Teff_count", 0);
     FLAMEGPU->agent_out.setVariable<int>("neighbor_Treg_count", 0);
     FLAMEGPU->agent_out.setVariable<int>("neighbor_cancer_count", 0);

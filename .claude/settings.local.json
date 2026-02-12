@@ -5,7 +5,9 @@
       "Bash(./build.sh:*)",
       "Bash(pgrep:*)",
       "Bash(cmake:*)",
-      "Bash(g++:*)"
+      "Bash(g++:*)",
+      "Bash(ls:*)",
+      "Bash(./build/bin/pdac:*)"
     ]
   }
 }

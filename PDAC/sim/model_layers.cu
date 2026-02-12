@@ -124,25 +124,27 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_CANCER_CELL, "check_voxel_packing");
     }
 
+    // TODO: verify that TCells and Tregs do not divide in the model
+    // population won't expand until we include recruitment
     // T cell division (select → execute)
-    {
-        flamegpu::LayerDescription layer = model.newLayer("select_divide_tcell");
-        layer.addAgentFunction(AGENT_TCELL, "select_divide_target");
-    }
-    {
-        flamegpu::LayerDescription layer = model.newLayer("execute_divide_tcell");
-        layer.addAgentFunction(AGENT_TCELL, "execute_divide");
-    }
+    // {
+    //     flamegpu::LayerDescription layer = model.newLayer("select_divide_tcell");
+    //     layer.addAgentFunction(AGENT_TCELL, "select_divide_target");
+    // }
+    // {
+    //     flamegpu::LayerDescription layer = model.newLayer("execute_divide_tcell");
+    //     layer.addAgentFunction(AGENT_TCELL, "execute_divide");
+    // }
 
     // TReg division (select → execute)
-    {
-        flamegpu::LayerDescription layer = model.newLayer("select_divide_treg");
-        layer.addAgentFunction(AGENT_TREG, "select_divide_target");
-    }
-    {
-        flamegpu::LayerDescription layer = model.newLayer("execute_divide_treg");
-        layer.addAgentFunction(AGENT_TREG, "execute_divide");
-    }
+    // {
+    //     flamegpu::LayerDescription layer = model.newLayer("select_divide_treg");
+    //     layer.addAgentFunction(AGENT_TREG, "select_divide_target");
+    // }
+    // {
+    //     flamegpu::LayerDescription layer = model.newLayer("execute_divide_treg");
+    //     layer.addAgentFunction(AGENT_TREG, "execute_divide");
+    // }
 
     {
         flamegpu::LayerDescription layer = model.newLayer("solve_qsp");

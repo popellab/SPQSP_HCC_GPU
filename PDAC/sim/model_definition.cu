@@ -157,20 +157,16 @@ void defineTCellAgent(flamegpu::ModelDescription& model, bool include_state_divi
     tcell.newVariable<int>("divide_limit", 10);
 
     // Molecular exposure
-    tcell.newVariable<float>("local_O2", 0.0f);
-    tcell.newVariable<float>("local_IFNg", 0.0f);
     tcell.newVariable<float>("local_IL2", 0.0f);
-    tcell.newVariable<float>("local_IL10", 0.0f);        // From Tregs (suppressive)
-    tcell.newVariable<float>("local_TGFB", 0.0f);        // From Tregs (suppressive)
-    tcell.newVariable<float>("local_ArgI", 0.0f);        // From MDSCs (T cell suppression)
-    tcell.newVariable<float>("local_NO", 0.0f);          // From MDSCs (T cell suppression)
-    tcell.newVariable<float>("local_IL12", 0.0f);        // From macrophages (T cell activation)
+
+    // Molecular state (affects behavior)
+    tcell.newVariable<float>("PDL1_syn", 0.0f);
 
     // Chemical production/release
     tcell.newVariable<float>("IFNg_release_rate", 0.0f);  // Current release rate (mol/s)
     tcell.newVariable<float>("IL2_release_rate", 0.0f);   // Current release rate (mol/s)
-    tcell.newVariable<float>("IFN_release_remain", 0.0f); // Time remaining to release IFN (s)
     tcell.newVariable<float>("IL2_release_remain", 0.0f); // Time remaining to release IL2 (s)
+    tcell.newVariable<float>("IL2_uptake_rate", 0.0f);
 
     // Molecular exposure (cumulative for decisions)
     tcell.newVariable<float>("IL2_exposure", 0.0f);       // Cumulative IL2 exposure
@@ -265,6 +261,9 @@ void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divid
     treg.newVariable<float>("TGFB_release_rate", 0.0f);
     treg.newVariable<float>("IL2_consumption_rate", 0.0f); // Tregs consume IL2
 
+    // Molecular state (affects behavior)
+    treg.newVariable<float>("PDL1_syn", 0.0f);
+
     // Molecular exposure
     treg.newVariable<float>("IL2_exposure", 0.0f);
 
@@ -348,6 +347,9 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
     // Functional state
     mdsc.newVariable<float>("suppression_radius", 1.0f); // Local suppression range
     mdsc.newVariable<float>("activation_level", 1.0f);   // Activity level
+
+    // Molecular state (affects behavior)
+    mdsc.newVariable<float>("PDL1_syn", 0.0f);
 
     // Chemotaxis state (for directed migration)
     mdsc.newVariable<float>("CCL2_gradient_x", 0.0f);
