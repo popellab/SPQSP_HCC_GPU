@@ -208,6 +208,152 @@ __global__ void add_source_kernel(
 }
 
 // ============================================================================
+// Diagonal Preconditioner Kernels
+// ============================================================================
+
+// Compute diagonal preconditioner M^{-1} for operator A = I + dt*λ - dt*D*∇²
+// Diagonal: M[i] = 1 + dt*λ + 6*dt*D/dx² (for interior points, approx for boundary)
+// Store inverse: M^{-1}[i] = 1 / M[i]
+__global__ void compute_diagonal_preconditioner_inv(
+    float* __restrict__ M_inv,
+    float D, float lambda, float dt, float dx,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float dx2 = dx * dx;
+    float diag = 1.0f + dt * lambda + 6.0f * dt * D / dx2;
+    M_inv[i] = 1.0f / diag;
+}
+
+// Apply diagonal preconditioner: z = M^{-1} * r (element-wise multiplication)
+__global__ void apply_diagonal_preconditioner(
+    const float* __restrict__ M_inv,
+    const float* __restrict__ r,
+    float* __restrict__ z,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    z[i] = M_inv[i] * r[i];
+}
+
+// ============================================================================
+// Multigrid Kernels
+// ============================================================================
+
+// Restrict residual from fine grid to coarse grid using full-weighting
+// Coarse grid has dimensions (nx_fine+1)/2 × (ny_fine+1)/2 × (nz_fine+1)/2
+__global__ void restrict_residual(
+    const float* __restrict__ fine,
+    float* __restrict__ coarse,
+    int nx_fine, int ny_fine, int nz_fine)
+{
+    int ix_c = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy_c = blockIdx.y * blockDim.y + threadIdx.y;
+    int iz_c = blockIdx.z * blockDim.z + threadIdx.z;
+
+    int nx_coarse = (nx_fine + 1) / 2;
+    int ny_coarse = (ny_fine + 1) / 2;
+    int nz_coarse = (nz_fine + 1) / 2;
+
+    if (ix_c >= nx_coarse || iy_c >= ny_coarse || iz_c >= nz_coarse) return;
+
+    // Map coarse grid point to fine grid
+    int ix_f = 2 * ix_c;
+    int iy_f = 2 * iy_c;
+    int iz_f = 2 * iz_c;
+
+    // Full-weighting: average 8 fine grid points (or fewer at boundaries)
+    float sum = 0.0f;
+    int count = 0;
+
+    for (int dz = 0; dz <= 1 && iz_f + dz < nz_fine; dz++) {
+        for (int dy = 0; dy <= 1 && iy_f + dy < ny_fine; dy++) {
+            for (int dx = 0; dx <= 1 && ix_f + dx < nx_fine; dx++) {
+                int idx_f = (iz_f + dz) * (nx_fine * ny_fine) + (iy_f + dy) * nx_fine + (ix_f + dx);
+                sum += fine[idx_f];
+                count++;
+            }
+        }
+    }
+
+    int idx_c = iz_c * (nx_coarse * ny_coarse) + iy_c * nx_coarse + ix_c;
+    coarse[idx_c] = sum / count;  // Average
+}
+
+// Prolong correction from coarse grid to fine grid using trilinear interpolation
+__global__ void prolong_correction(
+    const float* __restrict__ coarse,
+    float* __restrict__ fine,
+    int nx_fine, int ny_fine, int nz_fine)
+{
+    int ix_f = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy_f = blockIdx.y * blockDim.y + threadIdx.y;
+    int iz_f = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (ix_f >= nx_fine || iy_f >= ny_fine || iz_f >= nz_fine) return;
+
+    int nx_coarse = (nx_fine + 1) / 2;
+    int ny_coarse = (ny_fine + 1) / 2;
+    int nz_coarse = (nz_fine + 1) / 2;
+
+    // Map fine grid point to coarse grid
+    int ix_c = ix_f / 2;
+    int iy_c = iy_f / 2;
+    int iz_c = iz_f / 2;
+
+    // For simplicity, use piecewise constant interpolation (inject)
+    // This is the simplest prolongation and works well for diffusion
+    int idx_c = iz_c * (nx_coarse * ny_coarse) + iy_c * nx_coarse + ix_c;
+    int idx_f = iz_f * (nx_fine * ny_fine) + iy_f * nx_fine + ix_f;
+
+    fine[idx_f] += coarse[idx_c];  // Add correction
+}
+
+// Weighted Jacobi smoother for multigrid
+__global__ void weighted_jacobi_kernel(
+    const float* __restrict__ x_old,
+    const float* __restrict__ rhs,
+    float* __restrict__ x_new,
+    int nx, int ny, int nz,
+    float D, float lambda, float dt, float dx, float omega)
+{
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int iz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+
+    int idx = iz * (nx * ny) + iy * nx + ix;
+    float x_center = x_old[idx];
+
+    // Compute Laplacian using 7-point stencil
+    float laplacian = 0.0f;
+    float dx2 = dx * dx;
+    int num_neighbors = 0;
+
+    if (ix > 0) { laplacian += x_old[idx - 1]; num_neighbors++; }
+    if (ix < nx - 1) { laplacian += x_old[idx + 1]; num_neighbors++; }
+    if (iy > 0) { laplacian += x_old[idx - nx]; num_neighbors++; }
+    if (iy < ny - 1) { laplacian += x_old[idx + nx]; num_neighbors++; }
+    if (iz > 0) { laplacian += x_old[idx - nx * ny]; num_neighbors++; }
+    if (iz < nz - 1) { laplacian += x_old[idx + nx * ny]; num_neighbors++; }
+
+    laplacian = (laplacian - num_neighbors * x_center) / dx2;
+
+    // Apply operator: A*x = (I + dt*λ - dt*D*∇²)x
+    float Ax = x_center + dt * lambda * x_center - dt * D * laplacian;
+
+    // Jacobi update: x_new = x_old + omega * (rhs - Ax) / diag(A)
+    float diagonal = 1.0f + dt * lambda + 6.0f * dt * D / dx2;
+    float residual = rhs[idx] - Ax;
+    x_new[idx] = x_old[idx] + omega * residual / diagonal;
+}
+
+// ============================================================================
 // Conjugate Gradient Solver Kernels (Implicit Method)
 // ============================================================================
 
@@ -374,8 +520,14 @@ PDESolver::~PDESolver() {
     if (d_cg_r_) CUDA_CHECK(cudaFree(d_cg_r_));
     if (d_cg_p_) CUDA_CHECK(cudaFree(d_cg_p_));
     if (d_cg_Ap_) CUDA_CHECK(cudaFree(d_cg_Ap_));
+    if (d_cg_z_) CUDA_CHECK(cudaFree(d_cg_z_));
     if (d_cg_temp_) CUDA_CHECK(cudaFree(d_cg_temp_));
+    if (d_precond_diag_inv_) CUDA_CHECK(cudaFree(d_precond_diag_inv_));
     if (d_dot_buffer_) CUDA_CHECK(cudaFree(d_dot_buffer_));
+    if (d_mg_residual_) CUDA_CHECK(cudaFree(d_mg_residual_));
+    if (d_mg_correction_) CUDA_CHECK(cudaFree(d_mg_correction_));
+    if (d_mg_coarse_) CUDA_CHECK(cudaFree(d_mg_coarse_));
+    if (d_mg_coarse_rhs_) CUDA_CHECK(cudaFree(d_mg_coarse_rhs_));
     if (h_temp_buffer_) delete[] h_temp_buffer_;
 }
 
@@ -398,32 +550,50 @@ void PDESolver::initialize() {
     CUDA_CHECK(cudaMalloc(&d_cg_r_, voxel_size));
     CUDA_CHECK(cudaMalloc(&d_cg_p_, voxel_size));
     CUDA_CHECK(cudaMalloc(&d_cg_Ap_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_cg_z_, voxel_size));  // Preconditioned residual
     CUDA_CHECK(cudaMalloc(&d_cg_temp_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_precond_diag_inv_, voxel_size));  // Diagonal preconditioner (inverse)
 
     // Allocate reduction buffer for dot products
     int threads_per_block = 256;
     cg_reduction_blocks_ = (total_voxels + threads_per_block - 1) / threads_per_block;
     CUDA_CHECK(cudaMalloc(&d_dot_buffer_, cg_reduction_blocks_ * sizeof(float)));
 
+    // Allocate multigrid workspace
+    mg_coarse_nx_ = (config_.nx + 1) / 2;  // Coarsen by factor of 2
+    mg_coarse_ny_ = (config_.ny + 1) / 2;
+    mg_coarse_nz_ = (config_.nz + 1) / 2;
+    int coarse_voxels = mg_coarse_nx_ * mg_coarse_ny_ * mg_coarse_nz_;
+    size_t coarse_size = coarse_voxels * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&d_mg_residual_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_mg_correction_, voxel_size));
+    CUDA_CHECK(cudaMalloc(&d_mg_coarse_, coarse_size));
+    CUDA_CHECK(cudaMalloc(&d_mg_coarse_rhs_, coarse_size));
+
     // Allocate host buffer for transfers
     h_temp_buffer_ = new float[total_voxels];
 
-    float cg_workspace_mb = 5.0f * voxel_size / (1024.0f * 1024.0f);
-    std::cout << "PDE Solver initialized (Implicit CG):" << std::endl;
-    std::cout << "  Grid: " << config_.nx << "x" << config_.ny << "x" << config_.nz << std::endl;
+    float cg_workspace_mb = 7.0f * voxel_size / (1024.0f * 1024.0f);
+    float mg_workspace_mb = (2.0f * voxel_size + 2.0f * coarse_size) / (1024.0f * 1024.0f);
+    std::cout << "PDE Solver initialized (Multigrid + PCG):" << std::endl;
+    std::cout << "  Fine grid: " << config_.nx << "x" << config_.ny << "x" << config_.nz << std::endl;
+    std::cout << "  Coarse grid: " << mg_coarse_nx_ << "x" << mg_coarse_ny_ << "x" << mg_coarse_nz_ << std::endl;
     std::cout << "  Substrates: " << config_.num_substrates << std::endl;
     std::cout << "  Concentration memory: " << (3 * total_size) / (1024.0 * 1024.0) << " MB" << std::endl;
     std::cout << "  CG workspace: " << cg_workspace_mb << " MB" << std::endl;
+    std::cout << "  Multigrid workspace: " << mg_workspace_mb << " MB" << std::endl;
     std::cout << "  PDE timestep: " << config_.dt_pde << " s" << std::endl;
     std::cout << "  Substeps per ABM step: " << config_.substeps_per_abm << std::endl;
 }
 
-// Solve implicit system using Conjugate Gradient: A*x = b
-// where A = (I + dt*λ - dt*D*∇²)
-void PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
+// Solve implicit system using Preconditioned Conjugate Gradient (diagonal preconditioner)
+// A*x = b where A = (I + dt*λ - dt*D*∇²)
+// Returns: number of iterations taken (for diagnostics)
+int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
     const int n = config_.nx * config_.ny * config_.nz;
-    const int max_iters = 1000;  // Increased for stiff problems (high diffusion coefficients)
-    const float tolerance = 1e-4f;  // Relaxed tolerance for practical convergence
+    const int max_iters = 500;  // Increased to test convergence on 50^3 grid
+    const float tolerance = 1e-4f;
 
     // CUDA grid configuration
     dim3 block_3d(8, 8, 8);
@@ -436,12 +606,11 @@ void PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float
     int threads_1d = 256;
     int blocks_1d = (n + threads_1d - 1) / threads_1d;
 
-    // Helper lambda for dot product (with final reduction on host)
+    // Helper lambda for dot product
     auto dot_product = [&](const float* x, const float* y) -> float {
         dot_product_kernel<<<cg_reduction_blocks_, threads_1d>>>(x, y, d_dot_buffer_, n);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Final reduction on host
         std::vector<float> h_partial(cg_reduction_blocks_);
         CUDA_CHECK(cudaMemcpy(h_partial.data(), d_dot_buffer_,
                               cg_reduction_blocks_ * sizeof(float), cudaMemcpyDeviceToHost));
@@ -452,35 +621,48 @@ void PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float
         return sum;
     };
 
-    // Initialize: r = b - A*x0 (where x0 = d_C is current concentration)
+    // Step 1: Compute diagonal preconditioner M^{-1} (once per substrate)
+    compute_diagonal_preconditioner_inv<<<blocks_1d, threads_1d>>>(
+        d_precond_diag_inv_, D, lambda, dt, dx, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Step 2: Initialize residual r = b - A*x0
     apply_diffusion_operator<<<grid_3d, block_3d>>>(d_C, d_cg_Ap_,
                                                      config_.nx, config_.ny, config_.nz,
                                                      D, lambda, dt, dx);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // r = b - A*x0
     vector_copy<<<blocks_1d, threads_1d>>>(d_cg_r_, d_rhs, n);
     vector_axpy<<<blocks_1d, threads_1d>>>(d_cg_r_, d_cg_Ap_, -1.0f, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // p = r
-    vector_copy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_r_, n);
+    // Step 3: Apply preconditioner z = M^{-1} * r
+    apply_diagonal_preconditioner<<<blocks_1d, threads_1d>>>(
+        d_precond_diag_inv_, d_cg_r_, d_cg_z_, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    float rsold = dot_product(d_cg_r_, d_cg_r_);
-    float rs_initial = rsold;
+    // Step 4: Initialize search direction p = z
+    vector_copy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_z_, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // CG iteration
-    for (int iter = 0; iter < max_iters; iter++) {
+    // Step 5: Compute initial r·z (for alpha calculation)
+    float rzold = dot_product(d_cg_r_, d_cg_z_);
+    float rs_initial = dot_product(d_cg_r_, d_cg_r_);  // For residual norm
+
+    // Preconditioned CG iteration
+    int iter;
+    float final_residual_norm = 0.0f;
+
+    for (iter = 0; iter < max_iters; iter++) {
         // Ap = A*p
         apply_diffusion_operator<<<grid_3d, block_3d>>>(d_cg_p_, d_cg_Ap_,
                                                          config_.nx, config_.ny, config_.nz,
                                                          D, lambda, dt, dx);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // alpha = rsold / (p . Ap)
+        // alpha = (r·z) / (p·Ap)  ← KEY: use r·z not r·r!
         float pAp = dot_product(d_cg_p_, d_cg_Ap_);
-        float alpha = rsold / (pAp + 1e-30f);  // Add epsilon to avoid division by zero
+        float alpha = rzold / (pAp + 1e-30f);
 
         // x = x + alpha*p
         vector_axpy<<<blocks_1d, threads_1d>>>(d_C, d_cg_p_, alpha, n);
@@ -489,30 +671,190 @@ void PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float
         vector_axpy<<<blocks_1d, threads_1d>>>(d_cg_r_, d_cg_Ap_, -alpha, n);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Check convergence
+        // Check convergence (use actual residual norm)
         float rsnew = dot_product(d_cg_r_, d_cg_r_);
-        float residual_norm = sqrtf(rsnew / (rs_initial + 1e-30f));
+        final_residual_norm = sqrtf(rsnew / (rs_initial + 1e-30f));
 
-        if (residual_norm < tolerance) {
-            // Converged!
+        if (final_residual_norm < tolerance) {
+            iter++;  // Count this iteration
             break;
         }
 
-        // beta = rsnew / rsold
-        float beta = rsnew / (rsold + 1e-30f);
+        // z = M^{-1} * r (apply preconditioner)
+        apply_diagonal_preconditioner<<<blocks_1d, threads_1d>>>(
+            d_precond_diag_inv_, d_cg_r_, d_cg_z_, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // p = r + beta*p
+        // Compute new r·z
+        float rznew = dot_product(d_cg_r_, d_cg_z_);
+
+        // beta = rznew / rzold  ← KEY: use r·z not r·r!
+        float beta = rznew / (rzold + 1e-30f);
+
+        // p = z + beta*p  ← KEY: use z not r!
         vector_scale<<<blocks_1d, threads_1d>>>(d_cg_temp_, d_cg_p_, beta, n);
-        vector_copy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_r_, n);
+        vector_copy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_z_, n);
         vector_axpy<<<blocks_1d, threads_1d>>>(d_cg_p_, d_cg_temp_, 1.0f, n);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        rsold = rsnew;
+        rzold = rznew;
     }
 
-    // Ensure non-negative concentrations (CG can produce small negative values due to roundoff)
+    // Store final residual in a member variable for diagnostics
+    last_residual_norm_ = final_residual_norm;
+
+    // Ensure non-negative concentrations
     clamp_nonnegative<<<blocks_1d, threads_1d>>>(d_C, n);
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    return iter;  // Return iteration count for diagnostics
+}
+
+// ============================================================================
+// Multigrid Solver (2-Level V-Cycle)
+// ============================================================================
+
+int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
+    const int nx = config_.nx;
+    const int ny = config_.ny;
+    const int nz = config_.nz;
+    const int n_fine = nx * ny * nz;
+    const int n_coarse = mg_coarse_nx_ * mg_coarse_ny_ * mg_coarse_nz_;
+
+    // Special handling for zero-decay substrates (like O2)
+    const bool is_zero_decay = (lambda < 1e-10f);
+    const int max_cycles = is_zero_decay ? 50 : 20;  // More cycles for stiff problems
+    const float tolerance = is_zero_decay ? 5e-4f : 1e-4f;  // Relaxed tolerance for O2
+    const int pre_smooth = is_zero_decay ? 5 : 3;   // More smoothing for stiff problems
+    const int post_smooth = is_zero_decay ? 5 : 3;
+    const float omega = 0.67f;  // Jacobi relaxation parameter
+
+    // Grid configuration
+    dim3 block_fine(8, 8, 8);
+    dim3 grid_fine(
+        (nx + block_fine.x - 1) / block_fine.x,
+        (ny + block_fine.y - 1) / block_fine.y,
+        (nz + block_fine.z - 1) / block_fine.z
+    );
+
+    dim3 block_coarse(8, 8, 8);
+    dim3 grid_coarse(
+        (mg_coarse_nx_ + block_coarse.x - 1) / block_coarse.x,
+        (mg_coarse_ny_ + block_coarse.y - 1) / block_coarse.y,
+        (mg_coarse_nz_ + block_coarse.z - 1) / block_coarse.z
+    );
+
+    int threads_1d = 256;
+    int blocks_fine_1d = (n_fine + threads_1d - 1) / threads_1d;
+    int blocks_coarse_1d = (n_coarse + threads_1d - 1) / threads_1d;
+
+    // Helper for computing residual norm
+    auto compute_residual_norm = [&](const float* d_x, const float* d_b) -> float {
+        // Compute residual: r = b - A*x
+        apply_diffusion_operator<<<grid_fine, block_fine>>>(d_x, d_mg_residual_, nx, ny, nz, D, lambda, dt, dx);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        vector_copy<<<blocks_fine_1d, threads_1d>>>(d_cg_temp_, d_b, n_fine);
+        vector_axpy<<<blocks_fine_1d, threads_1d>>>(d_cg_temp_, d_mg_residual_, -1.0f, n_fine);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Compute norm
+        dot_product_kernel<<<cg_reduction_blocks_, threads_1d>>>(d_cg_temp_, d_cg_temp_, d_dot_buffer_, n_fine);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<float> h_partial(cg_reduction_blocks_);
+        CUDA_CHECK(cudaMemcpy(h_partial.data(), d_dot_buffer_,
+                              cg_reduction_blocks_ * sizeof(float), cudaMemcpyDeviceToHost));
+        float sum = 0.0f;
+        for (int i = 0; i < cg_reduction_blocks_; i++) {
+            sum += h_partial[i];
+        }
+        return sqrtf(sum) / sqrtf(n_fine);  // Normalized
+    };
+
+    // Initial residual
+    float initial_residual = compute_residual_norm(d_C, d_rhs);
+
+    // V-cycle iterations
+    int cycle;
+    for (cycle = 0; cycle < max_cycles; cycle++) {
+        // 1. Pre-smoothing on fine grid
+        mg_smooth(d_C, d_rhs, D, lambda, dt, dx, nx, ny, nz, pre_smooth, omega);
+
+        // 2. Compute residual: r = b - A*x
+        apply_diffusion_operator<<<grid_fine, block_fine>>>(d_C, d_mg_residual_, nx, ny, nz, D, lambda, dt, dx);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        vector_copy<<<blocks_fine_1d, threads_1d>>>(d_cg_temp_, d_rhs, n_fine);
+        vector_axpy<<<blocks_fine_1d, threads_1d>>>(d_cg_temp_, d_mg_residual_, -1.0f, n_fine);
+        vector_copy<<<blocks_fine_1d, threads_1d>>>(d_mg_residual_, d_cg_temp_, n_fine);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 3. Restrict residual to coarse grid
+        restrict_residual<<<grid_coarse, block_coarse>>>(d_mg_residual_, d_mg_coarse_rhs_,
+                                                         nx, ny, nz);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 4. Solve on coarse grid (using smoothing iterations)
+        CUDA_CHECK(cudaMemset(d_mg_coarse_, 0, n_coarse * sizeof(float)));  // Initial guess = 0
+        float dx_coarse = 2.0f * dx;  // Coarse grid spacing
+
+        // Smooth on coarse grid instead of exact solve
+        mg_smooth(d_mg_coarse_, d_mg_coarse_rhs_, D, lambda, dt, dx_coarse,
+                  mg_coarse_nx_, mg_coarse_ny_, mg_coarse_nz_, 10, omega);
+
+        // 5. Prolong correction to fine grid
+        CUDA_CHECK(cudaMemset(d_mg_correction_, 0, n_fine * sizeof(float)));
+        prolong_correction<<<grid_fine, block_fine>>>(d_mg_coarse_, d_mg_correction_,
+                                                      nx, ny, nz);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 6. Update solution: x = x + correction
+        vector_axpy<<<blocks_fine_1d, threads_1d>>>(d_C, d_mg_correction_, 1.0f, n_fine);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 7. Post-smoothing on fine grid
+        mg_smooth(d_C, d_rhs, D, lambda, dt, dx, nx, ny, nz, post_smooth, omega);
+
+        // Check convergence
+        float residual_norm = compute_residual_norm(d_C, d_rhs);
+        last_residual_norm_ = residual_norm;
+
+        if (residual_norm < tolerance) {
+            cycle++;  // Count this cycle
+            break;
+        }
+    }
+
+    // Ensure non-negative concentrations
+    clamp_nonnegative<<<blocks_fine_1d, threads_1d>>>(d_C, n_fine);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    return cycle;  // Return number of V-cycles
+}
+
+// Weighted Jacobi smoother
+void PDESolver::mg_smooth(float* d_x, const float* d_rhs, float D, float lambda, float dt, float dx,
+                          int nx, int ny, int nz, int num_iters, float omega) {
+    dim3 block(8, 8, 8);
+    dim3 grid(
+        (nx + block.x - 1) / block.x,
+        (ny + block.y - 1) / block.y,
+        (nz + block.z - 1) / block.z
+    );
+
+    // Use d_cg_temp_ as temporary buffer for ping-pong
+    for (int iter = 0; iter < num_iters; iter++) {
+        weighted_jacobi_kernel<<<grid, block>>>(d_x, d_rhs, d_cg_temp_, nx, ny, nz, D, lambda, dt, dx, omega);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Copy result back
+        int n = nx * ny * nz;
+        int threads = 256;
+        int blocks = (n + threads - 1) / threads;
+        vector_copy<<<blocks, threads>>>(d_x, d_cg_temp_, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 }
 
 void PDESolver::solve_timestep() {
@@ -521,8 +863,17 @@ void PDESolver::solve_timestep() {
     int blocks = (n + threads - 1) / threads;
 
     static int step_count = 0;
-    bool print_debug = (step_count <= 5);  // Print first 5 timesteps for debugging
+    bool print_debug = (step_count <= 5);  // Print first 5 timesteps for diagnostics
     step_count++;
+
+    // Diagnostics: track convergence and timing
+    int total_iters = 0;
+    int max_iters_seen = 0;
+    double total_time = 0.0;
+
+    const char* substrate_names[NUM_SUBSTRATES] = {
+        "O2", "IFNg", "IL2", "IL10", "TGFB", "CCL2", "ARGI", "NO", "IL12", "VEGFA"
+    };
 
     // Solve for each substrate independently using implicit CG
     for (int sub = 0; sub < config_.num_substrates; sub++) {
@@ -539,33 +890,46 @@ void PDESolver::solve_timestep() {
         vector_axpy<<<blocks, threads>>>(d_cg_temp_, sources, config_.dt_abm, n);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Debug output for O2, TGFB, CCL2, VEGFA (substrates 0, 4, 5, 9)
-        // if (print_debug && (sub == 0 || sub == 4 || sub == 5 || sub == 9)) {
-        //     std::vector<float> h_C(n), h_S(n), h_rhs(n);
-        //     cudaMemcpy(h_C.data(), C_curr, n*sizeof(float), cudaMemcpyDeviceToHost);
-        //     cudaMemcpy(h_S.data(), sources, n*sizeof(float), cudaMemcpyDeviceToHost);
-        //     cudaMemcpy(h_rhs.data(), d_cg_temp_, n*sizeof(float), cudaMemcpyDeviceToHost);
-
-        //     float sum_C = std::accumulate(h_C.begin(), h_C.end(), 0.0f);
-        //     float sum_S = std::accumulate(h_S.begin(), h_S.end(), 0.0f);
-        //     float sum_rhs = std::accumulate(h_rhs.begin(), h_rhs.end(), 0.0f);
-
-        //     const char* sub_name = "UNKNOWN";
-        //     if (sub == 0) sub_name = "O2";
-        //     else if (sub == 4) sub_name = "TGFB";
-        //     else if (sub == 5) sub_name = "CCL2";
-        //     else if (sub == 9) sub_name = "VEGFA";
-
-        //     printf("[PDE Step %d] %s (sub %d): C_total=%.3e, S_total=%.3e, RHS_total=%.3e, dt=%.1f\n",
-        //            step_count - 1, sub_name, sub, sum_C, sum_S, sum_rhs, config_.dt_abm);
-        // }
+        // Timing: start
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start);
 
         // Solve implicit system: (I + dt*λ - dt*D*∇²)C^(n+1) = rhs
         // using dt = dt_abm (entire ABM timestep, no substeps needed!)
-        solve_implicit_cg(C_curr, d_cg_temp_, D, lambda, config_.dt_abm, config_.voxel_size);
+        // Use multigrid solver (2-level V-cycle)
+        int iters = solve_multigrid(C_curr, d_cg_temp_, D, lambda, config_.dt_abm, config_.voxel_size);
+
+        // Timing: stop
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+
+        total_iters += iters;
+        max_iters_seen = (iters > max_iters_seen) ? iters : max_iters_seen;
+        total_time += milliseconds;
+
+        if (print_debug) {
+            // Print with final residual norm and convergence status
+            const char* status = (last_residual_norm_ < 1e-4f) ? "✓" : "✗MAX";
+            printf("[MG] Step %d, %s (sub %d): %d V-cycles, %.2f ms, residual=%.2e %s (D=%.2e, λ=%.2e)\n",
+                   step_count - 1, substrate_names[sub], sub, iters, milliseconds,
+                   last_residual_norm_, status, D, lambda);
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Print summary diagnostics
+    if (print_debug) {
+        printf("[MG Summary] Step %d: total_cycles=%d, avg_cycles=%.1f, max_cycles=%d, total_time=%.2f ms\n\n",
+               step_count - 1, total_iters, total_iters / (float)config_.num_substrates,
+               max_iters_seen, total_time);
+    }
 }
 
 void PDESolver::set_sources(const float* h_sources, int substrate_idx) {

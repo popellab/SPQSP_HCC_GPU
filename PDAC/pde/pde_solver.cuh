@@ -91,9 +91,19 @@ private:
     float* d_cg_r_;      // Residual vector
     float* d_cg_p_;      // Search direction
     float* d_cg_Ap_;     // A*p product
+    float* d_cg_z_;      // Preconditioned residual (for diagonal preconditioner)
     float* d_cg_temp_;   // Temporary storage
     float* d_dot_buffer_; // Reduction buffer for dot products
+    float* d_precond_diag_inv_; // Diagonal preconditioner M^{-1} (inverse stored)
     int cg_reduction_blocks_;
+    float last_residual_norm_;  // Final residual from last CG solve (for diagnostics)
+
+    // Multigrid workspace
+    float* d_mg_residual_;     // Residual on fine grid
+    float* d_mg_correction_;   // Correction from coarse grid
+    float* d_mg_coarse_;       // Solution on coarse grid (nx/2 × ny/2 × nz/2)
+    float* d_mg_coarse_rhs_;   // RHS on coarse grid
+    int mg_coarse_nx_, mg_coarse_ny_, mg_coarse_nz_;  // Coarse grid dimensions
 
     // Host memory (for transfers)
     float* h_temp_buffer_;
@@ -108,7 +118,14 @@ private:
     }
 
     // CG solver internals
-    void solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx);
+    int solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx);
+
+    // Multigrid solver internals
+    int solve_multigrid(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx);
+    void mg_smooth(float* d_x, const float* d_rhs, float D, float lambda, float dt, float dx,
+                   int nx, int ny, int nz, int num_iters, float omega);
+    void mg_compute_residual(const float* d_x, const float* d_rhs, float* d_residual,
+                             float D, float lambda, float dt, float dx, int nx, int ny, int nz);
 
     // Swap current and next buffers
     void swap_buffers();
@@ -183,6 +200,24 @@ __global__ void dot_product_kernel(
 __global__ void clamp_nonnegative(
     float* __restrict__ x,
     int n);
+
+// Multigrid kernels
+__global__ void restrict_residual(
+    const float* __restrict__ fine,
+    float* __restrict__ coarse,
+    int nx_fine, int ny_fine, int nz_fine);
+
+__global__ void prolong_correction(
+    const float* __restrict__ coarse,
+    float* __restrict__ fine,
+    int nx_fine, int ny_fine, int nz_fine);
+
+__global__ void weighted_jacobi_kernel(
+    const float* __restrict__ x_old,
+    const float* __restrict__ rhs,
+    float* __restrict__ x_new,
+    int nx, int ny, int nz,
+    float D, float lambda, float dt, float dx, float omega);
 
 } // namespace PDAC
 

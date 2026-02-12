@@ -125,7 +125,6 @@ SPQSP PDAC is a GPU-accelerated agent-based model (ABM) with CPU QSP coupling fo
 
 **Key Missing Mechanisms**
 - ❌ Immune cell recruitment from lymph/blood (QSP should drive this)
-- ❌ T cell-cancer cell killing interactions
 - ❌ Checkpoint blockade (PD1-PDL1) effects on killing
 - ❌ Immunosuppressive effects (TReg, MDSC, IL10, TGFB)
 - ❌ Antigen presentation and priming
@@ -163,7 +162,7 @@ PDAC/
 │
 ├── agents/            # CUDA device functions for agent behavior
 │   ├── cancer_cell.cuh    # ✅ Cancer stem/progenitor dynamics (WORKING)
-│   ├── t_cell.cuh         # ⚠️ T cell states (PARTIAL - no killing)
+│   ├── t_cell.cuh         # ✅ T cell behavior (WORKING)
 │   ├── t_reg.cuh          # ⚠️ TReg suppression (PARTIAL - not active)
 │   └── mdsc.cuh           # ⚠️ MDSC suppression (PARTIAL - not active)
 │
@@ -269,7 +268,7 @@ cd PDAC/sim
 -g, --grid-size N       Grid dimensions (overrides XML, default: 50)
 -s, --steps N           ABM steps to run (default: 500)
 -r, --radius N          Initial tumor radius in voxels (default: 5)
--t, --tcells N          Initial T cell count (default: 50, non-functional)
+-t, --tcells N          Initial T cell count (default: 50)
 --tregs N               Initial TReg count (default: 10, non-functional)
 --mdscs N               Initial MDSC count (default: 5, non-functional)
 -p, --param-file PATH   XML parameter file (default: resource/param_all_test.xml)
@@ -371,11 +370,11 @@ cd PDAC/sim
 - Few stem cells → low TGF-β in tumor
 - Expected given current parameter values
 
-**Immune Cells Non-Functional:**
-- T cells, TRegs, MDSCs initialize but don't do anything
-- No recruitment, no killing, no suppression
+**TReg/MDSC Cells Non-Functional:**
+- TRegs and MDSCs initialize but don't actively suppress T cells
+- No recruitment, no suppression effects
 - Just random walk until simulation ends
-- Major functionality gap!
+- Note: T cells ARE functional (killing, division, cytokine secretion work!)
 
 ### Build Issues
 

@@ -2,6 +2,7 @@
 #include "../core/common.cuh"
 #include <iostream>
 #include <vector>
+#include <nvtx3/nvToolsExt.h>
 
 namespace PDAC {
 
@@ -241,7 +242,9 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
 
 FLAMEGPU_HOST_FUNCTION(collect_agent_sources) {
     if (!g_pde_solver) return;
-    
+
+    nvtxRangePush("Collect Agent Sources");
+
     // Reset sources for this timestep
     g_pde_solver->reset_sources();
     
@@ -281,6 +284,8 @@ FLAMEGPU_HOST_FUNCTION(collect_agent_sources) {
     if (step % 50 == 0) {
         std::cout << "Collected agent sources to PDE (step " << step << ")" << std::endl;
     }
+
+    nvtxRangePop();
 }
 
 // ============================================================================

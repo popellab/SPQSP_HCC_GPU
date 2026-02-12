@@ -1,0 +1,45 @@
+# Preconditioned CG Implementation Plan
+
+## Current (unpreconditioned) CG:
+```
+r = b - A*x0
+p = r
+rsold = r·r
+loop:
+    Ap = A*p
+    alpha = rsold / (p·Ap)
+    x = x + alpha*p
+    r = r - alpha*Ap
+    rsnew = r·r
+    if sqrt(rsnew) < tol: break
+    beta = rsnew / rsold
+    p = r + beta*p
+    rsold = rsnew
+```
+
+## Preconditioned CG (with diagonal M):
+```
+Compute M^{-1}  (once per substrate)
+r = b - A*x0
+z = M^{-1} * r
+p = z
+rzold = r·z  ← KEY CHANGE: use r·z not r·r!
+loop:
+    Ap = A*p
+    alpha = rzold / (p·Ap)
+    x = x + alpha*p
+    r = r - alpha*Ap
+    z = M^{-1} * r  ← Apply preconditioner
+    rznew = r·z  ← KEY CHANGE: use r·z!
+    if sqrt(r·r) < tol: break  ← residual check unchanged
+    beta = rznew / rzold
+    p = z + beta*p  ← Use z not r!
+    rzold = rznew
+```
+
+## Key changes:
+1. Compute M^{-1} before CG loop (once per substrate)
+2. After updating r, apply preconditioner: z = M^{-1} * r
+3. Use z instead of r in dot products for alpha/beta
+4. Use z (not r) when updating p
+5. Residual norm still uses r (not z)
