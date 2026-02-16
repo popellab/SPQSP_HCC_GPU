@@ -54,6 +54,19 @@ const char* _gpu_param_description[][3] = {
     // MDSC cell parameters
     {"Param.ABM.MDSC.lifespanSD", "", "pos"},  // PARAM_MDSC_LIFESPAN_SD
     //*************************************************************************/
+    // Vas cell parameters
+    {"Param.ABM.Vas.maxPerVoxel", "", "pos"},  // 
+    {"Param.ABM.Vas.vas_50", "", "pr"},  // 
+    {"Param.ABM.Vas.O2_conc", "", "pr"},  // 
+    {"Param.ABM.Vas.Rc", "", "pr"},  // 
+    {"Param.ABM.Vas.sigma", "", "pr"},  // 
+    {"Param.ABM.Vas.ref_vas_frac", "", "pr"},  // 
+    {"Param.ABM.Vas.init_density", "", "pr"},  // 
+    {"Param.ABM.Vas.tumble", "", "pr"},  // 
+    {"Param.ABM.Vas.delta", "", "pr"},  // 
+    {"Param.ABM.Vas.branch_prob", "", "pr"},  // 
+    {"Param.ABM.Vas.min_neighbor", "", "pos"},  // 
+    //*************************************************************************/
     // Molecular parameters
     {"Param.Molecular.biofvm.IFNg.diffusivity", "", "pr"},  // PARAM_IFNG_DIFFUSIVITY
     {"Param.Molecular.biofvm.IL_2.diffusivity", "", "pr"},  // PARAM_IL2_DIFFUSIVITY
@@ -264,6 +277,18 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     //MDSC CELL PARAMETERS
     env.newProperty<float>("PARAM_MDSC_LIFESPAN_SD", getFloat(PARAM_MDSC_LIFESPAN_SD));
     env.newProperty<int>("PARAM_MDSC_MOVE_STEPS", getInt(PARAM_MDSC_MOVE_STEPS));
+    //VAS CELL PARAMETERS
+    env.newProperty<float>("PARAM_VAS_MAXPERVOXEL", getFloat(PARAM_VAS_MAXPERVOXEL));
+    env.newProperty<float>("PARAM_VAS_50", getFloat(PARAM_VAS_50));
+    env.newProperty<float>("PARAM_VAS_O2_CONC", getFloat(PARAM_VAS_O2_CONC));
+    env.newProperty<float>("PARAM_VAS_RC", getFloat(PARAM_VAS_RC));
+    env.newProperty<float>("PARAM_VAS_SIGMA", getFloat(PARAM_VAS_SIGMA));
+    env.newProperty<float>("PARAM_VAS_FRAC", getFloat(PARAM_VAS_FRAC));
+    env.newProperty<float>("PARAM_VAS_INIT_DENS", getFloat(PARAM_VAS_INIT_DENS));
+    env.newProperty<float>("PARAM_VAS_TUMBLE", getFloat(PARAM_VAS_TUMBLE));
+    env.newProperty<float>("PARAM_VAS_DELTA", getFloat(PARAM_VAS_DELTA));
+    env.newProperty<float>("PARAM_VAS_BRANCH_PROB", getFloat(PARAM_VAS_BRANCH_PROB));
+    env.newProperty<float>("PARAM_VAS_MIN_NEIGHBOR", getFloat(PARAM_VAS_MIN_NEIGHBOR));
     //MOLECULAR PARAMETERS
     env.newProperty<float>("PARAM_IFNG_DIFFUSIVITY", getFloat(PARAM_IFNG_DIFFUSIVITY));
     env.newProperty<float>("PARAM_IL2_DIFFUSIVITY", getFloat(PARAM_IL2_DIFFUSIVITY));
@@ -288,9 +313,7 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     env.newProperty<float>("PARAM_O2_DECAY_RATE", getFloat(PARAM_O2_DECAY_RATE));
 
     env.newProperty<float>("PARAM_IFNG_RELEASE", getFloat(PARAM_IFNG_RELEASE));              // Cyt TCells
-    float il2_val = getFloat(PARAM_IL2_RELEASE);
-    std::cout << "DEBUG: Loading PARAM_IL2_RELEASE = " << il2_val << std::endl;
-    env.newProperty<float>("PARAM_IL2_RELEASE", il2_val);                // Cyt TCells
+    env.newProperty<float>("PARAM_IL2_RELEASE", getFloat(PARAM_IL2_RELEASE));                // Cyt TCells
     env.newProperty<float>("PARAM_CCL2_RELEASE", getFloat(PARAM_CCL2_RELEASE));              // Cancer
     env.newProperty<float>("PARAM_ARGI_RELEASE", getFloat(PARAM_ARGI_RELEASE));
     env.newProperty<float>("PARAM_NO_RELEASE", getFloat(PARAM_NO_RELEASE));

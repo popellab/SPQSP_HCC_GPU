@@ -282,12 +282,12 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
 
     // Read O2
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_O2, "local_O2");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_O2, "local_O2");
     
     // Read IFN-gamma
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_IFN, "local_IFNg");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_IFN, "local_IFNg");
-    
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_IFN, "local_IFNg");
+
     // Read IL-2
     read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "local_IL2");
     
@@ -296,10 +296,8 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
     // Read TGF-beta (immunosuppressive)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_TGFB, "local_TGFB");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_TGFB, "local_TGFB");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_TGFB, "local_TGFB");
     
     // Read CCL2 (chemotaxis)
-    read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_CCL2, "local_CCL2");
 
     // Read ArgI (MDSC-produced, T cell response modifier)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_ARGI, "local_ArgI");
@@ -312,6 +310,10 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
 
     // Read VEGF-A (cancer-produced, pro-angiogenic)
     // read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_VEGFA, "local_VEGFA");
+
+    // VascularCell: read O2 and VEGF-A
+    read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_O2, "local_O2");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_VEGFA, "local_VEGFA");
 
     // Note: Nivolumab and Cabozantinib are now handled by QSP compartments
     // They will be transferred to GPU environment properties by the QSP coupling wrapper
@@ -330,6 +332,10 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
     // ========== CALCULATE CHEMICAL GRADIENTS FOR CHEMOTAXIS ==========
     // Pre-compute gradients on host side to avoid redundant per-agent calculations
     calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_MDSC, CHEM_CCL2, "CCL2_gradient");
+
+    // VascularCell: calculate VEGF-A gradient for tip cell chemotaxis
+    calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_VEGFA, "vegfa_grad");
+
     // Add more gradient calculations here as needed for other agent types:
     // calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "IL2_gradient");
 
@@ -379,6 +385,12 @@ FLAMEGPU_HOST_FUNCTION(collect_agent_sources) {
 
     // Collect ArgI production from MDSCs
     collect_chemical_from_agents(*FLAMEGPU, AGENT_MDSC, CHEM_ARGI, "ArgI_release_rate");
+
+    // VascularCell: collect O2 sources (phalanx only, filtered by agent function)
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_O2, "O2_source");
+
+    // VascularCell: collect VEGF-A sinks (all states)
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_VEGFA, "VEGFA_sink");
 
     unsigned int step = FLAMEGPU->environment.getProperty<unsigned int>("current_step");
     if (step % 50 == 0) {

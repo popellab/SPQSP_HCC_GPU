@@ -25,6 +25,14 @@ __device__ __forceinline__ void get_moore_direction_mdsc(int idx, int& dx, int& 
     dz = dirs[idx][2];
 }
 
+// Helper: Hill equation for PD1-PDL1 suppression
+__device__ __forceinline__ float hill_equation_mdsc(float x, float k50, float n) {
+    if (x <= 0.0f) return 0.0f;
+    const float xn = powf(x, n);
+    const float kn = powf(k50, n);
+    return xn / (kn + xn);
+}
+
 // MDSC agent function: Broadcast location
 FLAMEGPU_AGENT_FUNCTION(mdsc_broadcast_location, flamegpu::MessageNone, flamegpu::MessageSpatial3D) {
     const int x = FLAMEGPU->getVariable<int>("x");
@@ -33,9 +41,9 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_broadcast_location, flamegpu::MessageNone, flamegpu
     const float voxel_size = FLAMEGPU->environment.getProperty<float>("voxel_size");
 
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_MDSC);
-    FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+    FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getID());
     FLAMEGPU->message_out.setVariable<int>("cell_state", 0);  // MDSCs have single state
-    FLAMEGPU->message_out.setVariable<float>("PDL1", 0.0f);   // MDSCs don't express PDL1
+    FLAMEGPU->message_out.setVariable<float>("PDL1", FLAMEGPU->getVariable<float>("PDL1_syn"));
     FLAMEGPU->message_out.setVariable<int>("voxel_x", x);
     FLAMEGPU->message_out.setVariable<int>("voxel_y", y);
     FLAMEGPU->message_out.setVariable<int>("voxel_z", z);
@@ -185,7 +193,7 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_select_move_target, flamegpu::MessageNone, flamegpu
 
     if (FLAMEGPU->getVariable<int>("dead") == 1) {
         FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_MDSC);
-        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+        FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
         FLAMEGPU->message_out.setVariable<int>("intent_action", INTENT_NONE);
         FLAMEGPU->message_out.setVariable<int>("target_x", -1);
         FLAMEGPU->message_out.setVariable<int>("target_y", -1);
@@ -197,12 +205,13 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_select_move_target, flamegpu::MessageNone, flamegpu
         return flamegpu::ALIVE;
     }
 
-    const float move_prob = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_MOVE_PROB");
+    //TODO: Add ECM Check for movement probability
+    float ECM_sat = 0.2;
 
     int target_x = -1, target_y = -1, target_z = -1;
     int intent_action = INTENT_NONE;
 
-    if (FLAMEGPU->random.uniform<float>() < move_prob) {
+    if (FLAMEGPU->random.uniform<float>() < ECM_sat) {
         // Use cached available_neighbors mask, restricted to Von Neumann (6 face neighbors)
         const unsigned int available_all = FLAMEGPU->getVariable<unsigned int>("available_neighbors");
         const unsigned int available = available_all & VON_NEUMANN_MASK_MDSC;
@@ -236,7 +245,7 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_select_move_target, flamegpu::MessageNone, flamegpu
 
     // Broadcast intent message with source position for conflict resolution
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_MDSC);
-    FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getVariable<unsigned int>("id"));
+    FLAMEGPU->message_out.setVariable<unsigned int>("agent_id", FLAMEGPU->getID());
     FLAMEGPU->message_out.setVariable<int>("intent_action", intent_action);
     FLAMEGPU->message_out.setVariable<int>("target_x", target_x);
     FLAMEGPU->message_out.setVariable<int>("target_y", target_y);
@@ -271,7 +280,7 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_execute_move, flamegpu::MessageSpatial3D, flamegpu:
     const int target_x = FLAMEGPU->getVariable<int>("target_x");
     const int target_y = FLAMEGPU->getVariable<int>("target_y");
     const int target_z = FLAMEGPU->getVariable<int>("target_z");
-    const unsigned int my_id = FLAMEGPU->getVariable<unsigned int>("id");
+    const unsigned int my_id = FLAMEGPU->getID();
     const int my_x = FLAMEGPU->getVariable<int>("x");
     const int my_y = FLAMEGPU->getVariable<int>("y");
     const int my_z = FLAMEGPU->getVariable<int>("z");
@@ -299,7 +308,7 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_execute_move, flamegpu::MessageSpatial3D, flamegpu:
             // Only 1 MDSC per voxel - higher priority wins
             if ((msg_agent_type == CELL_TYPE_MDSC || msg_agent_type == CELL_TYPE_CANCER) && msg_intent == INTENT_MOVE) {
                 // Skip self
-                if (msg_src_x == my_x && msg_src_y == my_y && msg_src_z == my_z) {
+                if (msg_id == my_id) {
                     continue;
                 }
                 // Check if other agent has higher priority
@@ -331,32 +340,20 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_execute_move, flamegpu::MessageSpatial3D, flamegpu:
 FLAMEGPU_AGENT_FUNCTION(mdsc_update_chemicals, flamegpu::MessageNone, flamegpu::MessageNone) {
     // ========== READ CHEMICAL CONCENTRATIONS FROM AGENT VARIABLES ==========
     // These were already set by the host function update_agent_chemicals in layer 6
-    float local_O2 = FLAMEGPU->getVariable<float>("local_O2");
     float local_IFNg = FLAMEGPU->getVariable<float>("local_IFNg");
-    float local_IL2 = FLAMEGPU->getVariable<float>("local_IL2");
-    float local_IL10 = FLAMEGPU->getVariable<float>("local_IL10");
-    float local_TGFB = FLAMEGPU->getVariable<float>("local_TGFB");
-    float local_CCL2 = FLAMEGPU->getVariable<float>("local_CCL2");
     
     // ========== COMPUTE DERIVED STATES ==========
 
-    // 1. Activation level (enhanced by TGF-beta)
-    float activation_level = 1.0f;
-    if (local_TGFB > 0.0f) {
-        const float TGFB_activate_EC50 = FLAMEGPU->environment.getProperty<float>("PARAM_TGFB_MDSC_ACTIVATE_EC50");
-        activation_level = 1.0f + 0.3f * hill_equation(local_TGFB, TGFB_activate_EC50, 2.0f);
+    const float IFNg_PDL1_EC50 = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_HALF");
+    const float IFNg_PDL1_hill = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_N");
+    float H_IFNg = hill_equation_mdsc(local_IFNg, IFNg_PDL1_EC50, IFNg_PDL1_hill);
+    const float PDL1_syn_max = FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_SYN_MAX");
+    float minPDL1 = PDL1_syn_max * H_IFNg;
+
+    float PDL1_current = FLAMEGPU->getVariable<float>("PDL1_syn");
+    if (PDL1_current < minPDL1) {
+        FLAMEGPU->setVariable<float>("PDL1_syn", minPDL1);
     }
-    FLAMEGPU->setVariable<float>("activation_level", activation_level);
-
-    // 2. Suppression radius
-    const float base_suppression_radius = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_SUPPRESSION_RADIUS");
-    float suppression_radius = base_suppression_radius * activation_level;
-    FLAMEGPU->setVariable<float>("suppression_radius", suppression_radius);
-
-    // 3. CCL2 gradient for chemotaxis
-    // Note: Gradients are now pre-computed in update_agent_chemicals (host function)
-    // This is more efficient than calculating per-agent on the device
-    // The gradient variables are already set, so nothing to do here
     
     return flamegpu::ALIVE;
 }
@@ -364,26 +361,23 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_update_chemicals, flamegpu::MessageNone, flamegpu::
 // MDSC agent function: Compute chemical sources
 FLAMEGPU_AGENT_FUNCTION(mdsc_compute_chemical_sources, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int dead = FLAMEGPU->getVariable<int>("dead");
-    const float activation_level = FLAMEGPU->getVariable<float>("activation_level");
     
     // Dead cells don't produce
     if (dead == 1) {
-        FLAMEGPU->setVariable<float>("ROS_release_rate", 0.0f);
+        FLAMEGPU->setVariable<float>("ArgI_release_rate", 0.0f);
         FLAMEGPU->setVariable<float>("NO_release_rate", 0.0f);
+        FLAMEGPU->setVariable<float>("CCL2_uptake_rate", 0.0f);
         return flamegpu::ALIVE;
     }
-    
-    // ========== ROS (Reactive Oxygen Species) RELEASE ==========
-    // MDSCs produce ROS which suppresses T cell function locally
-    const float ROS_base = FLAMEGPU->environment.getProperty<float>("PARAM_ROS_RELEASE_RATE_BASE");
-    float ROS_rate = ROS_base * activation_level;
-    FLAMEGPU->setVariable<float>("ROS_release_rate", ROS_rate);
-    
-    // ========== NO (Nitric Oxide) RELEASE ==========
-    // MDSCs produce NO which also suppresses T cells
-    const float NO_base = FLAMEGPU->environment.getProperty<float>("PARAM_NO_RELEASE_RATE_BASE");
-    float NO_rate = NO_base * activation_level;
-    FLAMEGPU->setVariable<float>("NO_release_rate", NO_rate);
+
+    const float ArgI_release = FLAMEGPU->environment.getProperty<float>("PARAM_ARGI_RELEASE");
+    FLAMEGPU->setVariable<float>("ArgI_release_rate", ArgI_release);
+
+    const float NO_release = FLAMEGPU->environment.getProperty<float>("PARAM_NO_RELEASE");
+    FLAMEGPU->setVariable<float>("NO_release_rate", NO_release);
+
+    const float CCL2_uptake = FLAMEGPU->environment.getProperty<float>("PARAM_CCL2_UPTAKE");
+    FLAMEGPU->setVariable<float>("CCL2_uptake_rate", -CCL2_uptake);
     
     return flamegpu::ALIVE;
 }

@@ -13,7 +13,8 @@ enum AgentType : int {
     CELL_TYPE_TREG = 3,
     CELL_TYPE_MDSC = 4,
     CELL_TYPE_MAC = 5,
-    CELL_TYPE_FIB = 6
+    CELL_TYPE_FIB = 6,
+    CELL_TYPE_VASCULAR = 7
 };
 
 // Cancer cell state enumeration (matches CPU AgentStateEnum)
@@ -47,6 +48,7 @@ constexpr const char* AGENT_CANCER_CELL = "CancerCell";
 constexpr const char* AGENT_TCELL = "TCell";
 constexpr const char* AGENT_TREG = "TReg";
 constexpr const char* AGENT_MDSC = "MDSC";
+constexpr const char* AGENT_VASCULAR = "VascularCell";
 
 // Environment property names for grid dimensions
 constexpr const char* ENV_GRID_SIZE_X = "grid_size_x";

@@ -20,6 +20,8 @@ SimulationConfig::SimulationConfig()
     , num_tcells(50)
     , num_tregs(10)
     , num_mdscs(5)
+    , vascular_mode("random")
+    , vascular_xml_file("")
     , abm_out(true)
     , pde_out(true)
     , interval_out(1)
@@ -56,6 +58,10 @@ void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC:
             interval_out =  std::atoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             random_seed = std::atoi(argv[++i]);
+        } else if ((arg == "--vascular-mode" || arg == "-vm") && i + 1 < argc) {
+            vascular_mode = argv[++i];
+        } else if ((arg == "--vascular-xml" || arg == "-vx") && i + 1 < argc) {
+            vascular_xml_file = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "\nOptions:\n"
@@ -65,8 +71,10 @@ void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC:
                       << "  -s, --steps N            Number of simulation steps [default: 200]\n"
                       << "  -oa, --out_abm Bool      Output ABM at interval frequency [default: true]\n"
                       << "  -op, --out_pde Bool      Output PDE at interval frequency [default: true]\n"
-                      << "  -oi, --out_int N         Output interval frequency [default: 1]"
+                      << "  -oi, --out_int N         Output interval frequency [default: 1]\n"
                       << "  --seed N                 Random seed [default: 12345]\n"
+                      << "  -vm, --vascular-mode STR Vasculature initialization: random, xml, test [default: random]\n"
+                      << "  -vx, --vascular-xml FILE XML file for vasculature (when mode=xml)\n"
                       << "  -h, --help               Show this help\n";
             exit(0);
         }
@@ -404,28 +412,8 @@ void initializeMDSCs(
         agent.setVariable<int>("y", y);
         agent.setVariable<int>("z", z);
         
-        // Chemical variables
-        agent.setVariable<float>("local_O2", 0.001f);
-        agent.setVariable<float>("local_CCL2", 0.0f);
-        agent.setVariable<float>("local_TGFB", 0.0f);
-        agent.setVariable<float>("ROS_release_rate", 0.0f);
-        agent.setVariable<float>("NO_release_rate", 0.0f);
-        agent.setVariable<float>("suppression_radius", 1.0f);
-        agent.setVariable<float>("activation_level", 1.0f);
-        agent.setVariable<float>("CCL2_gradient_x", 0.0f);
-        agent.setVariable<float>("CCL2_gradient_y", 0.0f);
-        agent.setVariable<float>("CCL2_gradient_z", 0.0f);
-        
-        // Neighbor counts
-        agent.setVariable<int>("neighbor_cancer_count", 0);
-        agent.setVariable<int>("neighbor_Tcell_count", 0);
-        agent.setVariable<int>("neighbor_Treg_count", 0);
-        agent.setVariable<int>("neighbor_MDSC_count", 0);
-        agent.setVariable<unsigned int>("available_neighbors", 0u);
-        
         // Lifecycle
         agent.setVariable<int>("life", life);
-        agent.setVariable<int>("dead", 0);
         
         // Intent
         agent.setVariable<int>("intent_action", INTENT_NONE);
@@ -437,6 +425,269 @@ void initializeMDSCs(
     }
 
     std::cout << "Initialized " << placed << " MDSCs around tumor margin" << std::endl;
+}
+
+// ============================================================================
+// Vascular Cell Initialization
+// ============================================================================
+
+// Helper to set all vascular cell variables
+inline void setVascularCellVariables(
+    flamegpu::AgentVector::Agent& agent,
+    int x, int y, int z,
+    int state,
+    float move_dir_x = 1.0f,
+    float move_dir_y = 0.0f,
+    float move_dir_z = 0.0f,
+    unsigned int tip_id = 0)
+{
+    agent.setVariable<int>("x", x);
+    agent.setVariable<int>("y", y);
+    agent.setVariable<int>("z", z);
+    agent.setVariable<int>("vascular_state", state);
+    agent.setVariable<float>("local_O2", 0.0f);
+    agent.setVariable<float>("local_VEGFA", 0.0f);
+    agent.setVariable<float>("O2_source", 0.0f);
+    agent.setVariable<float>("VEGFA_sink", 0.0f);
+    agent.setVariable<float>("move_direction_x", move_dir_x);
+    agent.setVariable<float>("move_direction_y", move_dir_y);
+    agent.setVariable<float>("move_direction_z", move_dir_z);
+    agent.setVariable<int>("tumble", 1);  // Start in tumble phase
+    agent.setVariable<float>("vegfa_grad_x", 0.0f);
+    agent.setVariable<float>("vegfa_grad_y", 0.0f);
+    agent.setVariable<float>("vegfa_grad_z", 0.0f);
+    agent.setVariable<int>("intent_action", 0);  // INTENT_NONE
+    agent.setVariable<int>("target_x", -1);
+    agent.setVariable<int>("target_y", -1);
+    agent.setVariable<int>("target_z", -1);
+    agent.setVariable<unsigned int>("tip_id", tip_id);
+    agent.setVariable<int>("mature_to_phalanx", 0);
+    agent.setVariable<int>("branch", 0);
+}
+
+void initializeVascularCellsRandom(
+    flamegpu::AgentVector& vascular_agents,
+    int grid_x, int grid_y, int grid_z,
+    int tumor_radius,
+    int num_segments)
+{
+    const int center_x = grid_x / 2;
+    const int center_y = grid_y / 2;
+    const int center_z = grid_z / 2;
+    const double radius = tumor_radius;
+
+    // Random number generator
+    std::srand(12345);  // Use fixed seed for reproducibility
+    auto rand_unif = []() { return static_cast<double>(std::rand()) / RAND_MAX; };
+
+    int total_vessels = 0;
+
+    for (int seg = 0; seg < num_segments; seg++) {
+        int current_x, current_y, current_z;
+        double dx = 0, dy = 0, dz = 0;
+        int target_x, target_z;
+
+        // Random starting position coefficients
+        double z_coeff = 0.90 + (rand_unif() * 0.05);
+        double x_coeff = 0.90 + (rand_unif() * 0.05);
+
+        // Determine starting edge and direction based on segment number
+        switch (seg % 4) {
+            case 0:  // x=0 to x=xmax
+                current_x = 0;
+                current_y = center_y;
+                current_z = static_cast<int>(z_coeff * (grid_z - 1));
+                target_x = grid_x - 1;
+                target_z = current_z;
+                dx = 1;
+                break;
+
+            case 1:  // z=0 to z=zmax
+                current_x = static_cast<int>(x_coeff * (grid_x - 1));
+                current_y = center_y;
+                current_z = 0;
+                target_x = current_x;
+                target_z = grid_z - 1;
+                dz = 1;
+                break;
+
+            case 2:  // x=xmax to x=0
+                current_x = grid_x - 1;
+                current_y = center_y;
+                current_z = static_cast<int>(z_coeff * (grid_z - 1));
+                target_x = 0;
+                target_z = current_z;
+                dx = -1;
+                break;
+
+            case 3:  // z=zmax to z=0
+                current_x = static_cast<int>(x_coeff * (grid_x - 1));
+                current_y = center_y;
+                current_z = grid_z - 1;
+                target_x = current_x;
+                target_z = 0;
+                dz = -1;
+                break;
+        }
+
+        // Add starting position if outside tumor
+        double d_x_center = current_x - center_x;
+        double d_y_center = current_y - center_y;
+        double d_z_center = current_z - center_z;
+        double dist_sq = d_x_center * d_x_center + d_y_center * d_y_center + d_z_center * d_z_center;
+
+        if (dist_sq > radius * radius) {
+            vascular_agents.push_back();
+            flamegpu::AgentVector::Agent agent = vascular_agents.back();
+            setVascularCellVariables(agent, current_x, current_y, current_z,
+                                   2, 1.0f, 0.0f, 0.0f, seg);  // VAS_PHALANX, tip_id=seg
+            total_vessels++;
+        }
+
+        // Random walk to target
+        bool reached_end = false;
+        int segment_length = 0;
+        int max_length = 2 * std::max(grid_x, grid_z);
+
+        while (!reached_end && segment_length < max_length) {
+            // Directional persistence (80% keep direction, 20% change)
+            double persistence = 0.2;
+            if (rand_unif() > persistence) {
+                if (seg % 4 == 0) {  // Moving in +x
+                    dx = 1;
+                    dz = (rand_unif() > 0.5) ? 1 : -1;
+                }
+                else if (seg % 4 == 1) {  // Moving in +z
+                    dx = (rand_unif() > 0.5) ? 1 : -1;
+                    dz = 1;
+                }
+                else if (seg % 4 == 2) {  // Moving in -x
+                    dx = -1;
+                    dz = (rand_unif() > 0.5) ? 1 : -1;
+                }
+                else {  // Moving in -z
+                    dx = (rand_unif() > 0.5) ? 1 : -1;
+                    dz = -1;
+                }
+
+                // Y direction changes
+                double r = rand_unif();
+                if (r < 0.333) {
+                    dy = 1;
+                } else if (r < 0.667) {
+                    dy = -1;
+                } else {
+                    dy = 0;
+                }
+            }
+
+            // Calculate next position
+            int next_x = current_x + static_cast<int>(std::round(dx));
+            int next_y = current_y + static_cast<int>(std::round(dy));
+            int next_z = current_z + static_cast<int>(std::round(dz));
+
+            // Boundary checking with reflection
+            if (next_x < 0) {
+                next_x = 0;
+                dx = std::abs(dx);
+            }
+            if (next_x >= grid_x) {
+                next_x = grid_x - 1;
+                dx = -std::abs(dx);
+            }
+
+            if (next_y < 0) {
+                next_y = 0;
+                dy = 0;
+            }
+            if (next_y >= grid_y) {
+                next_y = grid_y - 1;
+                dy = 0;
+            }
+
+            // Keep z near target for x-moving segments
+            if (seg % 4 == 0 || seg % 4 == 2) {
+                double target_z_val = z_coeff * grid_z;
+                if (std::abs(next_z - target_z_val) > 2) {
+                    next_z = current_z + (next_z > target_z_val ? -1 : 1);
+                }
+            } else {
+                if (next_z < 0) {
+                    next_z = 0;
+                    dz = std::abs(dz);
+                }
+                if (next_z >= grid_z) {
+                    next_z = grid_z - 1;
+                    dz = -std::abs(dz);
+                }
+            }
+
+            // Keep x near target for z-moving segments
+            if (seg % 4 == 1 || seg % 4 == 3) {
+                double target_x_val = x_coeff * grid_x;
+                if (std::abs(next_x - target_x_val) > 2) {
+                    next_x = current_x + (next_x > target_x_val ? -1 : 1);
+                }
+            }
+
+            // Update position
+            current_x = next_x;
+            current_y = next_y;
+            current_z = next_z;
+
+            // Check if reached target
+            if ((seg % 4 == 0 && current_x >= target_x) ||
+                (seg % 4 == 1 && current_z >= target_z) ||
+                (seg % 4 == 2 && current_x <= target_x) ||
+                (seg % 4 == 3 && current_z <= target_z)) {
+                reached_end = true;
+            }
+
+            // Check distance from tumor center
+            d_x_center = current_x - center_x;
+            d_y_center = current_y - center_y;
+            d_z_center = current_z - center_z;
+            dist_sq = d_x_center * d_x_center + d_y_center * d_y_center + d_z_center * d_z_center;
+
+            // Only add if outside tumor
+            if (dist_sq > radius * radius) {
+                vascular_agents.push_back();
+                flamegpu::AgentVector::Agent agent = vascular_agents.back();
+                setVascularCellVariables(agent, current_x, current_y, current_z,
+                                       2, 1.0f, 0.0f, 0.0f, seg);  // VAS_PHALANX, tip_id=seg
+                total_vessels++;
+            }
+
+            segment_length++;
+        }
+    }
+
+    std::cout << "Initialized " << total_vessels << " vascular cells (random walk, "
+              << num_segments << " segments)" << std::endl;
+}
+
+void initializeVascularCellsTest(
+    flamegpu::AgentVector& vascular_agents,
+    int grid_x, int grid_y, int grid_z)
+{
+    // Add 5 test vessels at tumor center (vertical column)
+    const int cx = grid_x / 2;
+    const int cy = grid_y / 2;
+    const int cz = grid_z / 2;
+
+    // Create 2 phalanx and 3 tip cells for testing
+    for (int i = 0; i < 5; i++) {
+        vascular_agents.push_back();
+        flamegpu::AgentVector::Agent agent = vascular_agents.back();
+
+        // Make first 2 phalanx, last 3 tip cells
+        int state = (i < 2) ? 2 : 0;  // 2=PHALANX, 0=TIP
+        setVascularCellVariables(agent,
+                               cx, cy, cz + (i - 2) * 2,  // Vertical spacing
+                               state, 1.0f, 0.0f, 0.0f, i);  // Start moving +x, tip_id=i
+    }
+
+    std::cout << "Initialized 5 test vascular cells (2 phalanx, 3 tip)" << std::endl;
 }
 
 // ============================================================================
@@ -496,17 +747,50 @@ void initializeAllAgents(
         simulation.setPopulationData(treg_pop);
     }
     
-    // // Initialize MDSCs
-    // if (config.num_mdscs > 0) {
-    //     flamegpu::AgentVector mdsc_pop(model.Agent(AGENT_MDSC));
-    //     initializeMDSCs(
-    //         mdsc_pop, 
-    //         config.grid_x, config.grid_y, config.grid_z,
-    //         config.cluster_radius, config.num_mdscs, 
-    //         mdsc_life);
-    //     simulation.setPopulationData(mdsc_pop);
-    // }
-    
+    // Initialize MDSCs
+    if (config.num_mdscs > 0) {
+        flamegpu::AgentVector mdsc_pop(model.Agent(AGENT_MDSC));
+        initializeMDSCs(
+            mdsc_pop,
+            config.grid_x, config.grid_y, config.grid_z,
+            config.cluster_radius, config.num_mdscs,
+            mdsc_life);
+        simulation.setPopulationData(mdsc_pop);
+    }
+
+    // === VASCULAR CELLS ===
+    {
+        flamegpu::AgentVector vascular_vec(model.Agent(AGENT_VASCULAR));
+
+        if (config.vascular_mode == "random") {
+            // Random walk initialization (HCC-style)
+            int num_segments = 4;  // Default: 4 vessel segments
+            initializeVascularCellsRandom(
+                vascular_vec,
+                config.grid_x, config.grid_y, config.grid_z,
+                config.cluster_radius,
+                num_segments);
+        }
+        else if (config.vascular_mode == "xml") {
+            // XML-based initialization (Phase 2)
+            std::cout << "WARNING: XML vasculature loading not yet implemented" << std::endl;
+            std::cout << "  Falling back to test mode" << std::endl;
+            initializeVascularCellsTest(vascular_vec, config.grid_x, config.grid_y, config.grid_z);
+        }
+        else if (config.vascular_mode == "test") {
+            // Manual test pattern (5 vessels at center)
+            initializeVascularCellsTest(vascular_vec, config.grid_x, config.grid_y, config.grid_z);
+        }
+        else {
+            std::cerr << "ERROR: Unknown vascular mode '" << config.vascular_mode << "'" << std::endl;
+            std::cerr << "  Valid modes: random, xml, test" << std::endl;
+            std::cerr << "  Falling back to test mode" << std::endl;
+            initializeVascularCellsTest(vascular_vec, config.grid_x, config.grid_y, config.grid_z);
+        }
+
+        simulation.setPopulationData(vascular_vec);
+    }
+
     std::cout << "Agent initialization complete\n" << std::endl;
 }
 

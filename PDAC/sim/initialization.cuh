@@ -30,6 +30,10 @@ struct SimulationConfig {
     int num_tcells;
     int num_tregs;
     int num_mdscs;
+
+    // Vasculature initialization mode
+    std::string vascular_mode;  // "random", "xml", "test"
+    std::string vascular_xml_file;
     
     // Movement iterations per timestep
     int cancer_move_steps;
@@ -90,6 +94,18 @@ void initializeMDSCs(
     int grid_x, int grid_y, int grid_z,
     int tumor_radius, int num_mdscs,
     float mdsc_life_mean);
+
+// Initialize Vascular Cells with random walk (HCC-style)
+void initializeVascularCellsRandom(
+    flamegpu::AgentVector& vascular_agents,
+    int grid_x, int grid_y, int grid_z,
+    int tumor_radius,
+    int num_segments);
+
+// Initialize Vascular Cells with manual test pattern
+void initializeVascularCellsTest(
+    flamegpu::AgentVector& vascular_agents,
+    int grid_x, int grid_y, int grid_z);
 
 // ============================================================================
 // Master Initialization Function

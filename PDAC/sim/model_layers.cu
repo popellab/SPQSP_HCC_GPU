@@ -44,6 +44,10 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("final_broadcast_mdsc");
         layer.addAgentFunction(AGENT_MDSC, "broadcast_location");
     }
+    {
+        flamegpu::LayerDescription layer = model.newLayer("final_broadcast_vascular");
+        layer.addAgentFunction(AGENT_VASCULAR, "broadcast_location");
+    }
 
     // 5. Scan neighbors
     {
@@ -64,9 +68,10 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
     {
         flamegpu::LayerDescription layer = model.newLayer("update_chemical_states");
         layer.addAgentFunction(AGENT_CANCER_CELL, "update_chemicals");
-        layer.addAgentFunction(AGENT_TCELL, "update_chemicals");
-        layer.addAgentFunction(AGENT_TREG, "update_chemicals");
+        //layer.addAgentFunction(AGENT_TCELL, "update_chemicals"); // TCell states are updated in state step now
+        //layer.addAgentFunction(AGENT_TREG, "update_chemicals"); // TReg states are updated in state step now
         layer.addAgentFunction(AGENT_MDSC, "update_chemicals");
+        layer.addAgentFunction(AGENT_VASCULAR, "update_chemicals");
     }
 
     // 8. Agent state transitions (killing, division decisions, etc.)
@@ -76,6 +81,7 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_TCELL, "state_step");
         layer.addAgentFunction(AGENT_TREG, "state_step");
         layer.addAgentFunction(AGENT_MDSC, "state_step");
+        layer.addAgentFunction(AGENT_VASCULAR, "state_step");
     }
 
     // 9. Agents compute their chemical production/consumption rates
@@ -85,6 +91,7 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_TCELL, "compute_chemical_sources");
         layer.addAgentFunction(AGENT_TREG, "compute_chemical_sources");
         layer.addAgentFunction(AGENT_MDSC, "compute_chemical_sources");
+        layer.addAgentFunction(AGENT_VASCULAR, "compute_chemical_sources");
     }
 
     // 10. WRITE agent sources to PDE
@@ -97,6 +104,16 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
     {
         flamegpu::LayerDescription layer = model.newLayer("solve_pde");
         layer.addHostFunction(solve_pde_step);
+    }
+
+    // 11b. Vascular cell movement (tip cells only, run-tumble)
+    {
+        flamegpu::LayerDescription layer = model.newLayer("vascular_select_move");
+        layer.addAgentFunction(AGENT_VASCULAR, "select_move_target");
+    }
+    {
+        flamegpu::LayerDescription layer = model.newLayer("vascular_execute_move");
+        layer.addAgentFunction(AGENT_VASCULAR, "execute_move");
     }
 
     // 12 - 14. Division layers for each cell type
@@ -143,6 +160,16 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
     {
         flamegpu::LayerDescription layer = model.newLayer("execute_divide_treg");
         layer.addAgentFunction(AGENT_TREG, "execute_divide");
+    }
+
+    // Vascular cell division (select → execute)
+    {
+        flamegpu::LayerDescription layer = model.newLayer("select_divide_vascular");
+        layer.addAgentFunction(AGENT_VASCULAR, "select_divide_target");
+    }
+    {
+        flamegpu::LayerDescription layer = model.newLayer("execute_divide_vascular");
+        layer.addAgentFunction(AGENT_VASCULAR, "execute_divide");
     }
 
     {

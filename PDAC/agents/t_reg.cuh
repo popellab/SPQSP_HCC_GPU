@@ -693,7 +693,6 @@ FLAMEGPU_AGENT_FUNCTION(treg_update_chemicals, flamegpu::MessageNone, flamegpu::
 // TReg agent function: Compute chemical sources
 FLAMEGPU_AGENT_FUNCTION(treg_compute_chemical_sources, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int dead = FLAMEGPU->getVariable<int>("dead");
-    const float suppression_strength = FLAMEGPU->getVariable<float>("suppression_strength");
     
     // Dead cells don't produce
     if (dead == 1) {
@@ -702,24 +701,6 @@ FLAMEGPU_AGENT_FUNCTION(treg_compute_chemical_sources, flamegpu::MessageNone, fl
         FLAMEGPU->setVariable<float>("IL2_release_rate", 0.0f);
         return flamegpu::ALIVE;
     }
-    
-    // Rates set in state step for each t cell type
-    // // Get base rates from environment
-    // const float IL10_base = FLAMEGPU->environment.getProperty<float>("PARAM_IL10_RELEASE_RATE_BASE");
-    // const float TGFB_base = FLAMEGPU->environment.getProperty<float>("PARAM_TGFB_RELEASE_RATE_BASE");
-    // const float IL2_consumption_base = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_CONSUMPTION_TREG");
-    
-    // // ========== IL-10 RELEASE ==========
-    // float IL10_rate = IL10_base * suppression_strength;
-    // FLAMEGPU->setVariable<float>("IL10_release_rate", IL10_rate);
-    
-    // // ========== TGF-BETA RELEASE ==========
-    // float TGFB_rate = TGFB_base * suppression_strength;
-    // FLAMEGPU->setVariable<float>("TGFB_release_rate", TGFB_rate);
-    
-    // // ========== IL-2 CONSUMPTION (NEGATIVE!) ==========
-    // float IL2_consumption = IL2_consumption_base;
-    // FLAMEGPU->setVariable<float>("IL2_consumption_rate", -IL2_consumption);  // NEGATIVE!
     
     return flamegpu::ALIVE;
 }

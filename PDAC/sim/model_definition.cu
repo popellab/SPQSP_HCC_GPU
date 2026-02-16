@@ -6,6 +6,7 @@
 #include "../agents/t_cell.cuh"
 #include "../agents/t_reg.cuh"
 #include "../agents/mdsc.cuh"
+#include "../agents/vascular_cell.cuh"
 
 #include "../pde/pde_integration.cuh"
 #include "gpu_param.h"
@@ -28,6 +29,7 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
 void defineTCellAgent(flamegpu::ModelDescription& model, bool include_state_divide);
 void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divide);
 void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state);
+void defineVascularCellAgent(flamegpu::ModelDescription& model);
 
 // Forward declaration (implemented in model_layers.cu)
 void defineMainModelLayers(flamegpu::ModelDescription& model);
@@ -269,9 +271,6 @@ void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divid
     // Molecular exposure
     treg.newVariable<float>("IL2_exposure", 0.0f);
 
-    // Functional state
-    treg.newVariable<float>("suppression_strength", 1.0f); // Suppressive capacity [0-1]
-
     // Neighbor counts (computed via messaging)
     treg.newVariable<int>("neighbor_Tcell_count", 0);
     treg.newVariable<int>("neighbor_Treg_count", 0);
@@ -337,21 +336,12 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
     mdsc.newVariable<int>("y");
     mdsc.newVariable<int>("z");
 
-    mdsc.newVariable<float>("local_O2", 0.0f);
     mdsc.newVariable<float>("local_IFNg", 0.0f);
-    mdsc.newVariable<float>("local_IL2", 0.0f);
-    mdsc.newVariable<float>("local_IL10", 0.0f);
-    mdsc.newVariable<float>("local_CCL2", 0.0f);         // Attracted to CCL2
-    mdsc.newVariable<float>("local_TGFB", 0.0f);         // Can be activated by TGF-beta
 
     // Chemical production (MDSCs produce immunosuppressive factors)
-    mdsc.newVariable<float>("ROS_release_rate", 0.0f);   // Reactive oxygen species (deprecated, kept for compatibility)
     mdsc.newVariable<float>("NO_release_rate", 0.0f);    // Nitric oxide
     mdsc.newVariable<float>("ArgI_release_rate", 0.0f);  // Arginase I (immune suppression)
-
-    // Functional state
-    mdsc.newVariable<float>("suppression_radius", 1.0f); // Local suppression range
-    mdsc.newVariable<float>("activation_level", 1.0f);   // Activity level
+    mdsc.newVariable<float>("CCL2_uptake_rate", 0.0f);  // CCL2
 
     // Molecular state (affects behavior)
     mdsc.newVariable<float>("PDL1_syn", 0.0f);
@@ -404,6 +394,82 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
     }
 }
 
+// Define the VascularCell agent (Phase 1: Basic O2 secretion and VEGF-A uptake)
+void defineVascularCellAgent(flamegpu::ModelDescription& model) {
+    flamegpu::AgentDescription agent = model.newAgent(AGENT_VASCULAR);
+
+    // Position (voxel coordinates)
+    agent.newVariable<int>("x");
+    agent.newVariable<int>("y");
+    agent.newVariable<int>("z");
+
+    // State (VAS_TIP, VAS_STALK, VAS_PHALANX)
+    agent.newVariable<int>("vascular_state", VAS_PHALANX);  // Default: mature vessel
+
+    // Chemical concentrations (read from PDE)
+    agent.newVariable<float>("local_O2", 0.0f);
+    agent.newVariable<float>("local_VEGFA", 0.0f);
+
+    // VEGF-A gradient (read from PDE)
+    agent.newVariable<float>("vegfa_grad_x", 0.0f);
+    agent.newVariable<float>("vegfa_grad_y", 0.0f);
+    agent.newVariable<float>("vegfa_grad_z", 0.0f);
+
+    // Chemical source/sink rates (computed by agent)
+    agent.newVariable<float>("O2_source", 0.0f);
+    agent.newVariable<float>("VEGFA_sink", 0.0f);
+
+    // Movement direction (for tip cells)
+    agent.newVariable<float>("move_direction_x", 1.0f);
+    agent.newVariable<float>("move_direction_y", 0.0f);
+    agent.newVariable<float>("move_direction_z", 0.0f);
+
+    // Run-tumble state
+    agent.newVariable<int>("tumble", 1);  // Start in tumble phase
+
+    // Tip ID (for tracking vessel lineages)
+    agent.newVariable<unsigned int>("tip_id", 0);
+
+    // Intent variables for two-phase conflict resolution
+    agent.newVariable<int>("intent_action", INTENT_NONE);
+    agent.newVariable<int>("target_x", -1);
+    agent.newVariable<int>("target_y", -1);
+    agent.newVariable<int>("target_z", -1);
+
+    // State transition variables
+    agent.newVariable<int>("mature_to_phalanx", 0);  // Anastomosis flag
+    agent.newVariable<int>("branch", 0);  // Branch flag for phalanx cells
+
+    // Register agent functions
+    agent.newFunction("broadcast_location", vascular_broadcast_location)
+        .setMessageOutput(MSG_CELL_LOCATION);
+
+    agent.newFunction("update_chemicals", vascular_update_chemicals);
+
+    agent.newFunction("compute_chemical_sources", vascular_compute_chemical_sources);
+
+    // State transitions and division
+    agent.newFunction("state_step", vascular_state_step)
+        .setMessageInput(MSG_CELL_LOCATION);
+
+    agent.newFunction("select_divide_target", vascular_select_divide_target)
+        .setMessageOutput(MSG_INTENT);
+
+    {
+        flamegpu::AgentFunctionDescription fn = agent.newFunction("execute_divide", vascular_execute_divide);
+        fn.setMessageInput(MSG_INTENT);
+        fn.setAllowAgentDeath(false);
+        fn.setAgentOutput(agent);
+    }
+
+    // Movement functions (tip cells only)
+    agent.newFunction("select_move_target", vascular_select_move_target)
+        .setMessageOutput(MSG_INTENT);
+
+    agent.newFunction("execute_move", vascular_execute_move)
+        .setMessageInput(MSG_INTENT);
+}
+
 // Define the spatial message type for cell location broadcasting
 void defineCellLocationMessage(flamegpu::ModelDescription& model, float voxel_size, int grid_max) {
     flamegpu::MessageSpatial3D::Description message = model.newMessage<flamegpu::MessageSpatial3D>(MSG_CELL_LOCATION);
@@ -423,6 +489,7 @@ void defineCellLocationMessage(flamegpu::ModelDescription& model, float voxel_si
     message.newVariable<int>("voxel_x");
     message.newVariable<int>("voxel_y");
     message.newVariable<int>("voxel_z");
+    message.newVariable<unsigned int>("tip_id");  // For vascular cells
 }
 
 // Define the spatial message type for intent broadcasting (two-phase conflict resolution)
@@ -628,6 +695,7 @@ std::unique_ptr<flamegpu::ModelDescription> buildModel(
     defineTCellAgent(*model, true);
     defineTRegAgent(*model, true);
     defineMDSCAgent(*model, true);
+    defineVascularCellAgent(*model);
 
     // Define environment with GPU parameters loaded from XML
     defineEnvironment(*model, grid_x, grid_y, grid_z, voxel_size, gpu_params);

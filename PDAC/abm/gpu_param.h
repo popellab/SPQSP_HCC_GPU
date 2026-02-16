@@ -57,6 +57,19 @@ enum GPUParamFloat {
     // MDSC cell parameters
     PARAM_MDSC_LIFESPAN_SD,
     //*************************************************************************/
+    // Vas cell parameters
+    PARAM_VAS_MAXPERVOXEL,
+    PARAM_VAS_50,
+    PARAM_VAS_O2_CONC,
+    PARAM_VAS_RC,
+    PARAM_VAS_SIGMA,
+    PARAM_VAS_FRAC,
+    PARAM_VAS_INIT_DENS,
+    PARAM_VAS_TUMBLE,
+    PARAM_VAS_DELTA,
+    PARAM_VAS_BRANCH_PROB,
+    PARAM_VAS_MIN_NEIGHBOR,
+    //*************************************************************************/
     // Molecular parameters
     PARAM_IFNG_DIFFUSIVITY,
     PARAM_IL2_DIFFUSIVITY,
