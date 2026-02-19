@@ -79,6 +79,18 @@ __device__ __forceinline__ int voxel_index(int x, int y, int z, int size_x, int 
     return x + y * size_x + z * size_x * size_y;
 }
 
+// ============================================================
+// Occupancy Grid Constants
+// ============================================================
+// Max grid dimension for compile-time MacroProperty allocation.
+// Only voxels [0..runtime_grid_size-1] are actually used.
+// Memory: 128^3 * 8 types * 4 bytes = ~67 MB (acceptable for modern GPU).
+constexpr int OCC_GRID_MAX = 128;
+
+// Number of occupancy type slots (matches AgentType enum max index + 1).
+// Index 0 (AGENT_DUMMY) is unused; indices 1-7 map directly to AgentType values.
+constexpr int NUM_OCC_TYPES = 8;
+
 // Helper function: Hill equation
 __device__ __forceinline__ float hill_equation(float x, float k50, float n) {
     if (x <= 0.0f) return 0.0f;

@@ -1,4 +1,5 @@
 #include "flamegpu/flamegpu.h"
+#include <string>
 
 #include "../core/common.cuh"
 #include "../pde/pde_integration.cuh"
@@ -11,6 +12,7 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER collect_agent_sources;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_pde_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_agent_counts;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_qsp_step;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_occupancy_grid;
 
 // Define main model execution layers (state transitions and division)
 void defineMainModelLayers(flamegpu::ModelDescription& model) {
@@ -137,70 +139,79 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addHostFunction(solve_pde_step);
     }
 
-    // 11b. Vascular cell movement (tip cells only, run-tumble)
+    // 12. Occupancy grid: zero then populate with current live agent positions.
+    // Must run after state_transitions (so dead agents are removed).
     {
-        flamegpu::LayerDescription layer = model.newLayer("vascular_select_move");
-        layer.addAgentFunction(AGENT_VASCULAR, "select_move_target");
+        flamegpu::LayerDescription layer = model.newLayer("zero_occ_grid");
+        layer.addHostFunction(zero_occupancy_grid);
     }
     {
-        flamegpu::LayerDescription layer = model.newLayer("vascular_execute_move");
-        layer.addAgentFunction(AGENT_VASCULAR, "execute_move");
-    }
-
-    // 12 - 14. Division layers for each cell type
-    // Division: FLAMEGPU2 clears message lists when a new layer outputs to them.
-    // Each cell type's execute must immediately follow its select to read the correct messages.
-    // Note: FLAMEGPU2 doesn't allow multiple functions outputting to the same message in one layer.
-
-    // Cancer cell division (select → execute)
-    {
-        flamegpu::LayerDescription layer = model.newLayer("select_divide_cancer");
-        layer.addAgentFunction(AGENT_CANCER_CELL, "select_divide_target");
-    }
-    {
-        flamegpu::LayerDescription layer = model.newLayer("execute_divide_cancer");
-        layer.addAgentFunction(AGENT_CANCER_CELL, "execute_divide");
+        // All agent types write their position atomically in parallel.
+        flamegpu::LayerDescription layer = model.newLayer("write_to_occ_grid");
+        layer.addAgentFunction(AGENT_CANCER_CELL, "write_to_occ_grid");
+        layer.addAgentFunction(AGENT_TCELL,       "write_to_occ_grid");
+        layer.addAgentFunction(AGENT_TREG,        "write_to_occ_grid");
+        layer.addAgentFunction(AGENT_MDSC,        "write_to_occ_grid");
+        layer.addAgentFunction(AGENT_VASCULAR,    "write_to_occ_grid");
     }
 
-    // Check for packing AFTER division
+    // 13. Single-phase movement via occ_grid (replaces per-cell-type submodels).
+    // Each agent type gets N repeated move layers matching its XML move step count.
+    // Agents CAS/atomicAdd to claim voxels; releases old voxel atomically on success.
+    // Vascular tip cells use run-tumble (no occ_grid); stalk/phalanx don't move.
+
     {
-        flamegpu::LayerDescription layer = model.newLayer("postdivision_broadcast_cancer");
-        layer.addAgentFunction(AGENT_CANCER_CELL, "broadcast_location");
-    }
-    {
-        flamegpu::LayerDescription layer = model.newLayer("postdivision_check_packing");
-        layer.addAgentFunction(AGENT_CANCER_CELL, "check_voxel_packing");
+        flamegpu::LayerDescription layer = model.newLayer("reset_moves_cancer");
+            layer.addAgentFunction(AGENT_CANCER_CELL, "reset_moves");
     }
 
-    // population won't expand until we include recruitment
-    // T cell division (select → execute)
     {
-        flamegpu::LayerDescription layer = model.newLayer("select_divide_tcell");
-        layer.addAgentFunction(AGENT_TCELL, "select_divide_target");
-    }
-    {
-        flamegpu::LayerDescription layer = model.newLayer("execute_divide_tcell");
-        layer.addAgentFunction(AGENT_TCELL, "execute_divide");
+        const int cancer_steps = model.Environment().getProperty<int>("PARAM_CANCER_MOVE_STEPS_STEM");
+        const int tcell_steps  = model.Environment().getProperty<int>("PARAM_TCELL_MOVE_STEPS");
+        const int treg_steps   = model.Environment().getProperty<int>("PARAM_TCELL_MOVE_STEPS");
+        const int mdsc_steps   = model.Environment().getProperty<int>("PARAM_MDSC_MOVE_STEPS");
+
+        for (int i = 0; i < cancer_steps; i++) {
+            flamegpu::LayerDescription layer = model.newLayer("move_cancer_" + std::to_string(i));
+            layer.addAgentFunction(AGENT_CANCER_CELL, "move");
+        }
+        for (int i = 0; i < tcell_steps; i++) {
+            flamegpu::LayerDescription layer = model.newLayer("move_tcell_" + std::to_string(i));
+            layer.addAgentFunction(AGENT_TCELL, "move");
+        }
+        for (int i = 0; i < treg_steps; i++) {
+            flamegpu::LayerDescription layer = model.newLayer("move_treg_" + std::to_string(i));
+            layer.addAgentFunction(AGENT_TREG, "move");
+        }
+        for (int i = 0; i < mdsc_steps; i++) {
+            flamegpu::LayerDescription layer = model.newLayer("move_mdsc_" + std::to_string(i));
+            layer.addAgentFunction(AGENT_MDSC, "move");
+        }
+        {
+            flamegpu::LayerDescription layer = model.newLayer("move_vascular");
+            layer.addAgentFunction(AGENT_VASCULAR, "move");
+        }
     }
 
-    // TReg division (select → execute)
+    // 14. Single-phase division (atomicCAS replaces select → execute pair).
+    // Each successful claim updates the grid immediately, so concurrent
+    // threads in the same kernel see the updated occupancy.
     {
-        flamegpu::LayerDescription layer = model.newLayer("select_divide_treg");
-        layer.addAgentFunction(AGENT_TREG, "select_divide_target");
+        flamegpu::LayerDescription layer = model.newLayer("divide_cancer");
+        layer.addAgentFunction(AGENT_CANCER_CELL, "divide");
     }
     {
-        flamegpu::LayerDescription layer = model.newLayer("execute_divide_treg");
-        layer.addAgentFunction(AGENT_TREG, "execute_divide");
+        flamegpu::LayerDescription layer = model.newLayer("divide_tcell");
+        layer.addAgentFunction(AGENT_TCELL, "divide");
+    }
+    {
+        flamegpu::LayerDescription layer = model.newLayer("divide_treg");
+        layer.addAgentFunction(AGENT_TREG, "divide");
     }
 
-    // Vascular cell division (select → execute)
     {
-        flamegpu::LayerDescription layer = model.newLayer("select_divide_vascular");
-        layer.addAgentFunction(AGENT_VASCULAR, "select_divide_target");
-    }
-    {
-        flamegpu::LayerDescription layer = model.newLayer("execute_divide_vascular");
-        layer.addAgentFunction(AGENT_VASCULAR, "execute_divide");
+        flamegpu::LayerDescription layer = model.newLayer("divide_vascular");
+        layer.addAgentFunction(AGENT_VASCULAR, "vascular_divide");
     }
 
     {

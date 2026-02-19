@@ -675,6 +675,110 @@ FLAMEGPU_AGENT_FUNCTION(treg_execute_divide, flamegpu::MessageSpatial3D, flamegp
 }
 
 
+// ============================================================
+// Occupancy Grid Functions
+// ============================================================
+
+FLAMEGPU_AGENT_FUNCTION(treg_write_to_occ_grid, flamegpu::MessageNone, flamegpu::MessageNone) {
+    const int x = FLAMEGPU->getVariable<int>("x");
+    const int y = FLAMEGPU->getVariable<int>("y");
+    const int z = FLAMEGPU->getVariable<int>("z");
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+    occ[x][y][z][CELL_TYPE_TREG] += 1u;
+    return flamegpu::ALIVE;
+}
+
+// Single-phase TReg division using occupancy grid.
+FLAMEGPU_AGENT_FUNCTION(treg_divide, flamegpu::MessageNone, flamegpu::MessageNone) {
+    const int divide_flag  = FLAMEGPU->getVariable<int>("divide_flag");
+    const int divide_cd    = FLAMEGPU->getVariable<int>("divide_cd");
+    const int divide_limit = FLAMEGPU->getVariable<int>("divide_limit");
+
+    if (FLAMEGPU->getVariable<int>("dead") == 1 ||
+        divide_flag == 0 || divide_cd > 0 || divide_limit <= 0) {
+        return flamegpu::ALIVE;
+    }
+
+    const int my_x  = FLAMEGPU->getVariable<int>("x");
+    const int my_y  = FLAMEGPU->getVariable<int>("y");
+    const int my_z  = FLAMEGPU->getVariable<int>("z");
+    const int size_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int size_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int size_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+
+    int cand_x[6], cand_y[6], cand_z[6];
+    int n_cands = 0;
+    unsigned int max_cap[6];
+    for (int i = 0; i < 6; i++) {
+        int dx, dy, dz;
+        get_moore_direction_t(i, dx, dy, dz);
+        const int nx = my_x + dx, ny = my_y + dy, nz = my_z + dz;
+        if (!is_in_bounds(nx, ny, nz, size_x, size_y, size_z)) continue;
+
+        bool has_cancer = (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u);
+        max_cap[n_cands] = static_cast<unsigned int>(has_cancer ? MAX_T_PER_VOXEL_WITH_CANCER : MAX_T_PER_VOXEL);
+
+        if (occ[nx][ny][nz][CELL_TYPE_T] < max_cap[n_cands]) {
+            cand_x[n_cands] = nx;
+            cand_y[n_cands] = ny;
+            cand_z[n_cands] = nz;
+            n_cands++;
+        }
+    }
+
+    if (n_cands == 0) return flamegpu::ALIVE;
+
+    const int cell_state     = FLAMEGPU->getVariable<int>("cell_state");
+    const int div_interval   = FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL");
+    const float treg_life_mean = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
+
+    for (int i = 0; i < n_cands; i++) {
+        const int j = i + static_cast<int>(FLAMEGPU->random.uniform<float>() * (n_cands - i));
+        int tx = cand_x[i]; cand_x[i] = cand_x[j]; cand_x[j] = tx;
+        int ty = cand_y[i]; cand_y[i] = cand_y[j]; cand_y[j] = ty;
+        int tz = cand_z[i]; cand_z[i] = cand_z[j]; cand_z[j] = tz;
+        unsigned int max_curr = max_cap[i]; max_cap[i] = max_cap[j]; max_cap[j] = max_curr;
+
+        // operator+ performs atomicAdd and returns the OLD value
+        const unsigned int old_count = occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_TREG] + 1u;
+        if (old_count >= max_curr) {
+            occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_TREG] -= 1u;  // undo
+            continue;
+        }
+
+        const float rnd = FLAMEGPU->random.uniform<float>();
+        const int daughter_life = static_cast<int>(treg_life_mean * logf(1.0f / (rnd + 0.0001f)) + 0.5f);
+
+        FLAMEGPU->agent_out.setVariable<int>("x", cand_x[i]);
+        FLAMEGPU->agent_out.setVariable<int>("y", cand_y[i]);
+        FLAMEGPU->agent_out.setVariable<int>("z", cand_z[i]);
+        FLAMEGPU->agent_out.setVariable<int>("cell_state", cell_state);
+        FLAMEGPU->agent_out.setVariable<int>("divide_flag", 1);
+        FLAMEGPU->agent_out.setVariable<int>("divide_cd", div_interval);
+        FLAMEGPU->agent_out.setVariable<int>("divide_limit", divide_limit - 1);
+        FLAMEGPU->agent_out.setVariable<int>("life", daughter_life > 0 ? daughter_life : 1);
+
+        // Update parent
+        FLAMEGPU->setVariable<int>("divide_flag", 1);
+        FLAMEGPU->setVariable<int>("divide_limit", divide_limit - 1);
+        FLAMEGPU->setVariable<int>("divide_cd", div_interval);
+
+        break;
+    }
+
+    // Clear parent intent
+    FLAMEGPU->setVariable<int>("intent_action", INTENT_NONE);
+    FLAMEGPU->setVariable<int>("target_x", -1);
+    FLAMEGPU->setVariable<int>("target_y", -1);
+    FLAMEGPU->setVariable<int>("target_z", -1);
+
+    return flamegpu::ALIVE;
+}
+
 // TReg agent function: Update chemicals from PDE
 FLAMEGPU_AGENT_FUNCTION(treg_update_chemicals, flamegpu::MessageNone, flamegpu::MessageNone) {
     // ========== READ CHEMICAL CONCENTRATIONS FROM AGENT VARIABLES ==========
@@ -700,6 +804,77 @@ FLAMEGPU_AGENT_FUNCTION(treg_compute_chemical_sources, flamegpu::MessageNone, fl
         return flamegpu::ALIVE;
     }
     
+    return flamegpu::ALIVE;
+}
+
+// Single-phase TReg movement using occupancy grid.
+// Replaces two-phase select_move_target + execute_move.
+// Same capacity rules as T cells (up to MAX_T_PER_VOXEL).
+FLAMEGPU_AGENT_FUNCTION(treg_move, flamegpu::MessageNone, flamegpu::MessageNone) {
+    if (FLAMEGPU->getVariable<int>("dead") == 1) return flamegpu::ALIVE;
+
+    // ECM saturation: 20% chance to skip movement this step
+    if (FLAMEGPU->random.uniform<float>() < 0.2f) return flamegpu::ALIVE;
+
+    const int x = FLAMEGPU->getVariable<int>("x");
+    const int y = FLAMEGPU->getVariable<int>("y");
+    const int z = FLAMEGPU->getVariable<int>("z");
+    const int size_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int size_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int size_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+
+    // Von Neumann neighbor offsets
+    const int ddx[6] = {-1, 1,  0, 0,  0, 0};
+    const int ddy[6] = { 0, 0, -1, 1,  0, 0};
+    const int ddz[6] = { 0, 0,  0, 0, -1, 1};
+
+    // Build candidate list: neighbors with room for more TRegs
+    int cands[6];
+    int n_cands = 0;
+    for (int i = 0; i < 6; i++) {
+        int nx = x + ddx[i];
+        int ny = y + ddy[i];
+        int nz = z + ddz[i];
+        if (nx < 0 || nx >= size_x || ny < 0 || ny >= size_y || nz < 0 || nz >= size_z) continue;
+        unsigned int max_t = (occ[nx][ny][nz][CELL_TYPE_CANCER] > 0u)
+            ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
+            : static_cast<unsigned int>(MAX_T_PER_VOXEL);
+        if (occ[nx][ny][nz][CELL_TYPE_TREG] < max_t) {
+            cands[n_cands++] = i;
+        }
+    }
+    if (n_cands == 0) return flamegpu::ALIVE;
+
+    // Fisher-Yates shuffle for random candidate order
+    for (int i = n_cands - 1; i > 0; i--) {
+        int j = FLAMEGPU->random.uniform<int>(0, i);
+        int tmp = cands[i]; cands[i] = cands[j]; cands[j] = tmp;
+    }
+
+    // Try candidates with atomicAdd+undo pattern
+    for (int i = 0; i < n_cands; i++) {
+        int idx = cands[i];
+        int nx = x + ddx[idx];
+        int ny = y + ddy[idx];
+        int nz = z + ddz[idx];
+        unsigned int max_t = (occ[nx][ny][nz][CELL_TYPE_CANCER] > 0u)
+            ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
+            : static_cast<unsigned int>(MAX_T_PER_VOXEL);
+        unsigned int old = occ[nx][ny][nz][CELL_TYPE_TREG] + 1u;
+        if (old >= max_t) {
+            occ[nx][ny][nz][CELL_TYPE_TREG] -= 1u;  // undo — over capacity
+            continue;
+        }
+        // Won: release old voxel and move
+        occ[x][y][z][CELL_TYPE_TREG] -= 1u;
+        FLAMEGPU->setVariable<int>("x", nx);
+        FLAMEGPU->setVariable<int>("y", ny);
+        FLAMEGPU->setVariable<int>("z", nz);
+        break;
+    }
     return flamegpu::ALIVE;
 }
 

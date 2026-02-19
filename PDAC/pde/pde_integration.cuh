@@ -53,6 +53,9 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_mdscs;
 // Reset recruitment sources (call at start of each step)
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_recruitment_sources;
 
+// Occupancy grid: zero before agents write their positions each step
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_occupancy_grid;
+
 } // namespace PDAC
 
 #endif // PDE_INTEGRATION_CUH

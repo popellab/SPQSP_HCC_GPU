@@ -24,6 +24,7 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER collect_agent_sources;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_pde_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_agent_counts;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_qsp_step;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_occupancy_grid;
 
 // Forward declarations
 void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state_divide);
@@ -105,32 +106,23 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
     cancer_cell.newFunction("count_neighbors", cancer_count_neighbors)
         .setMessageInput(MSG_CELL_LOCATION);
 
-    cancer_cell.newFunction("check_voxel_packing", cancer_check_voxel_packing)
-        .setMessageInput(MSG_CELL_LOCATION);
+    cancer_cell.newFunction("reset_moves", cancer_reset_moves);
 
     cancer_cell.newFunction("update_chemicals", cancer_update_chemicals);
 
     cancer_cell.newFunction("compute_chemical_sources", cancer_compute_chemical_sources);
 
-    cancer_cell.newFunction("reset_moves", cancer_reset_moves);
-
-    cancer_cell.newFunction("select_move_target", cancer_select_move_target)
-        .setMessageOutput(MSG_INTENT);
-
-    cancer_cell.newFunction("execute_move", cancer_execute_move)
-        .setMessageInput(MSG_INTENT);
-
-    // Division and state functions only in main model
+    // Movement, state, division, and occupancy grid functions only in main model
+    // (these access occ_grid which is not defined in submodel environments)
     if (include_state_divide) {
+        cancer_cell.newFunction("write_to_occ_grid", cancer_write_to_occ_grid);
+        cancer_cell.newFunction("move", cancer_move);
+
         cancer_cell.newFunction("state_step", cancer_cell_state_step)
             .setAllowAgentDeath(true);
 
-        cancer_cell.newFunction("select_divide_target", cancer_select_divide_target)
-            .setMessageOutput(MSG_INTENT);
-
         {
-            flamegpu::AgentFunctionDescription fn = cancer_cell.newFunction("execute_divide", cancer_execute_divide);
-            fn.setMessageInput(MSG_INTENT);
+            flamegpu::AgentFunctionDescription fn = cancer_cell.newFunction("divide", cancer_divide);
             fn.setAgentOutput(cancer_cell);
         }
     }
@@ -212,23 +204,16 @@ void defineTCellAgent(flamegpu::ModelDescription& model, bool include_state_divi
 
     tcell.newFunction("compute_chemical_sources", tcell_compute_chemical_sources);
 
-    tcell.newFunction("select_move_target", tcell_select_move_target)
-        .setMessageOutput(MSG_INTENT);
-
-    tcell.newFunction("execute_move", tcell_execute_move)
-        .setMessageInput(MSG_INTENT);
-
-    // Division and state functions only in main model
+    // Movement, state, division, and occupancy grid functions only in main model
     if (include_state_divide) {
+        tcell.newFunction("write_to_occ_grid", tcell_write_to_occ_grid);
+        tcell.newFunction("move", tcell_move);
+
         tcell.newFunction("state_step", tcell_state_step)
             .setAllowAgentDeath(true);
 
-        tcell.newFunction("select_divide_target", tcell_select_divide_target)
-            .setMessageOutput(MSG_INTENT);
-
         {
-            flamegpu::AgentFunctionDescription fn = tcell.newFunction("execute_divide", tcell_execute_divide);
-            fn.setMessageInput(MSG_INTENT);
+            flamegpu::AgentFunctionDescription fn = tcell.newFunction("divide", tcell_divide);
             fn.setAgentOutput(tcell);
         }
     }
@@ -303,23 +288,16 @@ void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divid
 
     treg.newFunction("compute_chemical_sources", treg_compute_chemical_sources);
 
-    treg.newFunction("select_move_target", treg_select_move_target)
-        .setMessageOutput(MSG_INTENT);
-
-    treg.newFunction("execute_move", treg_execute_move)
-        .setMessageInput(MSG_INTENT);
-
-    // Division and state functions only in main model
+    // Movement, state, division, and occupancy grid functions only in main model
     if (include_state_divide) {
+        treg.newFunction("write_to_occ_grid", treg_write_to_occ_grid);
+        treg.newFunction("move", treg_move);
+
         treg.newFunction("state_step", treg_state_step)
             .setAllowAgentDeath(true);
 
-        treg.newFunction("select_divide_target", treg_select_divide_target)
-            .setMessageOutput(MSG_INTENT);
-
         {
-            flamegpu::AgentFunctionDescription fn = treg.newFunction("execute_divide", treg_execute_divide);
-            fn.setMessageInput(MSG_INTENT);
+            flamegpu::AgentFunctionDescription fn = treg.newFunction("divide", treg_divide);
             fn.setAgentOutput(treg);
         }
     }
@@ -382,14 +360,11 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
 
     mdsc.newFunction("compute_chemical_sources", mdsc_compute_chemical_sources);
 
-    mdsc.newFunction("select_move_target", mdsc_select_move_target)
-        .setMessageOutput(MSG_INTENT);
-
-    mdsc.newFunction("execute_move", mdsc_execute_move)
-        .setMessageInput(MSG_INTENT);
-
-    // State step only in main model (MDSCs don't divide)
+    // Movement and state functions only in main model (MDSCs don't divide)
     if (include_state) {
+        mdsc.newFunction("write_to_occ_grid", mdsc_write_to_occ_grid);
+        mdsc.newFunction("move", mdsc_move);
+
         mdsc.newFunction("state_step", mdsc_state_step)
             .setAllowAgentDeath(true);
     }
@@ -450,6 +425,9 @@ void defineVascularCellAgent(flamegpu::ModelDescription& model) {
 
     agent.newFunction("compute_chemical_sources", vascular_compute_chemical_sources);
 
+    // Occupancy grid write function
+    agent.newFunction("write_to_occ_grid", vascular_write_to_occ_grid);
+
     // Recruitment source marking
     agent.newFunction("mark_t_sources", vascular_mark_t_sources);
 
@@ -457,22 +435,14 @@ void defineVascularCellAgent(flamegpu::ModelDescription& model) {
     agent.newFunction("state_step", vascular_state_step)
         .setMessageInput(MSG_CELL_LOCATION);
 
-    agent.newFunction("select_divide_target", vascular_select_divide_target)
-        .setMessageOutput(MSG_INTENT);
-
+    // Single-phase divide using occupancy grid
     {
-        flamegpu::AgentFunctionDescription fn = agent.newFunction("execute_divide", vascular_execute_divide);
-        fn.setMessageInput(MSG_INTENT);
-        fn.setAllowAgentDeath(false);
+        flamegpu::AgentFunctionDescription fn = agent.newFunction("vascular_divide", vascular_divide);
         fn.setAgentOutput(agent);
     }
 
-    // Movement functions (tip cells only)
-    agent.newFunction("select_move_target", vascular_select_move_target)
-        .setMessageOutput(MSG_INTENT);
-
-    agent.newFunction("execute_move", vascular_execute_move)
-        .setMessageInput(MSG_INTENT);
+    // Single-phase movement (tip cells only, run-tumble, no occ_grid interaction)
+    agent.newFunction("move", vascular_move);
 }
 
 // Define the spatial message type for cell location broadcasting
@@ -590,111 +560,16 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     env.newProperty<int>("ABM_cc_death", 0);  
     env.newProperty<int>("ABM_cc_t_kill", 0);  
 
+    // Occupancy grid: stores per-voxel cell counts indexed by AgentType enum value.
+    // Dimensions are compile-time constants; only [0..grid_size-1] are used at runtime.
+    env.newMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+
     // Populate ALL other parameters from XML
     params.populateFlameGPUEnvironment(env);
 }
 
-// Define environment properties for a movement submodel
-void defineSubmodelEnvironment(flamegpu::ModelDescription& model,
-                                int grid_x, int grid_y, int grid_z,
-                                float voxel_size) {
-    flamegpu::EnvironmentDescription env = model.Environment();
-
-    // Grid dimensions (needed for bounds checking)
-    env.newProperty<int>(ENV_GRID_SIZE_X, grid_x);
-    env.newProperty<int>(ENV_GRID_SIZE_Y, grid_y);
-    env.newProperty<int>(ENV_GRID_SIZE_Z, grid_z);
-    env.newProperty<float>(ENV_VOXEL_SIZE, voxel_size);
-}
-
-void buildMovementSubmodel(
-    flamegpu::ModelDescription& submodel,
-    const std::string& moving_agent_name,
-    const std::vector<std::string>& all_agent_names,
-    int grid_x, int grid_y, int grid_z, float voxel_size)
-{
-    int grid_max = std::max({grid_x, grid_y, grid_z});
-
-    // Define environment and messages
-    defineSubmodelEnvironment(submodel, grid_x, grid_y, grid_z, voxel_size);
-    defineCellLocationMessage(submodel, voxel_size, grid_max);
-    defineIntentMessage(submodel, voxel_size, grid_max);
-
-    // Define ALL agents (needed for broadcasting locations)
-    // This uses your existing define functions with include_state_divide=false
-    for (const auto& agent_name : all_agent_names) {
-        if (agent_name == AGENT_CANCER_CELL) {
-            defineCancerCellAgent(submodel, false);
-        } else if (agent_name == AGENT_TCELL) {
-            defineTCellAgent(submodel, false);
-        } else if (agent_name == AGENT_TREG) {
-            defineTRegAgent(submodel, false);
-        } else if (agent_name == AGENT_MDSC) {
-            defineMDSCAgent(submodel, false);
-        }
-        // Add new cell types here as else-if blocks
-    }
-
-    // Layer 1-4: ALL agents broadcast their locations (separate layers required by FLAMEGPU2)
-    // Messages should accumulate across layers within the same step
-    for (const auto& agent_name : all_agent_names) {
-        flamegpu::LayerDescription layer = submodel.newLayer("broadcast_" + agent_name);
-        layer.addAgentFunction(agent_name, "broadcast_location");
-    }
-
-    // Layer 2: Only the moving agent scans neighbors
-    {
-        flamegpu::LayerDescription layer = submodel.newLayer("scan");
-        // Cancer cells use "count_neighbors", others use "scan_neighbors"
-        if (moving_agent_name == AGENT_CANCER_CELL) {
-            layer.addAgentFunction(moving_agent_name, "count_neighbors");
-        } else {
-            layer.addAgentFunction(moving_agent_name, "scan_neighbors");
-        }
-    }
-
-    // Layer 3: Only the moving agent selects move target
-    {
-        flamegpu::LayerDescription layer = submodel.newLayer("select_move");
-        layer.addAgentFunction(moving_agent_name, "select_move_target");
-    }
-
-    // Layer 4: Only the moving agent executes move
-    {
-        flamegpu::LayerDescription layer = submodel.newLayer("execute_move");
-        layer.addAgentFunction(moving_agent_name, "execute_move");
-    }
-}
-
-// Helper to create and configure a movement submodel in the main model
-flamegpu::SubModelDescription createMovementSubmodel(
-    flamegpu::ModelDescription& model,
-    const std::string& submodel_name,
-    const std::string& moving_agent_name,
-    const std::vector<std::string>& all_agent_names,
-    int max_steps,
-    int grid_x, int grid_y, int grid_z, float voxel_size)
-{
-    // Create the submodel description
-    flamegpu::ModelDescription submodelDesc(submodel_name);
-    buildMovementSubmodel(submodelDesc, moving_agent_name, all_agent_names,
-                          grid_x, grid_y, grid_z, voxel_size);
-
-    // Add submodel to main model
-    auto submodel = model.newSubModel(submodel_name, submodelDesc);
-
-    // Bind ALL agents (so positions stay synchronized)
-    for (const auto& agent_name : all_agent_names) {
-        submodel.bindAgent(agent_name, agent_name, true, true);
-    }
-
-    // Set max steps for this agent type
-    submodel.setMaxSteps(max_steps);
-
-    return submodel;
-}
-
-// Build the complete model with per-cell-type movement submodels
+// Build the complete model
 std::unique_ptr<flamegpu::ModelDescription> buildModel(
     int grid_x, int grid_y, int grid_z, float voxel_size,
     const PDAC::GPUParam& gpu_params) {
@@ -703,33 +578,10 @@ std::unique_ptr<flamegpu::ModelDescription> buildModel(
 
     int grid_max = std::max({grid_x, grid_y, grid_z});
 
-    // Define messages for main model
+    // MSG_CELL_LOCATION is still used by broadcast_location and scan_neighbors functions
+    // (for state transitions and neighbor detection). MSG_INTENT has been removed;
+    // all movement and division now use the occupancy grid (occ_grid) directly.
     defineCellLocationMessage(*model, voxel_size, grid_max);
-    defineIntentMessage(*model, voxel_size, grid_max);
-
-    // ========== AGENT CONFIGURATION ==========
-    // To add a new agent type:
-    // 1. Add to this list
-    // 2. Add its define function call below
-    // 3. Add its parameter name for move steps
-    struct AgentConfig {
-        std::string name;
-        std::string move_steps_param;
-    };
-
-    const std::vector<AgentConfig> agent_configs = {
-        {AGENT_CANCER_CELL, "PARAM_CANCER_MOVE_STEPS_STEM"},
-        {AGENT_TCELL,       "PARAM_TCELL_MOVE_STEPS"},
-        {AGENT_TREG,        "PARAM_TCELL_MOVE_STEPS"},  // or add PARAM_TREG_MOVE_STEPS
-        {AGENT_MDSC,        "PARAM_MDSC_MOVE_STEPS"}
-        // {AGENT_MACROPHAGE, "PARAM_MACROPHAGE_MOVE_STEPS"},
-    };
-
-    // Extract just agent names for convenience
-    std::vector<std::string> all_agent_names;
-    for (const auto& cfg : agent_configs) {
-        all_agent_names.push_back(cfg.name);
-    }
 
     // Define agents with all functions
     defineCancerCellAgent(*model, true);
@@ -741,36 +593,8 @@ std::unique_ptr<flamegpu::ModelDescription> buildModel(
     // Define environment with GPU parameters loaded from XML
     defineEnvironment(*model, grid_x, grid_y, grid_z, voxel_size, gpu_params);
 
-    // First reset cancer move steps
-    {
-        auto layer = model->newLayer("reset_cancer_moves");
-        layer.addAgentFunction(AGENT_CANCER_CELL, "reset_moves");
-    }                                                                                                                                                                                                            
-
-    // ========== BUILD AND ADD MOVEMENT SUBMODELS ==========
-    for (const auto& cfg : agent_configs) {
-        int max_steps = model->Environment().getProperty<int>(cfg.move_steps_param);
-
-        std::string submodel_name = cfg.name + "_movement";
-        flamegpu::ModelDescription submodelDesc(submodel_name + "_desc");
-
-        buildMovementSubmodel(submodelDesc, cfg.name, all_agent_names,
-                              grid_x, grid_y, grid_z, voxel_size);
-
-        auto submodel = model->newSubModel(submodel_name, submodelDesc);
-
-        // Bind all agents
-        for (const auto& agent_name : all_agent_names) {
-            submodel.bindAgent(agent_name, agent_name, true, true);
-        }
-        submodel.setMaxSteps(max_steps);
-
-        // Add layer for this submodel
-        auto layer = model->newLayer(submodel_name + "_layer");
-        layer.addSubModel(submodel);
-    }
-
-    // Define main model layers (state transitions, division)
+    // Define all model layers (state transitions, PDE, movement, division, QSP)
+    // Move step counts are read from the environment inside defineMainModelLayers.
     defineMainModelLayers(*model);
 
     return model;

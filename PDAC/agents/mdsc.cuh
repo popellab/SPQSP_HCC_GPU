@@ -334,6 +334,17 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_execute_move, flamegpu::MessageSpatial3D, flamegpu:
     return flamegpu::ALIVE;
 }
 
+// Occupancy Grid
+FLAMEGPU_AGENT_FUNCTION(mdsc_write_to_occ_grid, flamegpu::MessageNone, flamegpu::MessageNone) {
+    const int x = FLAMEGPU->getVariable<int>("x");
+    const int y = FLAMEGPU->getVariable<int>("y");
+    const int z = FLAMEGPU->getVariable<int>("z");
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+    occ[x][y][z][CELL_TYPE_MDSC].exchange(1u);  // Exclusive (MAX_MDSC_PER_VOXEL = 1)
+    return flamegpu::ALIVE;
+}
+
 // MDSC agent function: Update chemicals from PDE
 FLAMEGPU_AGENT_FUNCTION(mdsc_update_chemicals, flamegpu::MessageNone, flamegpu::MessageNone) {
     // ========== READ CHEMICAL CONCENTRATIONS FROM AGENT VARIABLES ==========
@@ -377,6 +388,67 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_compute_chemical_sources, flamegpu::MessageNone, fl
     const float CCL2_uptake = FLAMEGPU->environment.getProperty<float>("PARAM_CCL2_UPTAKE");
     FLAMEGPU->setVariable<float>("CCL2_uptake_rate", -CCL2_uptake);
     
+    return flamegpu::ALIVE;
+}
+
+// Single-phase MDSC movement using occupancy grid.
+// Replaces two-phase select_move_target + execute_move.
+// MDSCs are exclusive per voxel (CAS) but can share voxels with cancer cells.
+FLAMEGPU_AGENT_FUNCTION(mdsc_move, flamegpu::MessageNone, flamegpu::MessageNone) {
+    // ECM saturation: 20% chance to skip movement this step
+    if (FLAMEGPU->random.uniform<float>() < 0.2f) return flamegpu::ALIVE;
+
+    const int x = FLAMEGPU->getVariable<int>("x");
+    const int y = FLAMEGPU->getVariable<int>("y");
+    const int z = FLAMEGPU->getVariable<int>("z");
+    const int size_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int size_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int size_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+
+    // Von Neumann neighbor offsets
+    const int ddx[6] = {-1, 1,  0, 0,  0, 0};
+    const int ddy[6] = { 0, 0, -1, 1,  0, 0};
+    const int ddz[6] = { 0, 0,  0, 0, -1, 1};
+
+    // Build candidate list: neighbors with no MDSC (MDSCs can share with cancer)
+    int cands[6];
+    int n_cands = 0;
+    for (int i = 0; i < 6; i++) {
+        int nx = x + ddx[i];
+        int ny = y + ddy[i];
+        int nz = z + ddz[i];
+        if (nx < 0 || nx >= size_x || ny < 0 || ny >= size_y || nz < 0 || nz >= size_z) continue;
+        if (occ[nx][ny][nz][CELL_TYPE_MDSC] == 0u) {
+            cands[n_cands++] = i;
+        }
+    }
+    if (n_cands == 0) return flamegpu::ALIVE;
+
+    // Fisher-Yates shuffle for random candidate order
+    for (int i = n_cands - 1; i > 0; i--) {
+        int j = FLAMEGPU->random.uniform<int>(0, i);
+        int tmp = cands[i]; cands[i] = cands[j]; cands[j] = tmp;
+    }
+
+    // Try candidates in shuffled order; CAS to atomically claim new voxel
+    for (int i = 0; i < n_cands; i++) {
+        int idx = cands[i];
+        int nx = x + ddx[idx];
+        int ny = y + ddy[idx];
+        int nz = z + ddz[idx];
+        unsigned int old = occ[nx][ny][nz][CELL_TYPE_MDSC].CAS(0u, 1u);
+        if (old == 0u) {
+            // Won the voxel — release old and update position
+            occ[x][y][z][CELL_TYPE_MDSC].exchange(0u);
+            FLAMEGPU->setVariable<int>("x", nx);
+            FLAMEGPU->setVariable<int>("y", ny);
+            FLAMEGPU->setVariable<int>("z", nz);
+            break;
+        }
+    }
     return flamegpu::ALIVE;
 }
 

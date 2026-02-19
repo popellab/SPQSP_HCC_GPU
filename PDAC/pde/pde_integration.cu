@@ -833,4 +833,13 @@ FLAMEGPU_HOST_FUNCTION(recruit_mdscs) {
     FLAMEGPU->environment.setProperty<int>("ABM_MDSC_REC",mdsc_recruited);
 }
 
+// ============================================================================
+// Occupancy Grid: Zero the grid at the start of each step's division phase
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(zero_occupancy_grid) {
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+    occ.zero();
+}
+
 } // namespace PDAC

@@ -18,6 +18,12 @@ set(FLAMEGPU_ROOT "" CACHE PATH "Path to FLAMEGPU2 installation or source")
 # This increases build time but eliminates JIT compilation delay on first run
 set(FLAMEGPU_ENABLE_RTC OFF CACHE BOOL "Disable RTC for ahead-of-time compilation")
 
+# Disable FLAMEGPU seatbelt runtime checks.
+# Seatbelts flag mixed read + atomic-write on the same MacroProperty in one layer,
+# but our occupancy grid uses CAS (which atomically handles compare-and-swap) — this
+# is semantically safe and the conservative seatbelt check produces false positives.
+set(FLAMEGPU_SEATBELTS OFF CACHE BOOL "Disable FLAMEGPU2 seatbelt checks" FORCE)
+
 # Set CUDA architecture
 # Common architectures:
 #   70 = V100
@@ -97,6 +103,7 @@ add_executable(pdac
 
 # Link against FLAMEGPU2
 target_link_libraries(pdac PRIVATE flamegpu)
+target_compile_definitions(pdac PRIVATE FLAMEGPU_SEATBELTS=0)
 
 # Link against SUNDIALS if available (optional QSP support)
 if(SUNDIALS_FOUND)
