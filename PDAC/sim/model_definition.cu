@@ -547,6 +547,7 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
         fib.newFunction("follow_move", fib_follow_move);
         fib.newFunction("state_step", fib_state_step)
             .setAllowAgentDeath(true);
+        fib.newFunction("deposit_ecm", fib_deposit_ecm);
     }
 }
 
@@ -745,6 +746,11 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     // Dimensions are compile-time constants; only [0..grid_size-1] are used at runtime.
     env.newMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+
+    // ECM grid: per-voxel extracellular matrix density (float, range [baseline, saturation]).
+    // Deposited by fibroblasts/CAFs; decayed by update_ecm_grid host function each step.
+    env.newMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
 
     // Populate ALL other parameters from XML
     params.populateFlameGPUEnvironment(env);

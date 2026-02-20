@@ -26,6 +26,7 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_after_div_treg;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_after_div_vas;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER mark_mac_sources;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_macrophages;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_ecm_grid;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_start_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_break;
 // Define main model execution layers (state transitions and division)
@@ -167,6 +168,17 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
     {
         flamegpu::LayerDescription layer = model.newLayer("solve_pde");
         layer.addHostFunction(solve_pde_step);
+    }
+    // 11b. ECM deposition: fibroblasts (and CAFs) deposit ECM into their voxel.
+    // Runs after state_step (so fib_state reflects NORMAL vs CAF this step).
+    {
+        flamegpu::LayerDescription layer = model.newLayer("deposit_ecm");
+        layer.addAgentFunction(AGENT_FIBROBLAST, "deposit_ecm");
+    }
+    // 11c. ECM grid decay: apply per-step decay and clamp to [baseline, saturation].
+    {
+        flamegpu::LayerDescription layer = model.newLayer("update_ecm");
+        layer.addHostFunction(update_ecm_grid);
     }
     // 12. Occupancy grid: zero then populate with current live agent positions.
     // Must run after state_transitions (so dead agents are removed).

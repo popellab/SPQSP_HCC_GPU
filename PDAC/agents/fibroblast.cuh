@@ -345,6 +345,35 @@ FLAMEGPU_AGENT_FUNCTION(fib_state_step, flamegpu::MessageNone, flamegpu::Message
     return flamegpu::ALIVE;
 }
 
+// ============================================================================
+// Fibroblast: Deposit ECM into the local voxel
+// Normal fibroblasts deposit at PARAM_FIB_ECM_RELEASE_FIB;
+// CAFs deposit at PARAM_FIB_ECM_RELEASE_CAF (typically higher).
+// Uses atomicAdd so multiple fibroblasts in adjacent voxels are safe.
+// ============================================================================
+FLAMEGPU_AGENT_FUNCTION(fib_deposit_ecm, flamegpu::MessageNone, flamegpu::MessageNone) {
+    const int x = FLAMEGPU->getVariable<int>("x");
+    const int y = FLAMEGPU->getVariable<int>("y");
+    const int z = FLAMEGPU->getVariable<int>("z");
+    const int fib_state = FLAMEGPU->getVariable<int>("fib_state");
+
+    float release_rate;
+    if (fib_state == FIB_CAF) {
+        release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_RELEASE_CAF");
+    } else {
+        release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_RELEASE_FIB");
+    }
+
+    auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+
+    // Fibroblasts are exclusive per voxel (CAS occ_grid), so no race condition here.
+    float curr_ecm = static_cast<float>(ecm[x][y][z]);
+    ecm[x][y][z].exchange(curr_ecm + release_rate);
+
+    return flamegpu::ALIVE;
+}
+
 }  // namespace PDAC
 
 #endif  // FIBROBLAST_CUH

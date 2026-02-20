@@ -67,6 +67,9 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_recruitment_sources;
 // Occupancy grid: zero before agents write their positions each step
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_occupancy_grid;
 
+// ECM grid: decay ECM each step after fibroblasts have deposited
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_ecm_grid;
+
 // Debug checkpoints (insert between layers to locate crash)
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_after_zero_occ;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_after_write_occ;
