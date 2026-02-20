@@ -34,47 +34,39 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
     // 2. State transitions
     // 3. Division
 
-    { flamegpu::LayerDescription l = model.newLayer("chk_start_step"); l.addHostFunction(chk_start_step); }
-
+    // { flamegpu::LayerDescription l = model.newLayer("chk_start_step"); l.addHostFunction(chk_start_step); }
     // 0. update agent counts
     {
         flamegpu::LayerDescription layer = model.newLayer("update_agent_counts");
         layer.addHostFunction(update_agent_counts);
     }
-
     // 0a. Recruitment system (following HCC Tumor::timeSlice order)
     // Reset recruitment sources
     {
         flamegpu::LayerDescription layer = model.newLayer("reset_recruitment_sources");
         layer.addHostFunction(reset_recruitment_sources);
     }
-
     // Mark vascular T cell sources (phalanx cells based on IFN-γ)
     {
         flamegpu::LayerDescription layer = model.newLayer("mark_vascular_t_sources");
         layer.addAgentFunction(AGENT_VASCULAR, "mark_t_sources");
     }
-
     
-
     // Mark MDSC sources (all voxels based on CCL2)
     {
         flamegpu::LayerDescription layer = model.newLayer("mark_mdsc_sources");
         layer.addHostFunction(mark_mdsc_sources);
     }
-
     // Recruit T cells at marked sources
     {
         flamegpu::LayerDescription layer = model.newLayer("recruit_t_cells");
         layer.addHostFunction(recruit_t_cells);
     }
-
     // Recruit MDSCs at marked sources
     {
         flamegpu::LayerDescription layer = model.newLayer("recruit_mdscs");
         layer.addHostFunction(recruit_mdscs);
     }
-
     // 1-4. Broadcast (separate layers required by FLAMEGPU2)
     // Messages accumulate across layers within the same step
     {
@@ -97,7 +89,10 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("final_broadcast_vascular");
         layer.addAgentFunction(AGENT_VASCULAR, "broadcast_location");
     }
-
+    {
+        flamegpu::LayerDescription layer = model.newLayer("final_broadcast_macrophage");
+        layer.addAgentFunction(AGENT_MACROPHAGE, "broadcast_location");
+    }
     // 5. Scan neighbors
     {
         flamegpu::LayerDescription layer = model.newLayer("final_scan_neighbors");
@@ -105,6 +100,7 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_TCELL, "scan_neighbors");
         layer.addAgentFunction(AGENT_TREG, "scan_neighbors");
         layer.addAgentFunction(AGENT_MDSC, "scan_neighbors");
+        layer.addAgentFunction(AGENT_MACROPHAGE, "scan_neighbors");
     }
 
     // 6. READ chemicals from PDE to agents
@@ -112,7 +108,6 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("read_chemicals_from_pde");
         layer.addHostFunction(update_agent_chemicals);
     }
-
     // 7. Agents update their chemical states (PDL1, activation, etc.)
     {
         flamegpu::LayerDescription layer = model.newLayer("update_chemical_states");
@@ -120,9 +115,9 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         //layer.addAgentFunction(AGENT_TCELL, "update_chemicals"); // TCell states are updated in state step now
         //layer.addAgentFunction(AGENT_TREG, "update_chemicals"); // TReg states are updated in state step now
         layer.addAgentFunction(AGENT_MDSC, "update_chemicals");
+        // layer.addAgentFunction(AGENT_MACROPHAGE, "update_chemicals"); // Macrophage states updated in state step
         layer.addAgentFunction(AGENT_VASCULAR, "update_chemicals");
     }
-{ flamegpu::LayerDescription l = model.newLayer("chk_break"); l.addHostFunction(chk_break); }
     // 8. Agent state transitions (killing, division decisions, etc.)
     {
         flamegpu::LayerDescription layer = model.newLayer("state_transitions");
@@ -130,16 +125,18 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_TCELL, "state_step");
         layer.addAgentFunction(AGENT_TREG, "state_step");
         layer.addAgentFunction(AGENT_MDSC, "state_step");
+        layer.addAgentFunction(AGENT_MACROPHAGE, "state_step");
         layer.addAgentFunction(AGENT_VASCULAR, "state_step");
     }
-{ flamegpu::LayerDescription l = model.newLayer("chk_break2"); l.addHostFunction(chk_break); }
     // 9. Agents compute their chemical production/consumption rates
+    // { flamegpu::LayerDescription l = model.newLayer("chk_break"); l.addHostFunction(chk_break); }
     {
         flamegpu::LayerDescription layer = model.newLayer("compute_chemical_sources");
         layer.addAgentFunction(AGENT_CANCER_CELL, "compute_chemical_sources");
         layer.addAgentFunction(AGENT_TCELL, "compute_chemical_sources");
         layer.addAgentFunction(AGENT_TREG, "compute_chemical_sources");
         layer.addAgentFunction(AGENT_MDSC, "compute_chemical_sources");
+        layer.addAgentFunction(AGENT_MACROPHAGE, "compute_chemical_sources");
         layer.addAgentFunction(AGENT_VASCULAR, "compute_chemical_sources");
     }
 
@@ -148,13 +145,11 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("write_sources_to_pde");
         layer.addHostFunction(collect_agent_sources);
     }
-
     // 11. SOLVE PDE for one timestep
     {
         flamegpu::LayerDescription layer = model.newLayer("solve_pde");
         layer.addHostFunction(solve_pde_step);
     }
-
     // 12. Occupancy grid: zero then populate with current live agent positions.
     // Must run after state_transitions (so dead agents are removed).
     {
@@ -169,6 +164,7 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_TCELL,       "write_to_occ_grid");
         layer.addAgentFunction(AGENT_TREG,        "write_to_occ_grid");
         layer.addAgentFunction(AGENT_MDSC,        "write_to_occ_grid");
+        layer.addAgentFunction(AGENT_MACROPHAGE,  "write_to_occ_grid");
         layer.addAgentFunction(AGENT_VASCULAR,    "write_to_occ_grid");
     }
     { flamegpu::LayerDescription l = model.newLayer("chk_after_write_occ"); l.addHostFunction(chk_after_write_occ); }
@@ -188,6 +184,7 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         const int tcell_steps  = model.Environment().getProperty<int>("PARAM_TCELL_MOVE_STEPS");
         const int treg_steps   = model.Environment().getProperty<int>("PARAM_TCELL_MOVE_STEPS");
         const int mdsc_steps   = model.Environment().getProperty<int>("PARAM_MDSC_MOVE_STEPS");
+        const int mac_steps    = model.Environment().getProperty<int>("PARAM_MAC_MOVE_STEPS");
 
         for (int i = 0; i < cancer_steps; i++) {
             flamegpu::LayerDescription layer = model.newLayer("move_cancer_" + std::to_string(i));
@@ -209,6 +206,10 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
             layer.addAgentFunction(AGENT_MDSC, "move");
         }
         { flamegpu::LayerDescription l = model.newLayer("chk_after_move_mdsc"); l.addHostFunction(chk_after_move_mdsc); }
+        for (int i = 0; i < mac_steps; i++) {
+            flamegpu::LayerDescription layer = model.newLayer("move_macrophage_" + std::to_string(i));
+            layer.addAgentFunction(AGENT_MACROPHAGE, "move");
+        }
         {
             flamegpu::LayerDescription layer = model.newLayer("move_vascular");
             layer.addAgentFunction(AGENT_VASCULAR, "move");

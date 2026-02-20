@@ -7,6 +7,7 @@
 #include "../agents/t_cell.cuh"
 #include "../agents/t_reg.cuh"
 #include "../agents/mdsc.cuh"
+#include "../agents/macrophage.cuh"
 #include "../agents/vascular_cell.cuh"
 
 #include "../pde/pde_integration.cuh"
@@ -31,6 +32,7 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
 void defineTCellAgent(flamegpu::ModelDescription& model, bool include_state_divide);
 void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divide);
 void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state);
+void defineMacrophageAgent(flamegpu::ModelDescription& model, bool include_state);
 void defineVascularCellAgent(flamegpu::ModelDescription& model);
 
 // Forward declaration (implemented in model_layers.cu)
@@ -51,20 +53,21 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
     // State (CancerState enum)
     cancer_cell.newVariable<int>("cell_state", CANCER_STEM);
 
+    // Movement control
+    cancer_cell.newVariable<int>("moves_remaining", 0);
+
     // Division control
     cancer_cell.newVariable<int>("divideCD", 0);
     cancer_cell.newVariable<int>("divideFlag", 1);
     cancer_cell.newVariable<int>("divideCountRemaining", 0);
     cancer_cell.newVariable<unsigned int>("stemID", 0);
 
-    // Movement control
-    cancer_cell.newVariable<int>("moves_remaining", 0);
-
     cancer_cell.newVariable<float>("local_NO", 0.0f);
     cancer_cell.newVariable<float>("local_ArgI", 0.0f);
     cancer_cell.newVariable<float>("local_TGFB", 0.0f);
     cancer_cell.newVariable<float>("local_O2", 0.0f);
     cancer_cell.newVariable<float>("local_IFNg", 0.0f);
+    cancer_cell.newVariable<float>("local_IL10", 0.0f);
 
     // Molecular state (affects behavior)
     cancer_cell.newVariable<float>("PDL1_syn", 0.0f);
@@ -78,6 +81,7 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
     cancer_cell.newVariable<int>("neighbor_Treg_count", 0);
     cancer_cell.newVariable<int>("neighbor_cancer_count", 0);
     cancer_cell.newVariable<int>("neighbor_MDSC_count", 0);
+    cancer_cell.newVariable<int>("neighbor_Mac1_count", 0);
 
     // Cached bitmask of available neighbor voxels (no cancer cell, in bounds)
     cancer_cell.newVariable<unsigned int>("available_neighbors", 0u);
@@ -356,13 +360,13 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
     mdsc.newVariable<float>("move_direction_z", 0.0f);
     mdsc.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
 
+    // Molecular state (affects behavior)
+    mdsc.newVariable<float>("PDL1_syn", 0.0f);
+
     // Chemical production (MDSCs produce immunosuppressive factors)
     mdsc.newVariable<float>("NO_release_rate", 0.0f);    // Nitric oxide
     mdsc.newVariable<float>("ArgI_release_rate", 0.0f);  // Arginase I (immune suppression)
     mdsc.newVariable<float>("CCL2_uptake_rate", 0.0f);  // CCL2
-
-    // Molecular state (affects behavior)
-    mdsc.newVariable<float>("PDL1_syn", 0.0f);
 
     // Chemotaxis state (for directed migration)
     mdsc.newVariable<float>("CCL2_gradient_x", 0.0f);
@@ -405,6 +409,79 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
         mdsc.newFunction("move", mdsc_move);
 
         mdsc.newFunction("state_step", mdsc_state_step)
+            .setAllowAgentDeath(true);
+    }
+}
+
+// Define the Macrophage agent (M1/M2 polarization, CCL2 chemotaxis, cancer cell killing)
+void defineMacrophageAgent(flamegpu::ModelDescription& model, bool include_state) {
+    flamegpu::AgentDescription mac = model.newAgent(AGENT_MACROPHAGE);
+
+    // Identity: using FLAMEGPU's built-in ID system
+
+    // Position
+    mac.newVariable<int>("x");
+    mac.newVariable<int>("y");
+    mac.newVariable<int>("z");
+
+    // Macrophage state (0=M1, 1=M2)
+    mac.newVariable<int>("mac_state", 1);  // Default: M2
+
+    // Chemical concentrations (read from PDE)
+    mac.newVariable<float>("local_CCL2", 0.0f);
+    mac.newVariable<float>("local_TGFB", 0.0f);
+    mac.newVariable<float>("local_IL10", 0.0f);
+    mac.newVariable<float>("local_IL12", 0.0f);
+    mac.newVariable<float>("local_IFNg", 0.0f);
+
+    // Chemical gradients for chemotaxis (toward CCL2)
+    mac.newVariable<float>("ccl2_grad_x", 0.0f);
+    mac.newVariable<float>("ccl2_grad_y", 0.0f);
+    mac.newVariable<float>("ccl2_grad_z", 0.0f);
+
+    // Movement state for run-tumble chemotaxis
+    mac.newVariable<float>("move_direction_x", 0.0f);
+    mac.newVariable<float>("move_direction_y", 0.0f);
+    mac.newVariable<float>("move_direction_z", 0.0f);
+    mac.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
+
+    // Molecular state (affects behavior)
+    mac.newVariable<float>("PDL1_syn", 0.0f);
+
+    // Movement control
+    mac.newVariable<int>("moves_remaining", 0);
+
+    // Neighbor counts (computed via messaging)
+    mac.newVariable<int>("neighbor_cancer_count", 0);
+
+    // Lifecycle
+    mac.newVariable<int>("life", 0);
+    mac.newVariable<int>("dead", 0);
+
+    mac.newVariable<float>("IFNg_release_rate", 0.0f); 
+    mac.newVariable<float>("IL12_release_rate", 0.0f); 
+    mac.newVariable<float>("TGFB_release_rate", 0.0f); 
+    mac.newVariable<float>("IL10_release_rate", 0.0f); 
+    mac.newVariable<float>("VEGFA_release_rate", 0.0f); 
+    mac.newVariable<float>("CCL2_uptake_rate", 0.0f); 
+
+    // Define agent functions
+    mac.newFunction("broadcast_location", mac_broadcast_location)
+        .setMessageOutput(MSG_CELL_LOCATION);
+
+    mac.newFunction("scan_neighbors", mac_scan_neighbors)
+        .setMessageInput(MSG_CELL_LOCATION);
+
+    mac.newFunction("update_chemicals", mac_update_chemicals);
+
+    mac.newFunction("compute_chemical_sources", mac_compute_chemical_sources);
+
+    // Movement and state functions only in main model
+    if (include_state) {
+        mac.newFunction("write_to_occ_grid", mac_write_to_occ_grid);
+        mac.newFunction("move", mac_move);
+
+        mac.newFunction("state_step", mac_state_step)
             .setAllowAgentDeath(true);
     }
 }
@@ -627,6 +704,7 @@ std::unique_ptr<flamegpu::ModelDescription> buildModel(
     defineTCellAgent(*model, true);
     defineTRegAgent(*model, true);
     defineMDSCAgent(*model, true);
+    defineMacrophageAgent(*model, true);
     defineVascularCellAgent(*model);
 
     // Define environment with GPU parameters loaded from XML

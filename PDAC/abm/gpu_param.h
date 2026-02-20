@@ -58,6 +58,11 @@ enum GPUParamFloat {
     // MDSC cell parameters
     PARAM_MDSC_LIFESPAN_SD,
     //*************************************************************************/
+    // Macrophage cell parameters
+
+    //*************************************************************************/
+    // Fibroblast cell parameters
+    //*************************************************************************/
     // Vas cell parameters
     PARAM_VAS_MAXPERVOXEL,
     PARAM_VAS_50,
@@ -102,11 +107,13 @@ enum GPUParamFloat {
     PARAM_TREG_TGFB_RELEASE,
     PARAM_STEM_TGFB_RELEASE,
     PARAM_PROG_TGFB_RELEASE,
+    PARAM_MAC_TGFB_RELEASE,
     PARAM_TREG_IL10_RELEASE,
+    PARAM_MAC_IL10_RELEASE,
     PARAM_IL12_RELEASE,
     PARAM_STEM_VEGFA_RELEASE,
     PARAM_PROG_VEGFA_RELEASE,
-
+    PARAM_MAC_VEGFA_RELEASE,
 
     PARAM_IL2_UPTAKE,
     PARAM_CCL2_UPTAKE,
@@ -160,6 +167,12 @@ enum GPUParamInt {
     //*************************************************************************/
     // MDSC cell parameters
     PARAM_MDSC_MOVE_STEPS,
+    //*************************************************************************/
+    // Mac cell parameters
+    PARAM_MAC_MOVE_STEPS,
+    //*************************************************************************/
+    // Fibroblast cell parameters
+
     //*************************************************************************/
     // Molecular parameters
 

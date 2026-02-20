@@ -163,6 +163,20 @@ __global__ void read_concentrations_at_voxels(
     int substrate_idx,
     int nx, int ny, int nz);
 
+// Gradient computation kernels (central difference: grad_x = (C[x+1] - C[x-1])/(2*dx))
+__global__ void compute_gradients_at_voxels(
+    const float* __restrict__ d_concentrations,
+    const int* __restrict__ d_agent_x,
+    const int* __restrict__ d_agent_y,
+    const int* __restrict__ d_agent_z,
+    float* __restrict__ d_grad_x,
+    float* __restrict__ d_grad_y,
+    float* __restrict__ d_grad_z,
+    int num_agents,
+    int substrate_idx,
+    int nx, int ny, int nz,
+    float voxel_size);
+
 __global__ void add_sources_from_agents(
     float* __restrict__ d_sources,
     const int* __restrict__ d_agent_x,

@@ -366,10 +366,15 @@ FLAMEGPU_AGENT_FUNCTION(tcell_select_move_target, flamegpu::MessageNone, flamegp
 
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
 
-    //TODO: Add ECM Check for movement probability
-    float ECM_sat = 0.2;
+    // Read ECM concentration from grid at current voxel
+    auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+    float ECM_density = ecm[my_x][my_y][my_z];  // ECM concentration (0.0-1.0)
 
-    // Density too high, do not move, but still broadcast intent for conflict resolution
+    // If ECM density is high, cell has lower probability to move
+    float ECM_sat = ECM_density;  // Direct use of ECM density as movement inhibition
+
+    // High ECM density reduces move probability
     if (FLAMEGPU->random.uniform<float>() < ECM_sat) {
         // Output dummy message (required)
         FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
@@ -893,9 +898,6 @@ FLAMEGPU_AGENT_FUNCTION(tcell_compute_chemical_sources, flamegpu::MessageNone, f
 FLAMEGPU_AGENT_FUNCTION(tcell_move, flamegpu::MessageNone, flamegpu::MessageNone) {
     if (FLAMEGPU->getVariable<int>("dead") == 1) return flamegpu::ALIVE;
 
-    // ECM saturation: 20% chance to skip movement this step
-    if (FLAMEGPU->random.uniform<float>() < 0.2f) return flamegpu::ALIVE;
-
     const int x = FLAMEGPU->getVariable<int>("x");
     const int y = FLAMEGPU->getVariable<int>("y");
     const int z = FLAMEGPU->getVariable<int>("z");
@@ -903,6 +905,17 @@ FLAMEGPU_AGENT_FUNCTION(tcell_move, flamegpu::MessageNone, flamegpu::MessageNone
     const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    // ECM based movement probability
+    // TEMPORARILY DISABLED for debugging
+    // auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+    //     OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+    // float ECM_density = ecm[x][y][z];
+    // double ECM_sat = ECM_density / (ECM_density + FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_MOT_EC50"));
+    // if (FLAMEGPU->random.uniform<float>() < ECM_sat) return flamegpu::ALIVE;
+
+    // Use fixed ECM saturation temporarily
+    if (FLAMEGPU->random.uniform<float>() < 0.2f) return flamegpu::ALIVE;
 
     const float move_dir_x = FLAMEGPU->getVariable<float>("move_direction_x");
     const float move_dir_y = FLAMEGPU->getVariable<float>("move_direction_y");
@@ -920,28 +933,19 @@ FLAMEGPU_AGENT_FUNCTION(tcell_move, flamegpu::MessageNone, flamegpu::MessageNone
     int target_y = y;
     int target_z = z;
 
+    const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
+
     // === RUN PHASE (tumble == 0) ===
     if (tumble == 0) {
-        float v_x = move_dir_x;
-        float v_y = move_dir_y;
-        float v_z = move_dir_z;
+        float v_x = move_dir_x / dt;
+        float v_y = move_dir_y / dt;
+        float v_z = move_dir_z / dt;
 
         float norm_gradient = std::sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
-
-        // No gradient: switch to tumble
-        if (norm_gradient < 1e-10f) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
-            return flamegpu::ALIVE;
-        }
 
         // Compute alignment to gradient
         float dot_product = v_x * grad_x + v_y * grad_y + v_z * grad_z;
         float norm_v = std::sqrt(v_x * v_x + v_y * v_y + v_z * v_z);
-        if (norm_v < 1e-10f) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
-            return flamegpu::ALIVE;
-        }
-
         float cos_theta = dot_product / (norm_v * norm_gradient);
 
         // Hill function: bias tumble rate based on gradient alignment and strength
@@ -949,9 +953,8 @@ FLAMEGPU_AGENT_FUNCTION(tcell_move, flamegpu::MessageNone, flamegpu::MessageNone
         float H_grad = norm_gradient / (norm_gradient + EC50_grad);
         if (cos_theta < 0) H_grad = -H_grad;
 
-        const float lambda = 0.5f;  // Base tumble rate
-        const float delta = 0.1f;   // Spontaneous tumble rate
-        float tumble_rate = (lambda / 2.0f) * (1.0f - cos_theta) * (1.0f - H_grad) + delta;
+        const float lambda = 0.0000168;  // Base tumble rate
+        float tumble_rate = (lambda / 2.0f) * (1.0f - cos_theta) * (1.0f - H_grad) * dt;
         float p_tumble = 1.0f - std::exp(-tumble_rate);
 
         if (FLAMEGPU->random.uniform<float>() < p_tumble) {

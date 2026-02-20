@@ -39,6 +39,19 @@ enum TCD4State : int {
     TCD4_TH = 1,
 };
 
+// Macrophage state enumeration (M1/M2 polarization)
+enum MacrophageState : int {
+    MAC_M1 = 0,          // Pro-inflammatory (IFN-γ activated)
+    MAC_M2 = 1,          // Anti-inflammatory (IL-10/TGF-β activated)
+    MAC_INTERMEDIATE = 2 // Mixed phenotype
+};
+
+// Fibroblast state enumeration
+enum FibroblastState : int {
+    FIB_NORMAL = 0,  // Normal fibroblast
+    FIB_CAF = 1      // Cancer-associated fibroblast
+};
+
 // Message names
 constexpr const char* MSG_CELL_LOCATION = "cell_location";
 constexpr const char* MSG_INTENT = "intent_message";
@@ -48,6 +61,8 @@ constexpr const char* AGENT_CANCER_CELL = "CancerCell";
 constexpr const char* AGENT_TCELL = "TCell";
 constexpr const char* AGENT_TREG = "TReg";
 constexpr const char* AGENT_MDSC = "MDSC";
+constexpr const char* AGENT_MACROPHAGE = "Macrophage";
+constexpr const char* AGENT_FIBROBLAST = "Fibroblast";
 constexpr const char* AGENT_VASCULAR = "VascularCell";
 
 // Environment property names for grid dimensions
@@ -61,6 +76,7 @@ constexpr int MAX_T_PER_VOXEL = 8;              // Max T cells in empty voxel
 constexpr int MAX_T_PER_VOXEL_WITH_CANCER = 1;  // Max T cells when cancer present
 constexpr int MAX_CANCER_PER_VOXEL = 1;         // Max cancer cells per voxel
 constexpr int MAX_MDSC_PER_VOXEL = 1;           // Max MDSC per voxel (exclusive)
+constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exclusive)
 
 // Action types for intent messages
 enum IntentAction : int {

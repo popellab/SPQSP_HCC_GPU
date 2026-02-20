@@ -148,6 +148,68 @@ __global__ void read_concentrations_at_voxels(
     d_agent_concentrations[agent_idx] = d_concentrations[concentration_idx];
 }
 
+// Kernel: Compute spatial gradients using central differences
+// grad_x = (C[x+1,y,z] - C[x-1,y,z]) / (2*voxel_size)
+// Boundary cells use forward/backward differences
+__global__ void compute_gradients_at_voxels(
+    const float* __restrict__ d_concentrations,
+    const int* __restrict__ d_agent_x,
+    const int* __restrict__ d_agent_y,
+    const int* __restrict__ d_agent_z,
+    float* __restrict__ d_grad_x,
+    float* __restrict__ d_grad_y,
+    float* __restrict__ d_grad_z,
+    int num_agents,
+    int substrate_idx,
+    int nx, int ny, int nz,
+    float voxel_size)
+{
+    int agent_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (agent_idx >= num_agents) return;
+
+    int x = d_agent_x[agent_idx];
+    int y = d_agent_y[agent_idx];
+    int z = d_agent_z[agent_idx];
+
+    // Bounds check
+    if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) {
+        d_grad_x[agent_idx] = 0.0f;
+        d_grad_y[agent_idx] = 0.0f;
+        d_grad_z[agent_idx] = 0.0f;
+        return;
+    }
+
+    int total_voxels = nx * ny * nz;
+    int substrate_offset = substrate_idx * total_voxels;
+
+    // Helper lambda to get concentration at (ix, iy, iz)
+    auto get_concentration = [&](int ix, int iy, int iz) -> float {
+        if (ix < 0 || ix >= nx || iy < 0 || iy >= ny || iz < 0 || iz >= nz) {
+            return 0.0f;  // Neumann BC: no flux at boundary
+        }
+        int voxel_idx = iz * (nx * ny) + iy * nx + ix;
+        return d_concentrations[substrate_offset + voxel_idx];
+    };
+
+    // Compute gradients using central differences
+    float two_dx = 2.0f * voxel_size;
+
+    // Gradient in X direction
+    float c_right = get_concentration(x + 1, y, z);
+    float c_left = get_concentration(x - 1, y, z);
+    d_grad_x[agent_idx] = (c_right - c_left) / two_dx;
+
+    // Gradient in Y direction
+    float c_up = get_concentration(x, y + 1, z);
+    float c_down = get_concentration(x, y - 1, z);
+    d_grad_y[agent_idx] = (c_up - c_down) / two_dx;
+
+    // Gradient in Z direction
+    float c_front = get_concentration(x, y, z + 1);
+    float c_back = get_concentration(x, y, z - 1);
+    d_grad_z[agent_idx] = (c_front - c_back) / two_dx;
+}
+
 // Kernel: Write (add) sources from agents to voxels
 __global__ void add_sources_from_agents(
     float* __restrict__ d_sources,

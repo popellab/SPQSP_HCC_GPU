@@ -280,41 +280,35 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
         return;
     }
 
-    // Read O2
+    // Cancer reads
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_O2, "local_O2");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_O2, "local_O2");
-    
-    // Read IFN-gamma
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_IFN, "local_IFNg");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_IFN, "local_IFNg");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_IFN, "local_IFNg");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_IFN, "local_IFNg");
-
-    // Read IL-2
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "local_IL2");
-    
-    // Read IL-10 (immunosuppressive)
-    
-    // Read TGF-beta (immunosuppressive)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_TGFB, "local_TGFB");
-    read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_TGFB, "local_TGFB");
-    
-    // Read CCL2 (chemotaxis)
-
-    // Read ArgI (MDSC-produced, T cell response modifier)
     read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_ARGI, "local_ArgI");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_NO, "local_NO");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_NO, "local_IL10");
+
+    // T-Cell reads
+    read_chemical_to_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "local_IL2");
+
+    // T-Reg reads
+    read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_IFN, "local_IFNg");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_TGFB, "local_TGFB");
     read_chemical_to_agents(*FLAMEGPU, AGENT_TREG, CHEM_ARGI, "local_ArgI");
 
-    // Read NO (MDSC-produced, T cell response modifier)
-    read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_NO, "local_NO");
+    // MDSC reads
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MDSC, CHEM_IFN, "local_IFNg");
 
-    // Read IL-12 (macrophage-produced, T cell activator)
+    // Macrophage reads
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_IFN, "local_IFNg");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_IL10, "local_IL10");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_TGFB, "local_TGFB");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_CCL2, "local_CCL2");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_IL12, "local_IL12");
 
-    // Read VEGF-A (cancer-produced, pro-angiogenic)
-    // read_chemical_to_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_VEGFA, "local_VEGFA");
-
-    // VascularCell: read O2 and VEGF-A
+    // Vasculature reads
     read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_O2, "local_O2");
+    read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_IFN, "local_IFNg");
     read_chemical_to_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_VEGFA, "local_VEGFA");
 
     // Note: Nivolumab and Cabozantinib are now handled by QSP compartments
@@ -333,13 +327,24 @@ FLAMEGPU_HOST_FUNCTION(update_agent_chemicals) {
 
     // ========== CALCULATE CHEMICAL GRADIENTS FOR CHEMOTAXIS ==========
     // Pre-compute gradients on host side to avoid redundant per-agent calculations
-    calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_MDSC, CHEM_CCL2, "CCL2_gradient");
+
+    // T Cell: IFN-γ gradient for chemotaxis
+    calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IFN, "ifng_grad");
+
+    // TReg: IFN-γ gradient for chemotaxis
+    calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_TREG, CHEM_IFN, "ifng_grad");
+
+    // MDSC: CCL2 gradient for chemotaxis
+    calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_MDSC, CHEM_CCL2, "ccl2_grad");
+
+    // Macrophage: CCL2 gradient for chemotaxis
+    calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_CCL2, "ccl2_grad");
+
+    // Fibroblast: TGFB gradient for chemotaxis and CAF activation
+    // calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_FIBROBLAST, CHEM_TGFB, "tgfb_grad");
 
     // VascularCell: calculate VEGF-A gradient for tip cell chemotaxis
     calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_VEGFA, "vegfa_grad");
-
-    // Add more gradient calculations here as needed for other agent types:
-    // calculate_chemical_gradient_for_agents(*FLAMEGPU, AGENT_TCELL, CHEM_IL2, "IL2_gradient");
 
     nvtxRangePop();
 }
@@ -378,19 +383,24 @@ FLAMEGPU_HOST_FUNCTION(collect_agent_sources) {
     
     // Collect CCL2 production from cancer cells
     collect_chemical_from_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_CCL2, "CCL2_release_rate");
-
     // Collect VEGF-A production from cancer cells
     collect_chemical_from_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_VEGFA, "VEGFA_release_rate");
 
     // Collect NO production from MDSCs
     collect_chemical_from_agents(*FLAMEGPU, AGENT_MDSC, CHEM_NO, "NO_release_rate");
-
     // Collect ArgI production from MDSCs
     collect_chemical_from_agents(*FLAMEGPU, AGENT_MDSC, CHEM_ARGI, "ArgI_release_rate");
 
+    // Collect macrophage production (state-dependent)
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_IFN, "IFNg_release_rate");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_IL12, "IL12_release_rate");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_TGFB, "TGFB_release_rate");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_IL10, "IL10_release_rate");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_VEGFA, "VEGFA_release_rate");
+    collect_chemical_from_agents(*FLAMEGPU, AGENT_MACROPHAGE, CHEM_CCL2, "CCL2_uptake_rate");
+
     // VascularCell: collect O2 sources (phalanx only, filtered by agent function)
     collect_chemical_from_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_O2, "O2_source");
-
     // VascularCell: collect VEGF-A sinks (all states)
     collect_chemical_from_agents(*FLAMEGPU, AGENT_VASCULAR, CHEM_VEGFA, "VEGFA_sink");
 
@@ -535,6 +545,35 @@ __global__ void mark_mdsc_sources_kernel(
 
     if (rand_val < H_CCL2) {
         atomicOr(&d_recruitment_sources[idx], 2);  // Set MDSC bit (bit 1)
+    }
+}
+
+// CUDA kernel to mark macrophage recruitment sources based on CCL2
+__global__ void mark_mac_sources_kernel(
+    int* d_recruitment_sources,
+    const float* d_ccl2,
+    int nx, int ny, int nz,
+    float ec50_ccl2,
+    unsigned int seed)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x >= nx || y >= ny || z >= nz) return;
+
+    int idx = z * (nx * ny) + y * nx + x;
+
+    float ccl2 = d_ccl2[idx];
+    float H_CCL2 = ccl2 / (ccl2 + ec50_ccl2);
+
+    // Simple random number generation (thread-local)
+    unsigned int rng_state = seed + idx;
+    rng_state = rng_state * 1103515245u + 12345u;
+    float rand_val = (rng_state & 0x7FFFFFFF) / float(0x7FFFFFFF);
+
+    if (rand_val < H_CCL2) {
+        atomicOr(&d_recruitment_sources[idx], 4);  // Set macrophage bit (bit 2)
     }
 }
 
@@ -833,6 +872,109 @@ FLAMEGPU_HOST_FUNCTION(recruit_mdscs) {
     FLAMEGPU->environment.setProperty<int>("ABM_MDSC_REC",mdsc_recruited);
 }
 
+// Mark macrophage sources based on CCL2 concentration
+FLAMEGPU_HOST_FUNCTION(mark_mac_sources) {
+    if (!g_pde_solver) return;
+
+    const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int nz = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    int* d_recruitment_sources = g_pde_solver->get_device_recruitment_sources_ptr();
+    const float* d_ccl2 = g_pde_solver->get_device_concentration_ptr(CHEM_CCL2);
+
+    // Get parameter
+    float ec50_ccl2 = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_EC50_CCL2_REC");
+
+    // Generate random seed from step number
+    unsigned int seed = static_cast<unsigned int>(FLAMEGPU->getStepCounter()) * 12345u + 54321u;
+
+    dim3 block(8, 8, 8);
+    dim3 grid((nx + 7) / 8, (ny + 7) / 8, (nz + 7) / 8);
+
+    mark_mac_sources_kernel<<<grid, block>>>(
+        d_recruitment_sources, d_ccl2, nx, ny, nz, ec50_ccl2, seed);
+
+    cudaDeviceSynchronize();
+}
+
+// Recruit macrophages at marked macrophage source voxels
+FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
+    if (!g_pde_solver) return;
+
+    const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int nz = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    // Calculate recruitment probability
+    float p_recruit_mac = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_RECRUIT_K");
+
+    int total_voxels = nx * ny * nz;
+    std::vector<int> h_sources(total_voxels);
+    int* d_sources = g_pde_solver->get_device_recruitment_sources_ptr();
+    cudaMemcpy(h_sources.data(), d_sources, total_voxels * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Get agent API for creating new agents
+    auto mac_api = FLAMEGPU->agent(AGENT_MACROPHAGE);
+    int mac_recruited = 0;
+
+    // Scan for macrophage source voxels (bit 2 set)
+    for (int idx = 0; idx < total_voxels; idx++) {
+        if ((h_sources[idx] & 4) == 0) continue;  // Not a macrophage source
+
+        if (FLAMEGPU->random.uniform<float>() < p_recruit_mac) {
+            int z = idx / (nx * ny);
+            int y = (idx % (nx * ny)) / nx;
+            int x = idx % nx;
+
+            // Find empty neighbor voxel
+            bool placed = false;
+            for (int dz = -1; dz <= 1 && !placed; dz++) {
+                for (int dy = -1; dy <= 1 && !placed; dy++) {
+                    for (int dx = -1; dx <= 1 && !placed; dx++) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+
+                        int nx_new = x + dx;
+                        int ny_new = y + dy;
+                        int nz_new = z + dz;
+
+                        if (nx_new >= 0 && nx_new < nx &&
+                            ny_new >= 0 && ny_new < ny &&
+                            nz_new >= 0 && nz_new < nz) {
+
+                            auto new_agent = mac_api.newAgent();
+                            new_agent.setVariable<int>("x", nx_new);
+                            new_agent.setVariable<int>("y", ny_new);
+                            new_agent.setVariable<int>("z", nz_new);
+
+                            // Recruit as M1 state
+                            int mac_state = MAC_M1;
+
+                            // 30% chance to become M2
+                            if (FLAMEGPU->random.uniform<float>() < 0.3f) {
+                                mac_state = MAC_M2;
+                            }
+                            new_agent.setVariable<int>("mac_state", mac_state);
+
+                            // Set lifespan
+                            double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_LIFE_MEAN");
+                            float rnd = static_cast<float>(rand()) / RAND_MAX;
+                            int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
+                            if (life < 1) life = 1;
+
+                            new_agent.setVariable<int>("life", life);
+
+                            mac_recruited++;
+                            placed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    FLAMEGPU->environment.setProperty<int>("ABM_MAC_REC", mac_recruited);
+}
+
 // ============================================================================
 // Occupancy Grid: Zero the grid at the start of each step's division phase
 // ============================================================================
@@ -840,6 +982,47 @@ FLAMEGPU_HOST_FUNCTION(zero_occupancy_grid) {
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
     occ.zero();
+}
+
+// ============================================================================
+// ECM Grid: Decay ECM concentration slightly and prepare for new deposition
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(update_ecm_grid) {
+    auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    // ECM parameters
+    float decay_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_DECAY_RATE");
+    float ecm_baseline = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_BASELINE");
+    float ecm_saturation = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_SATURATION");
+    float dt_sec = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
+    float dt = dt_sec / 86400.0f;  // seconds → days
+
+    // ============================================================================
+    // Apply ECM dynamics (decay + saturation)
+    // Fibroblast deposition will be added later via agent functions
+    // ============================================================================
+    for (int i = 0; i < grid_x; i++) {
+        for (int j = 0; j < grid_y; j++) {
+            for (int k = 0; k < grid_z; k++) {
+                float curr_ecm = ecm[i][j][k];
+
+                // Exponential decay: ECM_n = ECM_{n-1} * exp(-decay_rate * dt)
+                float after_decay = curr_ecm * expf(-decay_rate * dt);
+
+                // Enforce bounds [baseline, saturation]
+                float new_ecm = after_decay;
+                if (new_ecm < ecm_baseline) new_ecm = ecm_baseline;
+                if (new_ecm > ecm_saturation) new_ecm = ecm_saturation;
+
+                ecm[i][j][k] = new_ecm;
+            }
+        }
+    }
 }
 
 // ---- Debug checkpoints: disabled for production ----
@@ -854,6 +1037,6 @@ FLAMEGPU_HOST_FUNCTION(chk_after_div_cancer)  { /* disabled */ }
 FLAMEGPU_HOST_FUNCTION(chk_after_div_tcell)   { /* disabled */ }
 FLAMEGPU_HOST_FUNCTION(chk_after_div_treg)    { /* disabled */ }
 FLAMEGPU_HOST_FUNCTION(chk_after_div_vas)     { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_start_step)     { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_break)     { /* disabled */ }
+FLAMEGPU_HOST_FUNCTION(chk_start_step)     {std::cout << "[debug] Step starting" << std::endl;}
+FLAMEGPU_HOST_FUNCTION(chk_break)     {std::cout << "[debug] Made it here" << std::endl;}
 } // namespace PDAC

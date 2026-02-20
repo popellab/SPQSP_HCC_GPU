@@ -20,6 +20,7 @@ SimulationConfig::SimulationConfig()
     , num_tcells(50)
     , num_tregs(10)
     , num_mdscs(5)
+    , num_macrophages(10)
     , vascular_mode("random")
     , vascular_xml_file("")
     , abm_out(true)
@@ -365,6 +366,84 @@ void initializeMDSCs(
     }
 
     std::cout << "Initialized " << placed << " MDSCs around tumor margin" << std::endl;
+}
+
+// ============================================================================
+// Macrophage Initialization
+// ============================================================================
+void initializeMacrophages(
+    flamegpu::AgentVector& mac_agents,
+    int grid_x, int grid_y, int grid_z,
+    int tumor_radius, int num_macrophages,
+    float mac_life_mean)
+{
+    const int cx = grid_x / 2;
+    const int cy = grid_y / 2;
+    const int cz = grid_z / 2;
+
+    const float inner_radius = tumor_radius + 1;
+    const float outer_radius = tumor_radius + 5;
+
+    int placed = 0;
+    int attempts = 0;
+    const int max_attempts = num_macrophages * 100;
+
+    while (placed < num_macrophages && attempts < max_attempts) {
+        attempts++;
+
+        float theta = static_cast<float>(rand()) / RAND_MAX * 2.0f * 3.14159f;
+        float phi = std::acos(2.0f * static_cast<float>(rand()) / RAND_MAX - 1.0f);
+        float r = inner_radius + static_cast<float>(rand()) / RAND_MAX * (outer_radius - inner_radius);
+
+        int x = cx + static_cast<int>(r * std::sin(phi) * std::cos(theta));
+        int y = cy + static_cast<int>(r * std::sin(phi) * std::sin(theta));
+        int z = cz + static_cast<int>(r * std::cos(phi));
+
+        if (x < 0 || x >= grid_x || y < 0 || y >= grid_y || z < 0 || z >= grid_z) {
+            continue;
+        }
+
+        float rnd = static_cast<float>(rand()) / RAND_MAX;
+        int life = static_cast<int>(mac_life_mean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
+        if (life < 1) life = 1;
+
+        mac_agents.push_back();
+        flamegpu::AgentVector::Agent agent = mac_agents.back();
+
+        // Basic identity
+        agent.setVariable<int>("x", x);
+        agent.setVariable<int>("y", y);
+        agent.setVariable<int>("z", z);
+
+        // Macrophage state (1=M2 by default)
+        agent.setVariable<int>("mac_state", 1);
+
+        // Chemical concentrations
+        agent.setVariable<float>("local_CCL2", 0.0f);
+
+        // Chemical gradients for chemotaxis
+        agent.setVariable<float>("ccl2_grad_x", 0.0f);
+        agent.setVariable<float>("ccl2_grad_y", 0.0f);
+        agent.setVariable<float>("ccl2_grad_z", 0.0f);
+
+        // Lifecycle
+        agent.setVariable<int>("life", life);
+        agent.setVariable<int>("dead", 0);
+
+        // Movement state
+        agent.setVariable<float>("move_direction_x", 0.0f);
+        agent.setVariable<float>("move_direction_y", 0.0f);
+        agent.setVariable<float>("move_direction_z", 0.0f);
+        agent.setVariable<int>("tumble", 0);
+        agent.setVariable<int>("moves_remaining", 0);
+
+        // Initialize neighbor counts
+        agent.setVariable<int>("neighbor_cancer_count", 0);
+
+        placed++;
+    }
+
+    std::cout << "Initialized " << placed << " Macrophages (M2) around tumor margin" << std::endl;
 }
 
 // ============================================================================
@@ -886,6 +965,41 @@ void initializeMDSCsFromQSP(
     std::cout << "  Placed " << placed << " MDSCs (probability-based QSP)" << std::endl;
 }
 
+void initializeMacsFromQSP(
+    flamegpu::AgentVector& mac_agents,
+    int grid_x, int grid_y, int grid_z,
+    double p_mac,
+    std::vector<std::vector<int>>& occupied,
+    float life_mean)
+{
+    int placed = 0;
+    for (int z = 0; z < grid_z; z++) {
+        for (int y = 0; y < grid_y; y++) {
+            for (int x = 0; x < grid_x; x++) {
+                // const int idx = z * grid_x * grid_y + y * grid_x + x;
+
+                const float rnd = static_cast<float>(rand()) / RAND_MAX;
+                if (rnd >= static_cast<float>(p_mac)) continue;
+
+                float life_rnd = static_cast<float>(rand()) / RAND_MAX;
+                int life = static_cast<int>(life_mean * std::log(1.0f / (life_rnd + 1e-4f)) + 0.5f);
+                if (life < 1) life = 1;
+
+                mac_agents.push_back();
+                flamegpu::AgentVector::Agent agent = mac_agents.back();
+                agent.setVariable<int>("x", x);
+                agent.setVariable<int>("y", y);
+                agent.setVariable<int>("z", z);
+                agent.setVariable<int>("life", life);
+                agent.setVariable<int>("mac_state", MAC_M2);
+
+                placed++;
+            }
+        }
+    }
+    std::cout << "  Placed " << placed << " Macrophages (probability-based QSP)" << std::endl;
+}
+
 // ============================================================================
 // Master Initialization Function
 // ============================================================================
@@ -909,6 +1023,7 @@ void initializeAllAgents(
     const int treg_div_limit = model.Environment().getProperty<int>("PARAM_TCD4_DIV_LIMIT");
     const int treg_div_interval = model.Environment().getProperty<int>("PARAM_TCD4_DIV_INTERNAL");
     const float mdsc_life = model.Environment().getProperty<float>("PARAM_MDSC_LIFE_MEAN_SLICE");
+    const float mac_life = model.Environment().getProperty<float>("PARAM_MAC_LIFE_MEAN");
     
     // Initialize cancer cells
     {
@@ -952,6 +1067,17 @@ void initializeAllAgents(
             config.cluster_radius, config.num_mdscs,
             mdsc_life);
         simulation.setPopulationData(mdsc_pop);
+    }
+
+    // Initialize Macrophages
+    if (config.num_macrophages > 0) {
+        flamegpu::AgentVector mac_pop(model.Agent(AGENT_MACROPHAGE));
+        initializeMacrophages(
+            mac_pop,
+            config.grid_x, config.grid_y, config.grid_z,
+            config.cluster_radius, config.num_macrophages,
+            mac_life);
+        simulation.setPopulationData(mac_pop);
     }
 
     // === VASCULAR CELLS ===
@@ -1084,11 +1210,12 @@ void initializeToQSP(
     const double p_th   = 0.03 * qsp.th_tumor   / (qsp.th_tumor + cc_SI + eps);
     const double p_mdsc =        qsp.mdsc_tumor  / (qsp.mdsc_tumor + cc_SI + eps);
     const double p_treg = 0.0;
+    const double p_mac  =        qsp.m2_tumor / (qsp.m2_tumor + cc_SI + eps);
 
-
+    std::cout << "  p_treg = " << p_treg   << std::endl;
     std::cout << "  p_th   = " << p_th   << std::endl;
     std::cout << "  p_mdsc = " << p_mdsc << std::endl;
-
+    std::cout << "  p_mac  = " << p_mac << std::endl;
     // -----------------------------------------------------------------------
     // Read cell-lifecycle parameters from model environment (same as initializeAllAgents)
     // -----------------------------------------------------------------------
@@ -1103,7 +1230,7 @@ void initializeToQSP(
     const int   treg_div_limit   = model.Environment().getProperty<int>("PARAM_TCD4_DIV_LIMIT");
     const int   treg_div_interval = model.Environment().getProperty<int>("PARAM_TCD4_DIV_INTERNAL");
     const float mdsc_life        = model.Environment().getProperty<float>("PARAM_MDSC_LIFE_MEAN_SLICE");
-
+    const float mac_life        = model.Environment().getProperty<float>("PARAM_MAC_LIFE_MEAN");
     // -----------------------------------------------------------------------
     // Get CDF for cancer cell population
     // -----------------------------------------------------------------------
@@ -1140,11 +1267,11 @@ void initializeToQSP(
             config.grid_x, config.grid_y, config.grid_z,
             p_th, occupied,
             treg_life, treg_div_limit, treg_div_interval);
-        // initializeTRegCellsFromQSP(
-        //     treg_pop,
-        //     config.grid_x, config.grid_y, config.grid_z,
-        //     p_treg, occupied,
-        //     treg_life, treg_div_limit, treg_div_interval);
+        initializeTRegCellsFromQSP(
+            treg_pop,
+            config.grid_x, config.grid_y, config.grid_z,
+            p_treg, occupied,
+            treg_life, treg_div_limit, treg_div_interval);
         simulation.setPopulationData(treg_pop);
     }
 
@@ -1157,6 +1284,17 @@ void initializeToQSP(
             p_mdsc, occupied,
             mdsc_life);
         simulation.setPopulationData(mdsc_pop);
+    }
+
+    // MDSCs: probability-based placement across all voxels
+    {
+        flamegpu::AgentVector mac_pop(model.Agent(AGENT_MACROPHAGE));
+        initializeMacsFromQSP(
+            mac_pop,
+            config.grid_x, config.grid_y, config.grid_z,
+            p_mac, occupied,
+            mac_life);
+        simulation.setPopulationData(mac_pop);
     }
 
     // Initialize vascular cells (same logic as initializeAllAgents)

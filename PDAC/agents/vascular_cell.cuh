@@ -754,6 +754,13 @@ FLAMEGPU_AGENT_FUNCTION(vascular_move, flamegpu::MessageNone, flamegpu::MessageN
     const int z = FLAMEGPU->getVariable<int>("z");
     const int tumble = FLAMEGPU->getVariable<int>("tumble");
 
+    // ECM based movement probability
+    auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+    float ECM_density = ecm[x][y][z];
+    double ECM_sat = ECM_density / (ECM_density + FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_MOT_EC50"));
+    if (FLAMEGPU->random.uniform<float>() < ECM_sat) return flamegpu::ALIVE;
+
     const float move_dir_x = FLAMEGPU->getVariable<float>("move_direction_x");
     const float move_dir_y = FLAMEGPU->getVariable<float>("move_direction_y");
     const float move_dir_z = FLAMEGPU->getVariable<float>("move_direction_z");
@@ -781,11 +788,6 @@ FLAMEGPU_AGENT_FUNCTION(vascular_move, flamegpu::MessageNone, flamegpu::MessageN
                                         vegfa_grad_y * vegfa_grad_y +
                                         vegfa_grad_z * vegfa_grad_z);
 
-        if (norm_gradient < 1e-10f) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
-            return flamegpu::ALIVE;
-        }
-
         float dot_product = v_x * vegfa_grad_x + v_y * vegfa_grad_y + v_z * vegfa_grad_z;
         float norm_v = std::sqrt(v_x * v_x + v_y * v_y + v_z * v_z);
         float cos_theta = dot_product / (norm_v * norm_gradient);
@@ -811,7 +813,6 @@ FLAMEGPU_AGENT_FUNCTION(vascular_move, flamegpu::MessageNone, flamegpu::MessageN
         if (target_x < 0 || target_x >= grid_x ||
             target_y < 0 || target_y >= grid_y ||
             target_z < 0 || target_z >= grid_z) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
         }
     }
@@ -872,7 +873,7 @@ FLAMEGPU_AGENT_FUNCTION(vascular_move, flamegpu::MessageNone, flamegpu::MessageN
         if (target_x < 0 || target_x >= grid_x ||
             target_y < 0 || target_y >= grid_y ||
             target_z < 0 || target_z >= grid_z) {
-            FLAMEGPU->setVariable<int>("tumble", 0);
+            FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
         }
 

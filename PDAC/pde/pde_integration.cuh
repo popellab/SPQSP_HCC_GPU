@@ -27,6 +27,15 @@ void collect_chemical_from_agents(
     int substrate_idx,
     const std::string& source_var_name);
 
+// Compute spatial gradients of a chemical and update agent variables
+void compute_chemical_gradients_for_agents(
+    flamegpu::HostAPI& host_api,
+    const std::string& agent_name,
+    int substrate_idx,
+    const std::string& grad_x_var,
+    const std::string& grad_y_var,
+    const std::string& grad_z_var);
+
 // FLAME GPU 2 host functions for PDE integration
 // (Declared and implemented in pde_integration.cu)
 
@@ -45,10 +54,12 @@ void cleanup_pde_solver();
 
 // Mark recruitment sources based on chemical concentrations
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER mark_mdsc_sources;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER mark_mac_sources;
 
 // Recruit new immune cells at marked sources
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_t_cells;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_mdscs;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_macrophages;
 
 // Reset recruitment sources (call at start of each step)
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_recruitment_sources;

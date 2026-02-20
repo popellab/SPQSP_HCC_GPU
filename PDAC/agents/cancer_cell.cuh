@@ -77,6 +77,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_count_neighbors, flamegpu::MessageSpatial3D, flam
     int treg_count = 0;    // Regulatory T cells
     int cancer_count = 0;  // Other cancer cells in neighborhood
     int mdsc_count = 0;    // MDSCs (suppress T cell killing)
+    int mac_m1_count = 0;    // Mac M1 count
 
     // Track which neighbor voxels have cancer cells (bit i = neighbor direction i)
     bool neighbor_blocked[26] = {false};
@@ -120,6 +121,10 @@ FLAMEGPU_AGENT_FUNCTION(cancer_count_neighbors, flamegpu::MessageSpatial3D, flam
             } else if (agent_type == CELL_TYPE_CANCER) {
                 cancer_count++;
                 neighbor_blocked[dir_idx] = true;
+            } else if (agent_type == CELL_TYPE_MAC) {
+                if (agent_cell_state == MAC_M1){
+                    mac_m1_count++;
+                }
             }
         }
     }
@@ -147,6 +152,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_count_neighbors, flamegpu::MessageSpatial3D, flam
     FLAMEGPU->setVariable<int>("neighbor_Treg_count", treg_count);
     FLAMEGPU->setVariable<int>("neighbor_cancer_count", cancer_count);
     FLAMEGPU->setVariable<int>("neighbor_MDSC_count", mdsc_count);
+    FLAMEGPU->setVariable<int>("neighbor_Mac1_count", mac_m1_count);
     FLAMEGPU->setVariable<unsigned int>("available_neighbors", available_neighbors);
 
     return flamegpu::ALIVE;
@@ -184,13 +190,15 @@ FLAMEGPU_AGENT_FUNCTION(cancer_select_move_target, flamegpu::MessageNone, flameg
     }
 
 
-    // float ECM_density = 1.0f;  // Placeholder for ECM density, should be read from environment or agent variable
-    // float ECM_50 = 0.5f;  // Placeholder for ECM density at which move probability is halved, should be set in environment
-    // float ECM_sat = ECM_density / (ECM_density + ECM_50);  // Saturation function to reduce move probability in dense ECM
+    // Read ECM concentration from grid at current voxel
+    auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+    float ECM_density = ecm[my_x][my_y][my_z];  // ECM concentration (0.0-1.0)
 
-    float ECM_sat = 0.2;
+    // If ECM density is high, cell has lower probability to move
+    float ECM_sat = ECM_density;  // Direct use of ECM density as movement inhibition
 
-    // Density too high, do not move, but still broadcast intent for conflict resolution
+    // High ECM density reduces move probability
     if (FLAMEGPU->random.uniform<float>() < ECM_sat) {
         // Output dummy message (required)
         FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_CANCER);
@@ -362,6 +370,12 @@ __device__ __forceinline__ float get_kill_probability(
 	return 1 - std::pow(kill_rate, q*(1-supp));
 }
 
+// Helper: Calculate M1 killing probability no supp
+__device__ __forceinline__ float get_kill_probability_M1(
+    float q, float kill_rate) {
+	return 1 - std::pow(kill_rate, q);
+}
+
 __device__ __forceinline__ float get_PD1_PDL1(float PDL1, float Nivo,
      float T1, float k1, float k2, float k3) {
     
@@ -465,6 +479,48 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         }
     }
     // TODO: repeat for Macrophages once added
+    int neighbor_M1 = FLAMEGPU->getVariable<int>("neighbor_Mac1_count");
+    if (neighbor_M1 > 0) {
+        const int neighbor_cancer = FLAMEGPU->getVariable<int>("neighbor_cancer_count");
+
+        const float PDL1 = FLAMEGPU->getVariable<float>("PDL1_syn");
+        float nivo = FLAMEGPU->environment.getProperty<float>("qsp_nivo_tumor");
+        float bond = get_PD1_PDL1(PDL1, nivo, 
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PD1_SYN"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K1"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K2"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K3"));
+        
+        float IL10 = FLAMEGPU->getVariable<float>("local_IL10");
+        float TGFB = FLAMEGPU->getVariable<float>("local_TGFB");
+
+        float A_SYN = FLAMEGPU->environment.getProperty<float>("PARAM_A_SYN");
+        float N_PD1_PDL1 = FLAMEGPU->environment.getProperty<float>("PARAM_N_PD1_PDL1");
+        float PD1_PDL1_half = FLAMEGPU->environment.getProperty<float>("PARAM_PD1_PDL1_HALF");
+
+        double H_PD1_M = hill_equation_cancer(bond / A_SYN, PD1_PDL1_half, N_PD1_PDL1);
+
+        double kd = (FLAMEGPU->environment.getProperty<float>("PARAM_KON_SIRPa_CD47") / FLAMEGPU->environment.getProperty<float>("PARAM_KOFF_SIRPa_CD47"));
+        double a = FLAMEGPU->environment.getProperty<float>("PARAM_C1_CD47_SYN");
+        double b = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_SIRPa_SYN");
+
+        double SIRPa_CD47_conc = ((a + b + 1 / kd) - std::sqrt((a + b + 1 / kd) * (a + b + 1 / kd) - 4 * a * b)) / 2;
+        double SIRPa_CD47_k50 = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_SIRPa_HALF");
+
+        double H_SIRPa_CD47_M = hill_equation_cancer(SIRPa_CD47_conc, SIRPa_CD47_k50, FLAMEGPU->environment.getProperty<float>("PARAM_N_SIRPa_CD47"));
+        double H_Mac_C = 1 - (1 - H_SIRPa_CD47_M) * (1 - H_PD1_M);
+
+        double H_IL10_phago = (IL10 / (IL10 + FLAMEGPU->environment.getProperty<float>("PARAM_MAC_IL_10_HALF_PHAGO")));
+
+        double q = double(neighbor_M1) / (neighbor_M1 + neighbor_cancer + FLAMEGPU->environment.getProperty<float>("PARAM_CELL")) * (1 - H_Mac_C) * (1 - H_IL10_phago);
+
+        double p_kill = get_kill_probability_M1(FLAMEGPU->environment.getProperty<float>("PARAM_ESCAPE_MAC_BASE"), q);
+
+        if (FLAMEGPU->random.uniform<float>() < p_kill) {
+            FLAMEGPU->setVariable<int>("dead", 1);
+            return flamegpu::DEAD;
+        }
+    }
 
     // === DIVISION COOLDOWN ===
     int divideCD = FLAMEGPU->getVariable<int>("divideCD");
@@ -1144,8 +1200,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNon
 
     if (FLAMEGPU->getVariable<int>("moves_remaining") <= 0) return flamegpu::ALIVE;
 
-    // ECM saturation: 20% chance to skip movement this step
-    if (FLAMEGPU->random.uniform<float>() < 0.2f) return flamegpu::ALIVE;
 
     const int x = FLAMEGPU->getVariable<int>("x");
     const int y = FLAMEGPU->getVariable<int>("y");
@@ -1154,6 +1208,13 @@ FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNon
     const int size_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int size_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int size_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    // ECM based movement probability - TEMPORARILY DISABLED
+    // auto ecm = FLAMEGPU->environment.getMacroProperty<float,
+    //     OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+    // float ECM_density = ecm[x][y][z];
+    // double ECM_sat = ECM_density / (ECM_density + FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_MOT_EC50"));
+    if (FLAMEGPU->random.uniform<float>() < 0.2f) return flamegpu::ALIVE;
 
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");

@@ -99,10 +99,13 @@ const char* _gpu_param_description[][3] = {
     {"Param.Molecular.biofvm.TGFB.release.Treg", "", "pr"},              // PARAM_TREG_TGFB_RELEASE_RATE
     {"Param.Molecular.biofvm.TGFB.release.CancerStem", "", "pr"},        // PARAM_STEM_TGFB_RELEASE_RATE
     {"Param.Molecular.biofvm.TGFB.release.CancerProgenitor", "", "pr"},  // PARAM_PROG_TGFB_RELEASE_RATE
+    {"Param.Molecular.biofvm.TGFB.release.Mac", "", "pr"},
     {"Param.Molecular.biofvm.IL10.release.Treg", "", "pr"},              // PARAM_TREG_IL10_RELEASE_RATE
+    {"Param.Molecular.biofvm.IL10.release.Mac", "", "pr"},  
     {"Param.Molecular.biofvm.IL12.release", "", "pr"},                   // PARAM_IL12_RELEASE_RATE
     {"Param.Molecular.biofvm.VEGFA.release.CancerStem", "", "pr"},       // PARAM_STEM_VEGFA_RELEASE_RATE
     {"Param.Molecular.biofvm.VEGFA.release.CancerProgenitor", "", "pr"}, // PARAM_PROG_VEGFA_RELEASE_RATE
+    {"Param.Molecular.biofvm.VEGFA.release.Mac", "", "pr"},
 
     {"Param.Molecular.biofvm.IL_2.uptake", "", "pr"},    // PARAM_IL2
     {"Param.Molecular.biofvm.CCL2.uptake", "", "pr"},    // PARAM_CCL2_UPTAKE
@@ -154,6 +157,9 @@ const char* _gpu_param_description[][3] = {
     //*************************************************************************/
     // MDSC cell parameters
     {"Param.ABM.MDSC.moveSteps", "", "pos"},   // PARAM_MDSC_MOVE_STEPS
+    //*************************************************************************/
+    // Macrophage cell parameters
+    {"Param.ABM.Mac.moveSteps", "", "pos"},   // PARAM_MAC_MOVE_STEPS
     //*************************************************************************/
     // Molecular parameters
 
@@ -279,6 +285,8 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     //MDSC CELL PARAMETERS
     env.newProperty<float>("PARAM_MDSC_LIFESPAN_SD", getFloat(PARAM_MDSC_LIFESPAN_SD));
     env.newProperty<int>("PARAM_MDSC_MOVE_STEPS", getInt(PARAM_MDSC_MOVE_STEPS));
+    //MACROPHAGE CELL PARAMETERS
+    env.newProperty<int>("PARAM_MAC_MOVE_STEPS", getInt(PARAM_MAC_MOVE_STEPS));
     //VAS CELL PARAMETERS
     env.newProperty<float>("PARAM_VAS_MAXPERVOXEL", getFloat(PARAM_VAS_MAXPERVOXEL));
     env.newProperty<float>("PARAM_VAS_50", getFloat(PARAM_VAS_50));
@@ -322,10 +330,13 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     env.newProperty<float>("PARAM_TREG_TGFB_RELEASE", getFloat(PARAM_TREG_TGFB_RELEASE));    // TRegs
     env.newProperty<float>("PARAM_STEM_TGFB_RELEASE", getFloat(PARAM_STEM_TGFB_RELEASE));    // Stem Cancer
     env.newProperty<float>("PARAM_PROG_TGFB_RELEASE", getFloat(PARAM_PROG_TGFB_RELEASE));    // Prog Cancer
+    env.newProperty<float>("PARAM_MAC_TGFB_RELEASE", getFloat(PARAM_MAC_TGFB_RELEASE)); 
     env.newProperty<float>("PARAM_TREG_IL10_RELEASE", getFloat(PARAM_TREG_IL10_RELEASE));    // TRegs
+    env.newProperty<float>("PARAM_MAC_IL10_RELEASE", getFloat(PARAM_MAC_IL10_RELEASE));
     env.newProperty<float>("PARAM_IL12_RELEASE", getFloat(PARAM_IL12_RELEASE));
     env.newProperty<float>("PARAM_STEM_VEGFA_RELEASE", getFloat(PARAM_STEM_VEGFA_RELEASE));  // Stem Cancer
     env.newProperty<float>("PARAM_PROG_VEGFA_RELEASE", getFloat(PARAM_PROG_VEGFA_RELEASE));  // Prog Cancer
+    env.newProperty<float>("PARAM_MAC_VEGFA_RELEASE", getFloat(PARAM_MAC_VEGFA_RELEASE));
 
     env.newProperty<float>("PARAM_IL2_UPTAKE", getFloat(PARAM_IL2_UPTAKE));      // Cyt TCells
     env.newProperty<float>("PARAM_CCL2_UPTAKE", getFloat(PARAM_CCL2_UPTAKE));
