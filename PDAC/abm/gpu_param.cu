@@ -123,6 +123,7 @@ const char* _gpu_param_description[][3] = {
     {"Param.Molecular.biofvm.VEGFA.molecularWeight", "", "pr"}, // PARAM_VEGFA_MOLECULAR_WEIGHT
     {"Param.Molecular.biofvm.O2.molecularWeight", "", "pr"},    // PARAM_O2_MOLECULAR_WEIGHT
 
+
     ////////////////////////////////////////////////////////////////////////////
     // Integer parameters (must match GPUParamInt enum order)
     // Environment parameters

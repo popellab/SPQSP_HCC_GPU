@@ -26,7 +26,12 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_after_div_treg;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_after_div_vas;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER mark_mac_sources;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_macrophages;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_fib_density_field;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_ecm_grid;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER fib_execute_divide;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER aggregate_abm_events;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER copy_abm_counters_to_environment;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_abm_event_counters;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_start_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER chk_break;
 // Define main model execution layers (state transitions and division)
@@ -43,7 +48,7 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("update_agent_counts");
         layer.addHostFunction(update_agent_counts);
     }
-    // 0a. Recruitment system (following HCC Tumor::timeSlice order)
+    // 0b. Recruitment system (following HCC Tumor::timeSlice order)
     // Reset recruitment sources
     {
         flamegpu::LayerDescription layer = model.newLayer("reset_recruitment_sources");
@@ -169,13 +174,18 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("solve_pde");
         layer.addHostFunction(solve_pde_step);
     }
-    // 11b. ECM deposition: fibroblasts (and CAFs) deposit ECM into their voxel.
-    // Runs after state_step (so fib_state reflects NORMAL vs CAF this step).
+    // 11b. ECM deposition with Gaussian smoothing:
+    // Step 1: Zero density field (reset from previous step)
     {
-        flamegpu::LayerDescription layer = model.newLayer("deposit_ecm");
-        layer.addAgentFunction(AGENT_FIBROBLAST, "deposit_ecm");
+        flamegpu::LayerDescription layer = model.newLayer("zero_fib_density_field");
+        layer.addHostFunction(zero_fib_density_field);
     }
-    // 11c. ECM grid decay: apply per-step decay and clamp to [baseline, saturation].
+    // Step 2: Fibroblasts scatter Gaussian kernels to density field
+    {
+        flamegpu::LayerDescription layer = model.newLayer("build_density_field");
+        layer.addAgentFunction(AGENT_FIBROBLAST, "build_density_field");
+    }
+    // 11c. ECM grid update: apply decay, deposition from density field, and clamp to [baseline, saturation].
     {
         flamegpu::LayerDescription layer = model.newLayer("update_ecm");
         layer.addHostFunction(update_ecm_grid);
@@ -242,12 +252,11 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
             flamegpu::LayerDescription layer = model.newLayer("move_macrophage_" + std::to_string(i));
             layer.addAgentFunction(AGENT_MACROPHAGE, "move");
         }
-        // Fibroblast chain movement: 4 layers per move cycle
+        // Fibroblast chain movement: 6 layers per move cycle (supports chains up to 5 cells)
         // 1. Snapshot positions + reset fib_moved flags
         // 2. HEAD (sensor) runs TGFB chemotaxis
-        // 3. Direct followers (1 step behind HEAD) move to leader's old position
-        // 4. Second-order followers (2 steps behind HEAD) move
-        // This propagates through chains of up to MAX_FIB_CHAIN_LENGTH cells
+        // 3-6. Four propagation passes for follower movement through 5-cell chains
+        // Layer i propagates through cells i steps behind HEAD
         for (int i = 0; i < fib_steps; i++) {
             {
                 flamegpu::LayerDescription layer = model.newLayer("fib_write_pos_" + std::to_string(i));
@@ -257,12 +266,9 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
                 flamegpu::LayerDescription layer = model.newLayer("fib_sensor_move_" + std::to_string(i));
                 layer.addAgentFunction(AGENT_FIBROBLAST, "sensor_move");
             }
-            {
-                flamegpu::LayerDescription layer = model.newLayer("fib_follow_move_0_" + std::to_string(i));
-                layer.addAgentFunction(AGENT_FIBROBLAST, "follow_move");
-            }
-            {
-                flamegpu::LayerDescription layer = model.newLayer("fib_follow_move_1_" + std::to_string(i));
+            // Four follow passes to propagate through 5-cell chains
+            for (int pass = 0; pass < 4; pass++) {
+                flamegpu::LayerDescription layer = model.newLayer("fib_follow_move_" + std::to_string(pass) + "_" + std::to_string(i));
                 layer.addAgentFunction(AGENT_FIBROBLAST, "follow_move");
             }
         }
@@ -297,9 +303,31 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
     }
     { flamegpu::LayerDescription l = model.newLayer("chk_after_div_vas"); l.addHostFunction(chk_after_div_vas); }
 
+    // 14b. Fibroblast HEAD division execution (creates new cells, extends chain, converts to CAF)
+    {
+        flamegpu::LayerDescription layer = model.newLayer("fib_execute_divide");
+        layer.addHostFunction(fib_execute_divide);
+    }
+
+    // 15a. Aggregate ABM events from agents (count deaths by cause)
+    {
+        flamegpu::LayerDescription layer = model.newLayer("aggregate_abm_events");
+        layer.addHostFunction(aggregate_abm_events);
+    }
+    // 15b. Copy ABM event counters from MacroProperty to environment properties (for QSP to read)
+    {
+        flamegpu::LayerDescription layer = model.newLayer("copy_abm_counters_to_environment");
+        layer.addHostFunction(copy_abm_counters_to_environment);
+    }
+    // 15c. Solve QSP model (reads ABM event counts from environment properties)
     {
         flamegpu::LayerDescription layer = model.newLayer("solve_qsp");
         layer.addHostFunction(solve_qsp_step);
+    }
+    // 15d. Reset ABM event counters for next step
+    {
+        flamegpu::LayerDescription layer = model.newLayer("reset_abm_event_counters");
+        layer.addHostFunction(reset_abm_event_counters);
     }
 }
 

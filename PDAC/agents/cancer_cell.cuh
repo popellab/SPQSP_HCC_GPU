@@ -427,6 +427,8 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         life--;
         if (life <= 0) {
             FLAMEGPU->setVariable<int>("dead", 1);
+            // Mark death reason for aggregation by host function
+            FLAMEGPU->setVariable<int>("death_reason", 0);  // 0 = natural senescence
             return flamegpu::DEAD;
         }
         FLAMEGPU->setVariable<int>("life", life);
@@ -475,6 +477,8 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         // Probabilistic killing
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
+            // Mark death reason for aggregation by host function
+            FLAMEGPU->setVariable<int>("death_reason", 1);  // 1 = T cell killing
             return flamegpu::DEAD;
         }
     }
@@ -518,6 +522,8 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
 
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
+            // Mark death reason for aggregation by host function
+            FLAMEGPU->setVariable<int>("death_reason", 2);  // 2 = macrophage killing
             return flamegpu::DEAD;
         }
     }

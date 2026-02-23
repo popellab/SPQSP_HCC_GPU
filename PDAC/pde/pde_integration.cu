@@ -991,11 +991,22 @@ FLAMEGPU_HOST_FUNCTION(zero_occupancy_grid) {
 }
 
 // ============================================================================
-// ECM Grid: Decay ECM concentration slightly and prepare for new deposition
+// Zero Fibroblast Density Field (reset before scatter)
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(zero_fib_density_field) {
+    auto field = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("fib_density_field");
+    field.zero();
+}
+
+// ============================================================================
+// ECM Grid: Apply decay, deposition from fibroblast density field, and clamp
 // ============================================================================
 FLAMEGPU_HOST_FUNCTION(update_ecm_grid) {
     auto ecm = FLAMEGPU->environment.getMacroProperty<float,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+    auto field = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("fib_density_field");
 
     const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
@@ -1005,12 +1016,12 @@ FLAMEGPU_HOST_FUNCTION(update_ecm_grid) {
     float decay_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_DECAY_RATE");
     float ecm_baseline = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_BASELINE");
     float ecm_saturation = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_SATURATION");
+    float release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_RELEASE_CAF");
     float dt_sec = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
     float dt = dt_sec / 86400.0f;  // seconds → days
 
     // ============================================================================
-    // Apply ECM dynamics (decay + saturation)
-    // Fibroblast deposition will be added later via agent functions
+    // Apply ECM dynamics: decay + deposition from Gaussian density field + saturation
     // ============================================================================
     for (int i = 0; i < grid_x; i++) {
         for (int j = 0; j < grid_y; j++) {
@@ -1018,15 +1029,251 @@ FLAMEGPU_HOST_FUNCTION(update_ecm_grid) {
                 float curr_ecm = ecm[i][j][k];
 
                 // Exponential decay: ECM_n = ECM_{n-1} * exp(-decay_rate * dt)
-                float after_decay = curr_ecm * expf(-decay_rate * dt);
+                float decayed = curr_ecm * expf(-decay_rate * dt);
+
+                // Deposition from Gaussian density field
+                float fib_field_val = field[i][j][k];
+                float saturation = fminf(curr_ecm / ecm_saturation, 1.0f);
+                float deposition = fib_field_val * release_rate / 3.0f * (1.0f - saturation);
+
+                float new_ecm = decayed + deposition;
 
                 // Enforce bounds [baseline, saturation]
-                float new_ecm = after_decay;
                 if (new_ecm < ecm_baseline) new_ecm = ecm_baseline;
                 if (new_ecm > ecm_saturation) new_ecm = ecm_saturation;
 
                 ecm[i][j][k] = new_ecm;
             }
+        }
+    }
+}
+
+// ============================================================================
+// Aggregate ABM Event Counters from Agent States
+// Counts cancer cell deaths by cause from agents marked as dead
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(aggregate_abm_events) {
+    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
+    auto cc_api = FLAMEGPU->agent("CancerCell");
+
+    // Get population data for iteration
+    flamegpu::DeviceAgentVector cc_agents = cc_api.getPopulationData();
+    const unsigned int cc_count = cc_agents.size();
+
+    // Count cancer cell deaths by cause from dead agents
+    int cc_death_total = 0;
+    int cc_death_natural = 0;
+    int cc_death_t_kill = 0;
+    int cc_death_mac_kill = 0;
+
+    for (unsigned int i = 0; i < cc_count; i++) {
+        if (cc_agents[i].getVariable<int>("dead") != 0) {
+            cc_death_total++;
+            int reason = cc_agents[i].getVariable<int>("death_reason");
+            if (reason == 0) {
+                cc_death_natural++;
+            } else if (reason == 1) {
+                cc_death_t_kill++;
+            } else if (reason == 2) {
+                cc_death_mac_kill++;
+            }
+        }
+    }
+
+    // Update counter MacroProperty with aggregated values
+    counters[ABM_COUNT_CC_DEATH] = cc_death_total;
+    counters[ABM_COUNT_CC_DEATH_NATURAL] = cc_death_natural;
+    counters[ABM_COUNT_CC_DEATH_T_KILL] = cc_death_t_kill;
+    counters[ABM_COUNT_CC_DEATH_MAC_KILL] = cc_death_mac_kill;
+}
+
+// ============================================================================
+// Copy ABM Event Counters from MacroProperty to Environment Properties
+// Called BEFORE QSP so the ODE model can read accumulated counts this step
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(copy_abm_counters_to_environment) {
+    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
+
+    // Copy from MacroProperty array to environment properties for QSP access
+    FLAMEGPU->environment.setProperty<int>("ABM_cc_death", static_cast<int>(counters[ABM_COUNT_CC_DEATH]));
+    FLAMEGPU->environment.setProperty<int>("ABM_cc_death_t_kill", static_cast<int>(counters[ABM_COUNT_CC_DEATH_T_KILL]));
+    FLAMEGPU->environment.setProperty<int>("ABM_cc_death_mac_kill", static_cast<int>(counters[ABM_COUNT_CC_DEATH_MAC_KILL]));
+    FLAMEGPU->environment.setProperty<int>("ABM_cc_death_natural", static_cast<int>(counters[ABM_COUNT_CC_DEATH_NATURAL]));
+    FLAMEGPU->environment.setProperty<int>("ABM_TEFF_REC", static_cast<int>(counters[ABM_COUNT_TEFF_REC]));
+    FLAMEGPU->environment.setProperty<int>("ABM_TH_REC", static_cast<int>(counters[ABM_COUNT_TH_REC]));
+    FLAMEGPU->environment.setProperty<int>("ABM_TREG_REC", static_cast<int>(counters[ABM_COUNT_TREG_REC]));
+    FLAMEGPU->environment.setProperty<int>("ABM_MDSC_REC", static_cast<int>(counters[ABM_COUNT_MDSC_REC]));
+    FLAMEGPU->environment.setProperty<int>("ABM_MAC_REC", static_cast<int>(counters[ABM_COUNT_MAC_REC]));
+}
+
+// ============================================================================
+// Reset ABM → QSP Event Counters (called at END of each step)
+// Clears MacroProperty array for next step's accumulation
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(reset_abm_event_counters) {
+    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
+
+    // Reset all counter elements to zero
+    for (int i = 0; i < ABM_EVENT_COUNTER_SIZE; i++) {
+        counters[i] = 0;
+    }
+}
+
+// ============================================================================
+// Fibroblast HEAD Division: Create 2 new HEAD cells and convert chain to CAF
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
+    auto fib_api = FLAMEGPU->agent(AGENT_FIBROBLAST);
+    const unsigned int fib_count = fib_api.count();
+    if (fib_count == 0) return;
+
+    flamegpu::DeviceAgentVector fib_vec = fib_api.getPopulationData();
+
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+    const float mean_life = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_LIFE_MEAN");
+
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+    auto fib_pos_x = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_x");
+    auto fib_pos_y = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_y");
+    auto fib_pos_z = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_z");
+
+    // --- Build slot->index map and find max slot ---
+    std::unordered_map<int, unsigned int> slot_to_idx;
+    int max_slot = -1;
+    for (unsigned int i = 0; i < fib_count; i++) {
+        int ms = fib_vec[i].getVariable<int>("my_slot");
+        if (ms >= 0) {
+            slot_to_idx[ms] = i;
+            if (ms > max_slot) max_slot = ms;
+        }
+    }
+    int next_slot = max_slot + 1;  // Next free slot index
+
+    // Claimed positions this function call (to avoid duplicate placement)
+    std::set<std::tuple<int,int,int>> claimed;
+
+    // 6 face-adjacent directions
+    const int dx6[] = {1,-1,0,0,0,0};
+    const int dy6[] = {0,0,1,-1,0,0};
+    const int dz6[] = {0,0,0,0,1,-1};
+
+    for (unsigned int i = 0; i < fib_count; i++) {
+        if (fib_vec[i].getVariable<int>("divide_flag") != 1) continue;
+
+        const int head_slot = fib_vec[i].getVariable<int>("my_slot");
+        const int ls        = fib_vec[i].getVariable<int>("leader_slot");
+        const int fs        = fib_vec[i].getVariable<int>("fib_state");
+
+        // Safety: must be a HEAD in a chain and still NORMAL
+        if (head_slot < 0 || ls == -1 || fs != FIB_NORMAL) {
+            fib_vec[i].setVariable<int>("divide_flag", 0);
+            continue;
+        }
+
+        const int hx = fib_vec[i].getVariable<int>("x");
+        const int hy = fib_vec[i].getVariable<int>("y");
+        const int hz = fib_vec[i].getVariable<int>("z");
+
+        // --- Find 2 adjacent free voxels in sequence ---
+        // NEW_HEAD_2: adjacent to old HEAD
+        // NEW_HEAD_1: adjacent to NEW_HEAD_2 (not necessarily adjacent to old HEAD)
+        int new_x[2], new_y[2], new_z[2];
+        int n_found = 0;
+
+        // Search from HEAD for first free voxel (NEW_HEAD_2 position)
+        for (int d = 0; d < 6 && n_found < 1; d++) {
+            int nx = hx + dx6[d];
+            int ny = hy + dy6[d];
+            int nz = hz + dz6[d];
+            if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+            if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_FIB]) > 0u) continue;
+            if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_CANCER]) > 0u) continue;
+            if (claimed.count({nx, ny, nz})) continue;
+            new_x[0] = nx; new_y[0] = ny; new_z[0] = nz;
+            n_found = 1;
+            claimed.insert({nx, ny, nz});
+        }
+
+        // If first cell found, search from IT for second free voxel (NEW_HEAD_1 position)
+        if (n_found == 1) {
+            for (int d = 0; d < 6; d++) {
+                int nx = new_x[0] + dx6[d];
+                int ny = new_y[0] + dy6[d];
+                int nz = new_z[0] + dz6[d];
+                if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+                if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_FIB]) > 0u) continue;
+                if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_CANCER]) > 0u) continue;
+                if (claimed.count({nx, ny, nz})) continue;
+                new_x[1] = nx; new_y[1] = ny; new_z[1] = nz;
+                n_found = 2;
+                claimed.insert({nx, ny, nz});
+                break;
+            }
+        }
+
+        // If can't find 2 free voxels, still convert chain but create fewer new cells
+        // Assign slots: slot A = NEW_HEAD_2 (next to old HEAD), slot B = NEW_HEAD_1 (outermost)
+        int slot_A = next_slot++;    // NEW_HEAD_2: leader_slot = head_slot (points to old HEAD)
+        int slot_B = next_slot++;    // NEW_HEAD_1: leader_slot = slot_A   (points to NEW_HEAD_2)
+
+        // Guard against slot overflow
+        if (slot_A >= MAX_FIB_SLOTS || slot_B >= MAX_FIB_SLOTS) {
+            fib_vec[i].setVariable<int>("divide_flag", 0);
+            continue;
+        }
+
+        // --- Create NEW_HEAD_2 (adjacent to old HEAD) ---
+        if (n_found >= 1) {
+            auto cell2 = fib_api.newAgent();
+            cell2.setVariable<int>("x", new_x[0]);
+            cell2.setVariable<int>("y", new_y[0]);
+            cell2.setVariable<int>("z", new_z[0]);
+            cell2.setVariable<int>("fib_state", FIB_NORMAL);
+            cell2.setVariable<int>("my_slot", slot_A);
+            cell2.setVariable<int>("leader_slot", head_slot);  // Points to old HEAD
+            cell2.setVariable<int>("life", static_cast<int>(mean_life));
+            cell2.setVariable<int>("divide_flag", 0);
+            // Write initial pos snapshot to MacroProperty
+            fib_pos_x[slot_A] = new_x[0];
+            fib_pos_y[slot_A] = new_y[0];
+            fib_pos_z[slot_A] = new_z[0];
+            // Mark occupancy
+            occ[new_x[0]][new_y[0]][new_z[0]][CELL_TYPE_FIB] = 1u;
+        }
+
+        // --- Create NEW_HEAD_1 (the new outermost HEAD) ---
+        if (n_found >= 2) {
+            auto cell1 = fib_api.newAgent();
+            cell1.setVariable<int>("x", new_x[1]);
+            cell1.setVariable<int>("y", new_y[1]);
+            cell1.setVariable<int>("z", new_z[1]);
+            cell1.setVariable<int>("fib_state", FIB_NORMAL);
+            cell1.setVariable<int>("my_slot", slot_B);
+            cell1.setVariable<int>("leader_slot", slot_A);   // Points to NEW_HEAD_2
+            cell1.setVariable<int>("life", static_cast<int>(mean_life));
+            cell1.setVariable<int>("divide_flag", 0);
+            fib_pos_x[slot_B] = new_x[1];
+            fib_pos_y[slot_B] = new_y[1];
+            fib_pos_z[slot_B] = new_z[1];
+            occ[new_x[1]][new_y[1]][new_z[1]][CELL_TYPE_FIB] = 1u;
+        }
+
+        // --- Convert entire chain to CAF ---
+        // HEAD itself
+        fib_vec[i].setVariable<int>("fib_state", FIB_CAF);
+        fib_vec[i].setVariable<int>("divide_flag", 0);
+
+        // Follow leader_slot chain to TAIL
+        int follow = ls;  // leader_slot of HEAD points to MIDDLE (or TAIL)
+        while (follow != -1) {
+            auto it = slot_to_idx.find(follow);
+            if (it == slot_to_idx.end()) break;
+            unsigned int idx = it->second;
+            fib_vec[idx].setVariable<int>("fib_state", FIB_CAF);
+            follow = fib_vec[idx].getVariable<int>("leader_slot");
         }
     }
 }

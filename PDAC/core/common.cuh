@@ -78,13 +78,27 @@ constexpr int MAX_CANCER_PER_VOXEL = 1;         // Max cancer cells per voxel
 constexpr int MAX_MDSC_PER_VOXEL = 1;           // Max MDSC per voxel (exclusive)
 constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exclusive)
 constexpr int MAX_FIB_SLOTS = 5000;             // Max fibroblast slots in chain position MacroProperty
-constexpr int MAX_FIB_CHAIN_LENGTH = 3;         // Max cells per fibroblast chain (HEAD + N-1 followers)
+constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max cells per fibroblast chain (HEAD + N-1 followers); grows via division
+constexpr int ABM_EVENT_COUNTER_SIZE = 9;      // Array size for ABM→QSP event counters (deaths + recruitment)
 
 // Action types for intent messages
 enum IntentAction : int {
     INTENT_NONE = 0,
     INTENT_MOVE = 1,
     INTENT_DIVIDE = 2
+};
+
+// ABM event counter indices (for abm_event_counters MacroProperty array)
+enum ABMEventCounterIndex : int {
+    ABM_COUNT_CC_DEATH = 0,           // Total cancer cell deaths
+    ABM_COUNT_CC_DEATH_T_KILL = 1,    // Cancer deaths from T cell killing
+    ABM_COUNT_CC_DEATH_MAC_KILL = 2,  // Cancer deaths from macrophage killing
+    ABM_COUNT_CC_DEATH_NATURAL = 3,   // Cancer deaths from senescence
+    ABM_COUNT_TEFF_REC = 4,           // T effector cells recruited to tumor
+    ABM_COUNT_TH_REC = 5,             // T helper cells recruited to tumor
+    ABM_COUNT_TREG_REC = 6,           // T regulatory cells recruited to tumor
+    ABM_COUNT_MDSC_REC = 7,           // MDSCs recruited to tumor
+    ABM_COUNT_MAC_REC = 8             // Macrophages recruited to tumor
 };
 
 // Helper device function to check grid bounds

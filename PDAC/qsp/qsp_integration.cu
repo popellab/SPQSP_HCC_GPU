@@ -41,18 +41,32 @@ FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
         abm_scaler = ((1.0 - w) / w) * lymphCC / (static_cast<double>(tumCC) + abm_min_cc);
     }
 
-    // Read ABM event counts (set by recruit_t_cells / recruit_mdscs / agent functions)
+    // Read ABM event counts (set by agent functions and recruitment during this step)
     const int cancer_deaths  = FLAMEGPU->environment.getProperty<int>("ABM_cc_death");
+    const int cc_death_t_kill = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_t_kill");
+    const int cc_death_mac_kill = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_mac_kill");
+    const int cc_death_natural = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_natural");
     const int teff_recruited = FLAMEGPU->environment.getProperty<int>("ABM_TEFF_REC");
+    const int th_recruited = FLAMEGPU->environment.getProperty<int>("ABM_TH_REC");
     const int treg_recruited = FLAMEGPU->environment.getProperty<int>("ABM_TREG_REC");
     const int mdsc_recruited = FLAMEGPU->environment.getProperty<int>("ABM_MDSC_REC");
+    const int mac_recruited = FLAMEGPU->environment.getProperty<int>("ABM_MAC_REC");
 
     // Pass scaled events to wrapper (applied inside time_step via _apply_abm_feedback)
+    // Note: cancer_deaths includes deaths from T cells, macrophages, and senescence
     g_lymph->update_from_abm(
         cancer_deaths, teff_recruited, treg_recruited, mdsc_recruited,
         /*tumor_volume=*/0.0,  // placeholder (not yet computed from ABM geometry)
         tumCC,
         abm_scaler);
+
+    // Debug output of event counts (optional)
+    // if (step % 50 == 0 && cancer_deaths > 0) {
+    //     std::cout << "ABM→QSP Events (step " << step << "): CC_deaths=" << cancer_deaths
+    //               << " (T=" << cc_death_t_kill << ", MAC=" << cc_death_mac_kill << ", nat=" << cc_death_natural << ")"
+    //               << ", Teff_rec=" << teff_recruited << ", TReg_rec=" << treg_recruited
+    //               << ", MDSC_rec=" << mdsc_recruited << ", MAC_rec=" << mac_recruited << std::endl;
+    // }
 
     // Solve ODE for one ABM timestep (CPU-based)
     double dt_abm = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");

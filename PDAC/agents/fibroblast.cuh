@@ -317,59 +317,79 @@ FLAMEGPU_AGENT_FUNCTION(fib_follow_move, flamegpu::MessageNone, flamegpu::Messag
 // Fibroblast: State step — TGFB-driven activation (NORMAL -> CAF) and lifespan
 // ============================================================================
 FLAMEGPU_AGENT_FUNCTION(fib_state_step, flamegpu::MessageNone, flamegpu::MessageNone) {
-    int fib_state = FLAMEGPU->getVariable<int>("fib_state");
-    int life = FLAMEGPU->getVariable<int>("life");
 
-    // Decrement lifespan
-    life--;
-    if (life <= 0) {
-        return flamegpu::DEAD;
+    const int fib_state   = FLAMEGPU->getVariable<int>("fib_state");
+    const int my_slot     = FLAMEGPU->getVariable<int>("my_slot");
+    const int leader_slot = FLAMEGPU->getVariable<int>("leader_slot");
+
+    // Only HEAD cells in a chain that are still NORMAL can divide
+    // HEAD = my_slot >= 0 AND leader_slot != -1 (not TAIL)
+    if (my_slot < 0 || leader_slot == -1 || fib_state != FIB_NORMAL) {
+        return flamegpu::ALIVE;
     }
-    FLAMEGPU->setVariable<int>("life", life);
 
-    // NORMAL → CAF activation driven by TGFB concentration
-    if (fib_state == FIB_NORMAL) {
-        float TGFB = FLAMEGPU->getVariable<float>("local_TGFB");
-        float ec50 = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
-        float activation = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_ACTIVATION");
+    const float TGFB     = FLAMEGPU->getVariable<float>("local_TGFB");
+    const float ec50     = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
+    const float caf_act  = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_ACTIVATION");
+    const float activation = caf_act * 5 * (1 + TGFB / (TGFB + ec50));
+    const float p_div  = 1.0f - expf(-activation);
 
-        // activation_coeff = activation * 5 * (1 + TGFB / (TGFB + EC50))  [HCC formula]
-        double activation_coeff = activation * 5.0 * (1.0 + (TGFB / (TGFB + ec50)));
-        double p_activation = 1.0 - std::exp(-activation_coeff);
-
-        if (FLAMEGPU->random.uniform<float>() < p_activation) {
-            FLAMEGPU->setVariable<int>("fib_state", FIB_CAF);
-        }
+    if (FLAMEGPU->random.uniform<float>() < p_div) {
+        FLAMEGPU->setVariable<int>("divide_flag", 1);
     }
 
     return flamegpu::ALIVE;
 }
 
 // ============================================================================
-// Fibroblast: Deposit ECM into the local voxel
-// Normal fibroblasts deposit at PARAM_FIB_ECM_RELEASE_FIB;
-// CAFs deposit at PARAM_FIB_ECM_RELEASE_CAF (typically higher).
-// Uses atomicAdd so multiple fibroblasts in adjacent voxels are safe.
+// Fibroblast: Build Gaussian density field for ECM deposition
+// Each fibroblast scatters a 3D Gaussian kernel (radius=10, sigma=3) to the
+// fib_density_field MacroProperty. CAFs contribute with scale=1.0, normals 0.5.
+// TGFB amplification is pre-multiplied at the fibroblast's voxel.
+// update_ecm_grid host fn then uses this field to deposit ECM.
 // ============================================================================
-FLAMEGPU_AGENT_FUNCTION(fib_deposit_ecm, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int x = FLAMEGPU->getVariable<int>("x");
-    const int y = FLAMEGPU->getVariable<int>("y");
-    const int z = FLAMEGPU->getVariable<int>("z");
+FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu::MessageNone) {
+    const int cx = FLAMEGPU->getVariable<int>("x");
+    const int cy = FLAMEGPU->getVariable<int>("y");
+    const int cz = FLAMEGPU->getVariable<int>("z");
     const int fib_state = FLAMEGPU->getVariable<int>("fib_state");
+    const float local_TGFB = FLAMEGPU->getVariable<float>("local_TGFB");
 
-    float release_rate;
-    if (fib_state == FIB_CAF) {
-        release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_RELEASE_CAF");
-    } else {
-        release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_RELEASE_FIB");
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    const float ec50  = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
+    const float scale = (fib_state == FIB_CAF) ? 1.0f : 0.5f;
+
+    // Gaussian parameters matching HCC (radius=10, sigma=3)
+    const int radius = 10;
+    const float variance = 9.0f;  // sigma^2 = 3^2
+    // normalizer = 1 / (sigma^3 * sqrt(2*pi)) = 1 / (27 * 2.5066) ≈ 0.014784
+    const float normalizer = 0.014784f;
+
+    // TGFB amplification factor at fibroblast's own voxel (pre-multiplied approximation)
+    const float H_TGFB = local_TGFB / (local_TGFB + ec50);
+    const float tgfb_scale = scale * (1.0f + H_TGFB);
+
+    auto field = FLAMEGPU->environment.getMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("fib_density_field");
+
+    for (int dx = -radius; dx <= radius; dx++) {
+        const int nx = cx + dx;
+        if (nx < 0 || nx >= grid_x) continue;
+        for (int dy = -radius; dy <= radius; dy++) {
+            const int ny = cy + dy;
+            if (ny < 0 || ny >= grid_y) continue;
+            for (int dz = -radius; dz <= radius; dz++) {
+                const int nz = cz + dz;
+                if (nz < 0 || nz >= grid_z) continue;
+                float dist_sq = static_cast<float>(dx*dx + dy*dy + dz*dz);
+                float kernel_val = tgfb_scale * normalizer * expf(-dist_sq / (2.0f * variance));
+                field[nx][ny][nz] += kernel_val;  // atomicAdd via MacroProperty +=
+            }
+        }
     }
-
-    auto ecm = FLAMEGPU->environment.getMacroProperty<float,
-        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
-
-    // Fibroblasts are exclusive per voxel (CAS occ_grid), so no race condition here.
-    float curr_ecm = static_cast<float>(ecm[x][y][z]);
-    ecm[x][y][z].exchange(curr_ecm + release_rate);
 
     return flamegpu::ALIVE;
 }

@@ -91,6 +91,7 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
     // Lifecycle
     cancer_cell.newVariable<int>("life", 0);
     cancer_cell.newVariable<int>("dead", 0);
+    cancer_cell.newVariable<int>("death_reason", -1);  // 0=senescence, 1=T cell kill, 2=MAC kill, -1=alive
 
     // Intent variables for two-phase conflict resolution
     cancer_cell.newVariable<int>("intent_action", INTENT_NONE);
@@ -523,6 +524,9 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
     // Lifecycle
     fib.newVariable<int>("life", 0);
 
+    // Division flag (set by state_step, used by fib_execute_divide)
+    fib.newVariable<int>("divide_flag", 0);
+
     // Chemical release rates (computed per step)
     fib.newVariable<float>("TGFB_release_rate", 0.0f);
 
@@ -547,7 +551,7 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
         fib.newFunction("follow_move", fib_follow_move);
         fib.newFunction("state_step", fib_state_step)
             .setAllowAgentDeath(true);
-        fib.newFunction("deposit_ecm", fib_deposit_ecm);
+        fib.newFunction("build_density_field", fib_build_density_field);
     }
 }
 
@@ -708,6 +712,17 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     env.newProperty<unsigned int>("treg_divide_attempts", 0u);
     env.newProperty<unsigned int>("treg_divide_successes", 0u);
 
+    // ABM → QSP event counters (copied from MacroProperty to these env properties each step, for QSP access)
+    env.newProperty<int>("ABM_cc_death", 0);              // Total cancer cell deaths
+    env.newProperty<int>("ABM_cc_death_t_kill", 0);       // Cancer deaths from T cell killing
+    env.newProperty<int>("ABM_cc_death_mac_kill", 0);     // Cancer deaths from macrophage killing
+    env.newProperty<int>("ABM_cc_death_natural", 0);      // Cancer deaths from senescence
+    env.newProperty<int>("ABM_TEFF_REC", 0);              // T effector cells recruited to tumor
+    env.newProperty<int>("ABM_TH_REC", 0);                // T helper cells recruited to tumor
+    env.newProperty<int>("ABM_TREG_REC", 0);              // T regulatory cells recruited to tumor
+    env.newProperty<int>("ABM_MDSC_REC", 0);              // MDSCs recruited to tumor
+    env.newProperty<int>("ABM_MAC_REC", 0);               // Macrophages recruited to tumor
+
     // QSP state (updated by solve_qsp_step host function)
     env.newProperty<float>("qsp_teff_central", 0.0f);
     env.newProperty<float>("qsp_treg_central", 0.0f);
@@ -730,17 +745,7 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     env.newProperty<float>("qsp_t_exh_tumor", 0.0f);  
     env.newProperty<float>("qsp_tum_vol", 0.0f);  
     env.newProperty<float>("qsp_tum_cmax", 0.0f);   
-    env.newProperty<float>("qsp_f_tum_cap", 0.0f);  
-
-    // ABM state to QSP
-    env.newProperty<int>("ABM_TEFF_REC", 0);  
-    env.newProperty<int>("ABM_TREG_REC", 0);  
-    env.newProperty<int>("ABM_TH_REC", 0);  
-    env.newProperty<int>("ABM_MDSC_REC", 0);
-    env.newProperty<int>("ABM_MAC_REC", 0);
-
-    env.newProperty<int>("ABM_cc_death", 0);  
-    env.newProperty<int>("ABM_cc_t_kill", 0);  
+    env.newProperty<float>("qsp_f_tum_cap", 0.0f);
 
     // Occupancy grid: stores per-voxel cell counts indexed by AgentType enum value.
     // Dimensions are compile-time constants; only [0..grid_size-1] are used at runtime.
@@ -751,6 +756,16 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     // Deposited by fibroblasts/CAFs; decayed by update_ecm_grid host function each step.
     env.newMacroProperty<float,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("ecm_grid");
+
+    // Fibroblast density field: Gaussian-smoothed fibroblast positions.
+    // Computed each step by fib_build_density_field, used by update_ecm_grid for ECM deposition.
+    env.newMacroProperty<float,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX>("fib_density_field");
+
+    // ABM event counters: atomic increment by agent functions, reset each step.
+    // Indices defined in ABMEventCounterIndex enum (common.cuh).
+    // Values: cancer deaths (by cause), immune cell recruitment counts.
+    env.newMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
 
     // Populate ALL other parameters from XML
     params.populateFlameGPUEnvironment(env);
