@@ -65,10 +65,12 @@ public:
     // Direct device pointer access (for FLAME GPU integration)
     float* get_device_concentration_ptr(int substrate_idx);
     float* get_device_source_ptr(int substrate_idx);
-    
+    float* get_device_uptake_ptr(int substrate_idx);
+
     // Reset all concentrations to zero
     void reset_concentrations();
     void reset_sources();
+    void reset_uptakes();
     
     // Set uniform initial concentration for a substrate
     void set_initial_concentration(int substrate_idx, float value);
@@ -89,7 +91,8 @@ private:
     // Device memory
     float* d_concentrations_current_;   // [num_substrates][nz][ny][nx]
     float* d_concentrations_next_;      // Double buffering (for output)
-    float* d_sources_;                   // [num_substrates][nz][ny][nx]
+    float* d_sources_;                   // [num_substrates][nz][ny][nx] - positive sources only
+    float* d_uptakes_;                   // [num_substrates][nz][ny][nx] - positive uptake rates
 
     // Recruitment sources (bit flags: 1=T_source, 2=MDSC_source, 3=both)
     int* d_recruitment_sources_;        // [nz][ny][nx]
@@ -125,11 +128,11 @@ private:
     }
 
     // CG solver internals
-    int solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx);
+    int solve_implicit_cg(float* d_C, const float* d_rhs, const float* d_uptakes_per_voxel, float D, float lambda, float dt, float dx);
 
     // Multigrid solver internals
-    int solve_multigrid(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx);
-    void mg_smooth(float* d_x, const float* d_rhs, float D, float lambda, float dt, float dx,
+    int solve_multigrid(float* d_C, const float* d_rhs, const float* d_uptakes_per_voxel, float D, float lambda, float dt, float dx);
+    void mg_smooth(float* d_x, const float* d_rhs, const float* d_uptakes, float D, float lambda, float dt, float dx,
                    int nx, int ny, int nz, int num_iters, float omega);
     void mg_compute_residual(const float* d_x, const float* d_rhs, float* d_residual,
                              float D, float lambda, float dt, float dx, int nx, int ny, int nz);
@@ -179,6 +182,7 @@ __global__ void compute_gradients_at_voxels(
 
 __global__ void add_sources_from_agents(
     float* __restrict__ d_sources,
+    float* __restrict__ d_uptakes,  // NEW: separate uptakes array
     const int* __restrict__ d_agent_x,
     const int* __restrict__ d_agent_y,
     const int* __restrict__ d_agent_z,
@@ -186,12 +190,14 @@ __global__ void add_sources_from_agents(
     int num_agents,
     int substrate_idx,
     int nx, int ny, int nz,
-    float voxel_volume);
+    float voxel_volume,
+    float dt);
 
 // CG solver kernels
 __global__ void apply_diffusion_operator(
     const float* __restrict__ x,
     float* __restrict__ Ax,
+    const float* __restrict__ uptakes,  // NEW: uptake rates per voxel
     int nx, int ny, int nz,
     float D, float lambda, float dt, float dx);
 

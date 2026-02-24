@@ -128,9 +128,7 @@ public:
         int cancer_deaths,
         int teff_recruited,
         int treg_recruited,
-        int mdsc_recruited,
-        double tumor_volume,
-        int tumor_cell_count,
+        int th_recruited,
         double abm_scaler
     );
 
@@ -228,11 +226,9 @@ private:
         int cancer_deaths_last_step;
         int teff_recruited_last_step;
         int treg_recruited_last_step;
-        int mdsc_recruited_last_step;
-        double tumor_volume;
-        int tumor_cell_count;
+        int th_recruited_last_step;
         double abm_scaler;   // pre-computed (1-w)/w × lymphCC / (tumCC + eps)
-    } _abm_signals;
+    }_abm_signals;
 
     // Species indices (extracted from ODE_system or defined by SBML model)
     // These will be populated during initialization

@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <nvtx3/nvToolsExt.h>
 #include <chrono>
+#include <filesystem>
 
 #include "../core/common.cuh"
 #include "../pde/pde_integration.cuh"
@@ -28,11 +29,26 @@ namespace PDAC {
 }
 
 // ============================================================================
+// Output Directory Management
+// ============================================================================
+
+// Ensure output directories exist, creating them if necessary
+void ensureOutputDirectories() {
+    try {
+        std::filesystem::create_directories("outputs/pde");
+        std::filesystem::create_directories("outputs/abm");
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Could not create output directories: " << e.what() << std::endl;
+    }
+}
+
+// ============================================================================
 // Simulation Monitoring Functions
 // ============================================================================
 
 // Called manually from main() after presim completes — captures true day-0 PDE state.
 void exportPDEData_step0(int grid_x, int grid_y, int grid_z) {
+    ensureOutputDirectories();
     if (!PDAC::g_pde_solver) return;
 
     std::ostringstream filename;
@@ -64,6 +80,8 @@ void exportPDEData_step0(int grid_x, int grid_y, int grid_z) {
 FLAMEGPU_STEP_FUNCTION(exportPDEData) {
     if (PDAC::is_presim_mode_active()) return;
     if (!PDAC::g_pde_solver) return;
+
+    ensureOutputDirectories();
 
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
     const int interval = FLAMEGPU->environment.getProperty<int>("interval_out");
@@ -117,6 +135,8 @@ FLAMEGPU_STEP_FUNCTION(exportPDEData) {
 
 // Called manually from main() after presim completes — captures true day-0 agent state.
 void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescription& model) {
+    ensureOutputDirectories();
+
     std::ostringstream filename;
     filename << "outputs/abm/agents_step_" << std::setw(6) << std::setfill('0') << 0 << ".csv";
     std::ofstream file(filename.str());
@@ -231,11 +251,37 @@ void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescripti
                  << ",life=" << life << "\n";
         }
     }
+
+    // Vasculature
+    {
+        flamegpu::AgentVector vas_pop(model.Agent(PDAC::AGENT_VASCULAR));
+        sim.getPopulationData(vas_pop);
+        for (unsigned int i = 0; i < vas_pop.size(); ++i) {
+            unsigned int id = vas_pop[i].getID();
+            int x = vas_pop[i].getVariable<int>("x");
+            int y = vas_pop[i].getVariable<int>("y");
+            int z = vas_pop[i].getVariable<int>("z");
+            int vas_state = vas_pop[i].getVariable<int>("vascular_state");
+            int life = 0;
+            std::string state_name;
+            switch (vas_state) {
+                case 0: state_name = "TIP"; break;
+                case 1: state_name = "STALK"; break;
+                case 2: state_name = "PHALANX"; break;
+                default: state_name = "UNKNOWN"; break;
+            }
+            file << "VAS," << id << "," << x << "," << y << "," << z << ","
+                 << state_name
+                 << ",life=" << life << "\n";
+        }
+    }
     file.close();
 }
 
 FLAMEGPU_STEP_FUNCTION(exportABMData) {
     if (PDAC::is_presim_mode_active()) return;
+
+    ensureOutputDirectories();
 
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
     const int interval = FLAMEGPU->environment.getProperty<int>("interval_out");
@@ -401,6 +447,9 @@ FLAMEGPU_STEP_FUNCTION(stepCounter) {
     const unsigned int tcell_count  = FLAMEGPU->agent(PDAC::AGENT_TCELL).count();
     const unsigned int treg_count   = FLAMEGPU->agent(PDAC::AGENT_TREG).count();
     const unsigned int mdsc_count   = FLAMEGPU->agent(PDAC::AGENT_MDSC).count();
+    const unsigned int mac_count   = FLAMEGPU->agent(PDAC::AGENT_MACROPHAGE).count();
+    const unsigned int fib_count   = FLAMEGPU->agent(PDAC::AGENT_FIBROBLAST).count();
+    const unsigned int vas_count   = FLAMEGPU->agent(PDAC::AGENT_VASCULAR).count();
 
     // QSP state (set by solve_qsp_step each step)
     const float tum_vol  = FLAMEGPU->environment.getProperty<float>("qsp_tum_vol");
@@ -412,16 +461,20 @@ FLAMEGPU_STEP_FUNCTION(stepCounter) {
     const float mdsc_t   = FLAMEGPU->environment.getProperty<float>("qsp_mdsc_tumor");
 
     std::cout << std::fixed << std::setprecision(2)
-              << "[Day " << std::setw(7) << treat_day << "]"
-              << "  CC=" << cancer_count
+              << "[Day " << std::setw(7) << treat_day << "]" << std::endl;
+    std::cout << std::fixed << std::setprecision(2) << "[ABM] CC=" << cancer_count 
               << "  TC=" << tcell_count
               << "  TR=" << treg_count
               << "  MD=" << mdsc_count
-              << " | vol=" << std::setprecision(4) << tum_vol
+              << "  MAC=" << mac_count
+              << "  FIB=" << fib_count
+              << "  VAS=" << vas_count
+              << std::endl;
+
+    std::cout << std::scientific << std::setprecision(2) << "[QSP] vol=" << tum_vol
               << " cc=" << cc_tumor
-              << " nivo=" << std::scientific << std::setprecision(3) << nivo
+              << " nivo=" << nivo
               << " cabo=" << cabo
-              << std::fixed << std::setprecision(4)
               << " Teff=" << teff_t
               << " Treg=" << treg_t
               << " MDSC=" << mdsc_t

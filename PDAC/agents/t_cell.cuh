@@ -112,7 +112,9 @@ FLAMEGPU_AGENT_FUNCTION(tcell_scan_neighbors, flamegpu::MessageSpatial3D, flameg
                 if (agent_type == CELL_TYPE_CANCER) {
                     cancer_count++;
                     neighbor_counts[dir_idx][0]++;
-                    if (agent_state == CANCER_PROGENITOR) {
+                    // TEMPORARY DEBUG: any cancer cell triggers T cell activation (test IFNg collection)
+                    // Original: if (agent_state == CANCER_PROGENITOR)
+                    if (agent_state == CANCER_STEM || agent_state == CANCER_PROGENITOR) {
                         found_progenitor = 1;
                     }
                 } else if (agent_type == CELL_TYPE_T) {
@@ -872,21 +874,16 @@ FLAMEGPU_AGENT_FUNCTION(tcell_update_chemicals, flamegpu::MessageNone, flamegpu:
 // T Cell agent function: Compute chemical sources
 // Updates in state step now
 FLAMEGPU_AGENT_FUNCTION(tcell_compute_chemical_sources, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
     const int dead = FLAMEGPU->getVariable<int>("dead");
-    
+
     // Dead cells don't produce
     if (dead == 1) {
         return flamegpu::DEAD;
     }
-    
-    // Get base rates and release timers
-    // const float IFNg_release = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
-    // const float IL2_release = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
 
-    // FLAMEGPU->setVariable<float>("IFNg_release_rate", IFNg_release);
-    // FLAMEGPU->setVariable<float>("IL2_release_rate", IL2_release);
-    
+    // NOTE: IFNg_release_rate is already set by state_step based on cancer detection
+    // No action needed here - just let state_step values be used
+
     return flamegpu::ALIVE;
 }
 

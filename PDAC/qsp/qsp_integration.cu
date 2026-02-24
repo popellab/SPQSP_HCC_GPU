@@ -34,7 +34,8 @@ FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
     const double lymphCC    = FLAMEGPU->environment.getProperty<float>("qsp_cc_tumor")
                               * FLAMEGPU->environment.getProperty<float>("AVOGADROS");
     const int    tumCC      = FLAMEGPU->environment.getProperty<unsigned int>("total_cancer_cells");
-    const double abm_min_cc = 0.5;   // prevents division by zero when tumCC == 0
+    const double abm_min_cc = FLAMEGPU->environment.getProperty<float>("PARAM_MIN_CC");
+    // params.getVal(SP_QSP_IO::SP_QSP_HCC::PARAM_C1_MIN);
 
     double abm_scaler = 0.0;
     if (w > 0.0 && w < 1.0) {
@@ -55,10 +56,7 @@ FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
     // Pass scaled events to wrapper (applied inside time_step via _apply_abm_feedback)
     // Note: cancer_deaths includes deaths from T cells, macrophages, and senescence
     g_lymph->update_from_abm(
-        cancer_deaths, teff_recruited, treg_recruited, mdsc_recruited,
-        /*tumor_volume=*/0.0,  // placeholder (not yet computed from ABM geometry)
-        tumCC,
-        abm_scaler);
+        cancer_deaths, teff_recruited, treg_recruited, th_recruited, abm_scaler);
 
     // Debug output of event counts (optional)
     // if (step % 50 == 0 && cancer_deaths > 0) {

@@ -11,7 +11,11 @@
       "Bash(nsys stats:*)",
       "Bash(python3:*)",
       "Bash(grep:*)",
-      "Bash(CUDA_LAUNCH_BLOCKING=1 ./build/bin/pdac:*)"
+      "Bash(CUDA_LAUNCH_BLOCKING=1 ./build/bin/pdac:*)",
+      "WebSearch",
+      "Bash(du:*)",
+      "Bash(/tmp/delivery_checklist.txt:*)",
+      "Bash(cat:*)"
     ]
   }
 }

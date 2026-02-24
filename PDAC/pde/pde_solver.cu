@@ -213,6 +213,7 @@ __global__ void compute_gradients_at_voxels(
 // Kernel: Write (add) sources from agents to voxels
 __global__ void add_sources_from_agents(
     float* __restrict__ d_sources,
+    float* __restrict__ d_uptakes,  // NEW: separate uptakes array
     const int* __restrict__ d_agent_x,
     const int* __restrict__ d_agent_y,
     const int* __restrict__ d_agent_z,
@@ -220,7 +221,8 @@ __global__ void add_sources_from_agents(
     int num_agents,
     int substrate_idx,
     int nx, int ny, int nz,
-    float voxel_volume)
+    float voxel_volume,
+    float dt)
 {
     int agent_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (agent_idx >= num_agents) return;
@@ -239,25 +241,32 @@ __global__ void add_sources_from_agents(
     // Skip if no source
     if (source_rate == 0.0f) return;
 
-    // Unit conversion:
-    // - Release rates (positive): amount/(cell*time) -> divide by voxel volume to get concentration/time
-    // - Uptake rates (negative): already in correct units -> use as-is
-    float concentration_rate;
-    if (source_rate > 0.0f) {
-        concentration_rate = source_rate / voxel_volume;  // Source: convert units
-    } else {
-        concentration_rate = source_rate;  // Sink: already correct units
-    }
+    // Unit conversion for implicit BioFVM solver:
+    // Store RATES (concentration/time), NOT integrated over dt
+    // For SOURCES (positive rates): amount/cell/time → divide by voxel_volume to get concentration/time
+    // For UPTAKES (negative rates): magnitude as concentration/time
+    // dt is applied in RHS construction, not here
+    // Implicit solve: (I + dt*λ + dt*U - dt*D*∇²)C_new = C + dt*S
+
+    // NEW BIOFVM APPROACH: Separate sources from uptakes
+    // Sources (positive) go to d_sources array (for RHS of PDE)
+    // Uptakes (negative) go to d_uptakes array (for diagonal coefficient)
 
     // Compute flat index
     int voxel_idx = z * (nx * ny) + y * nx + x;
 
-    // NOTE: d_sources is already offset to this substrate's data by get_device_source_ptr(),
-    // so we just use voxel_idx, NOT substrate_idx * total_voxels + voxel_idx
-    int source_idx = voxel_idx;
+    // NOTE: d_sources and d_uptakes are already offset to this substrate's data
+    // by get_device_source_ptr() and get_device_uptake_ptr(), so just use voxel_idx
 
-    // Atomic add (multiple agents may be in same voxel)
-    atomicAdd(&d_sources[source_idx], concentration_rate);
+    if (source_rate > 0.0f) {
+        // Release: amount/cell/time → divide by voxel_volume to get concentration/time (rate, not integrated)
+        float source_contribution = source_rate / voxel_volume;
+        atomicAdd(&d_sources[voxel_idx], source_contribution);
+    } else {
+        // Uptake: positive rate (magnitude), stored as concentration/time rate
+        float uptake_magnitude = fabsf(source_rate);
+        atomicAdd(&d_uptakes[voxel_idx], uptake_magnitude);
+    }
 }
 
 __global__ void add_source_kernel(
@@ -279,6 +288,7 @@ __global__ void add_source_kernel(
 // Store inverse: M^{-1}[i] = 1 / M[i]
 __global__ void compute_diagonal_preconditioner_inv(
     float* __restrict__ M_inv,
+    float avg_uptake,  // Average uptake coefficient for this substrate
     float D, float lambda, float dt, float dx,
     int n)
 {
@@ -286,8 +296,10 @@ __global__ void compute_diagonal_preconditioner_inv(
     if (i >= n) return;
 
     float dx2 = dx * dx;
-    float diag = 1.0f + dt * lambda + 6.0f * dt * D / dx2;
-    M_inv[i] = 1.0f / diag;
+    float diag = 1.0f + dt * (lambda + avg_uptake) + 6.0f * dt * D / dx2;
+    // Clamp to ensure positive and finite
+    if (!isfinite(diag) || diag <= 0.0f) diag = 1.0f;
+    M_inv[i] = 1.0f / (diag + 1e-30f);
 }
 
 // Apply diagonal preconditioner: z = M^{-1} * r (element-wise multiplication)
@@ -301,6 +313,36 @@ __global__ void apply_diagonal_preconditioner(
     if (i >= n) return;
 
     z[i] = M_inv[i] * r[i];
+}
+
+// Compute average uptake from uptake array for preconditioner
+__global__ void compute_average_uptake_kernel(
+    const float* __restrict__ uptakes,
+    float* __restrict__ partial_sums,
+    int n)
+{
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float sum = 0.0f;
+    if (idx < n) {
+        sum = uptakes[idx];
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Reduce within block
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
 }
 
 // ============================================================================
@@ -381,6 +423,7 @@ __global__ void weighted_jacobi_kernel(
     const float* __restrict__ x_old,
     const float* __restrict__ rhs,
     float* __restrict__ x_new,
+    const float* __restrict__ uptakes,
     int nx, int ny, int nz,
     float D, float lambda, float dt, float dx, float omega)
 {
@@ -392,6 +435,7 @@ __global__ void weighted_jacobi_kernel(
 
     int idx = iz * (nx * ny) + iy * nx + ix;
     float x_center = x_old[idx];
+    float uptake = uptakes[idx];
 
     // Compute Laplacian using 7-point stencil
     float laplacian = 0.0f;
@@ -408,9 +452,11 @@ __global__ void weighted_jacobi_kernel(
     laplacian = (laplacian - num_neighbors * x_center) / dx2;
 
     // Apply operator: A*x = (I + dt*λ - dt*D*∇²)x
+    // Note: Uptakes handled via average in preconditioner, not per-voxel
     float Ax = x_center + dt * lambda * x_center - dt * D * laplacian;
 
     // Jacobi update: x_new = x_old + omega * (rhs - Ax) / diag(A)
+    // Diagonal includes avg uptake from preconditioner
     float diagonal = 1.0f + dt * lambda + 6.0f * dt * D / dx2;
     float residual = rhs[idx] - Ax;
     x_new[idx] = x_old[idx] + omega * residual / diagonal;
@@ -424,6 +470,7 @@ __global__ void weighted_jacobi_kernel(
 __global__ void apply_diffusion_operator(
     const float* __restrict__ x,
     float* __restrict__ Ax,
+    const float* __restrict__ uptakes,  // NEW: uptake rates per voxel
     int nx, int ny, int nz,
     float D, float lambda, float dt, float dx)
 {
@@ -435,6 +482,7 @@ __global__ void apply_diffusion_operator(
 
     int idx = iz * (nx * ny) + iy * nx + ix;
     float x_center = x[idx];
+    float uptake = uptakes[idx];  // NEW: get local uptake rate
 
     // Compute Laplacian using 7-point stencil
     float laplacian = 0.0f;
@@ -464,9 +512,9 @@ __global__ void apply_diffusion_operator(
         laplacian += (x[idx + nx * ny] - x_center) / dx2;
     }
 
-    // Apply operator: A*x = x + dt*λ*x - dt*D*∇²x
-    // (equivalent to: (I + dt*λ - dt*D*∇²)x)
-    Ax[idx] = x_center + dt * lambda * x_center - dt * D * laplacian;
+    // Apply operator: A*x = (1 + dt*λ + dt*U)*x - dt*D*∇²x
+    // Uptakes are per-voxel and must be included in the main operator
+    Ax[idx] = x_center + dt * lambda * x_center + dt * uptake * x_center - dt * D * laplacian;
 }
 
 // Vector addition: y = y + alpha*x
@@ -581,6 +629,7 @@ PDESolver::~PDESolver() {
     if (d_concentrations_current_) CUDA_CHECK(cudaFree(d_concentrations_current_));
     if (d_concentrations_next_) CUDA_CHECK(cudaFree(d_concentrations_next_));
     if (d_sources_) CUDA_CHECK(cudaFree(d_sources_));
+    if (d_uptakes_) CUDA_CHECK(cudaFree(d_uptakes_));  // NEW: deallocate uptakes
     if (d_recruitment_sources_) CUDA_CHECK(cudaFree(d_recruitment_sources_));
     if (d_cg_r_) CUDA_CHECK(cudaFree(d_cg_r_));
     if (d_cg_p_) CUDA_CHECK(cudaFree(d_cg_p_));
@@ -606,6 +655,7 @@ void PDESolver::initialize() {
     CUDA_CHECK(cudaMalloc(&d_concentrations_current_, total_size));
     CUDA_CHECK(cudaMalloc(&d_concentrations_next_, total_size));
     CUDA_CHECK(cudaMalloc(&d_sources_, total_size));
+    CUDA_CHECK(cudaMalloc(&d_uptakes_, total_size));  // NEW: uptake rates
 
     // Allocate recruitment sources array (int per voxel)
     size_t recruitment_size = total_voxels * sizeof(int);
@@ -615,6 +665,7 @@ void PDESolver::initialize() {
     CUDA_CHECK(cudaMemset(d_concentrations_current_, 0, total_size));
     CUDA_CHECK(cudaMemset(d_concentrations_next_, 0, total_size));
     CUDA_CHECK(cudaMemset(d_sources_, 0, total_size));
+    CUDA_CHECK(cudaMemset(d_uptakes_, 0, total_size));  // NEW: initialize uptakes
     CUDA_CHECK(cudaMemset(d_recruitment_sources_, 0, recruitment_size));
 
     // Allocate CG workspace (per voxel, not per substrate)
@@ -659,12 +710,37 @@ void PDESolver::initialize() {
 }
 
 // Solve implicit system using Preconditioned Conjugate Gradient (diagonal preconditioner)
-// A*x = b where A = (I + dt*λ - dt*D*∇²)
+// A*x = b where A = (I + dt*(λ+U) - dt*D*∇²) with U = uptake rate
 // Returns: number of iterations taken (for diagnostics)
-int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
+int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, const float* d_uptakes_per_voxel, float D, float lambda, float dt, float dx) {
     const int n = config_.nx * config_.ny * config_.nz;
     const int max_iters = 500;  // Increased to test convergence on 50^3 grid
     const float tolerance = 1e-4f;
+
+    // Compute actual average uptake from uptake array for preconditioner
+    // This ensures preconditioner diagonal matches operator diagonal on average
+    float avg_uptake = 1e-4f;  // Default fallback
+
+    int threads_1d = 256;
+    int reduction_blocks = (n + threads_1d - 1) / threads_1d;
+
+    // Compute partial sums (partial_sums_uptake_ buffer)
+    compute_average_uptake_kernel<<<reduction_blocks, threads_1d>>>(
+        d_uptakes_per_voxel, d_dot_buffer_, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Reduce partial sums on CPU
+    std::vector<float> h_partial(reduction_blocks);
+    CUDA_CHECK(cudaMemcpy(h_partial.data(), d_dot_buffer_,
+                          reduction_blocks * sizeof(float), cudaMemcpyDeviceToHost));
+    float total_uptake = 0.0f;
+    for (int i = 0; i < reduction_blocks; i++) {
+        total_uptake += h_partial[i];
+    }
+    avg_uptake = total_uptake / static_cast<float>(n);
+
+    // Clamp to reasonable range to avoid numerical issues
+    avg_uptake = std::max(1e-8f, std::min(avg_uptake, 1e-2f));
 
     // CUDA grid configuration
     dim3 block_3d(8, 8, 8);
@@ -674,8 +750,7 @@ int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float 
         (config_.nz + block_3d.z - 1) / block_3d.z
     );
 
-    int threads_1d = 256;
-    int blocks_1d = (n + threads_1d - 1) / threads_1d;
+    int blocks_1d = reduction_blocks;
 
     // Helper lambda for dot product
     auto dot_product = [&](const float* x, const float* y) -> float {
@@ -694,11 +769,12 @@ int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float 
 
     // Step 1: Compute diagonal preconditioner M^{-1} (once per substrate)
     compute_diagonal_preconditioner_inv<<<blocks_1d, threads_1d>>>(
-        d_precond_diag_inv_, D, lambda, dt, dx, n);
+        d_precond_diag_inv_, avg_uptake, D, lambda, dt, dx, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Step 2: Initialize residual r = b - A*x0
     apply_diffusion_operator<<<grid_3d, block_3d>>>(d_C, d_cg_Ap_,
+                                                     d_uptakes_per_voxel,
                                                      config_.nx, config_.ny, config_.nz,
                                                      D, lambda, dt, dx);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -727,6 +803,7 @@ int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float 
     for (iter = 0; iter < max_iters; iter++) {
         // Ap = A*p
         apply_diffusion_operator<<<grid_3d, block_3d>>>(d_cg_p_, d_cg_Ap_,
+                                                         d_uptakes_per_voxel,
                                                          config_.nx, config_.ny, config_.nz,
                                                          D, lambda, dt, dx);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -785,7 +862,7 @@ int PDESolver::solve_implicit_cg(float* d_C, const float* d_rhs, float D, float 
 // Multigrid Solver (2-Level V-Cycle)
 // ============================================================================
 
-int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float lambda, float dt, float dx) {
+int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, const float* d_uptakes_per_voxel, float D, float lambda, float dt, float dx) {
     const int nx = config_.nx;
     const int ny = config_.ny;
     const int nz = config_.nz;
@@ -822,7 +899,9 @@ int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float la
     // Helper for computing residual norm
     auto compute_residual_norm = [&](const float* d_x, const float* d_b) -> float {
         // Compute residual: r = b - A*x
-        apply_diffusion_operator<<<grid_fine, block_fine>>>(d_x, d_mg_residual_, nx, ny, nz, D, lambda, dt, dx);
+        apply_diffusion_operator<<<grid_fine, block_fine>>>(d_x, d_mg_residual_,
+                                                            d_cg_temp_,  // Use temp for zero uptakes in multigrid
+                                                            nx, ny, nz, D, lambda, dt, dx);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         vector_copy<<<blocks_fine_1d, threads_1d>>>(d_cg_temp_, d_b, n_fine);
@@ -850,10 +929,12 @@ int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float la
     int cycle;
     for (cycle = 0; cycle < max_cycles; cycle++) {
         // 1. Pre-smoothing on fine grid
-        mg_smooth(d_C, d_rhs, D, lambda, dt, dx, nx, ny, nz, pre_smooth, omega);
+        mg_smooth(d_C, d_rhs, d_uptakes_per_voxel, D, lambda, dt, dx, nx, ny, nz, pre_smooth, omega);
 
         // 2. Compute residual: r = b - A*x
-        apply_diffusion_operator<<<grid_fine, block_fine>>>(d_C, d_mg_residual_, nx, ny, nz, D, lambda, dt, dx);
+        apply_diffusion_operator<<<grid_fine, block_fine>>>(d_C, d_mg_residual_,
+                                                            d_uptakes_per_voxel,
+                                                            nx, ny, nz, D, lambda, dt, dx);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         vector_copy<<<blocks_fine_1d, threads_1d>>>(d_cg_temp_, d_rhs, n_fine);
@@ -871,7 +952,9 @@ int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float la
         float dx_coarse = 2.0f * dx;  // Coarse grid spacing
 
         // Smooth on coarse grid instead of exact solve
-        mg_smooth(d_mg_coarse_, d_mg_coarse_rhs_, D, lambda, dt, dx_coarse,
+        // Use d_cg_temp_ as zero uptakes for coarse grid (uptakes not properly restricted)
+        CUDA_CHECK(cudaMemset(d_cg_temp_, 0, n_coarse * sizeof(float)));
+        mg_smooth(d_mg_coarse_, d_mg_coarse_rhs_, d_cg_temp_, D, lambda, dt, dx_coarse,
                   mg_coarse_nx_, mg_coarse_ny_, mg_coarse_nz_, 10, omega);
 
         // 5. Prolong correction to fine grid
@@ -885,7 +968,7 @@ int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float la
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // 7. Post-smoothing on fine grid
-        mg_smooth(d_C, d_rhs, D, lambda, dt, dx, nx, ny, nz, post_smooth, omega);
+        mg_smooth(d_C, d_rhs, d_uptakes_per_voxel, D, lambda, dt, dx, nx, ny, nz, post_smooth, omega);
 
         // Check convergence
         float residual_norm = compute_residual_norm(d_C, d_rhs);
@@ -905,7 +988,7 @@ int PDESolver::solve_multigrid(float* d_C, const float* d_rhs, float D, float la
 }
 
 // Weighted Jacobi smoother
-void PDESolver::mg_smooth(float* d_x, const float* d_rhs, float D, float lambda, float dt, float dx,
+void PDESolver::mg_smooth(float* d_x, const float* d_rhs, const float* d_uptakes, float D, float lambda, float dt, float dx,
                           int nx, int ny, int nz, int num_iters, float omega) {
     dim3 block(8, 8, 8);
     dim3 grid(
@@ -916,7 +999,7 @@ void PDESolver::mg_smooth(float* d_x, const float* d_rhs, float D, float lambda,
 
     // Use d_cg_temp_ as temporary buffer for ping-pong
     for (int iter = 0; iter < num_iters; iter++) {
-        weighted_jacobi_kernel<<<grid, block>>>(d_x, d_rhs, d_cg_temp_, nx, ny, nz, D, lambda, dt, dx, omega);
+        weighted_jacobi_kernel<<<grid, block>>>(d_x, d_rhs, d_cg_temp_, d_uptakes, nx, ny, nz, D, lambda, dt, dx, omega);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy result back
@@ -956,10 +1039,11 @@ void PDESolver::solve_timestep() {
         float lambda = config_.decay_rates[sub];
         float* C_curr = d_concentrations_current_ + sub * n;
         float* sources = d_sources_ + sub * n;
+        float* uptakes = d_uptakes_ + sub * n;  // NEW: get uptakes for this substrate
 
-        // Build RHS: b = C^n + dt*S
+        // Build RHS: b = C^n + dt*S (sources are rates, apply dt here)
         vector_copy<<<blocks, threads>>>(d_cg_temp_, C_curr, n);
-        vector_axpy<<<blocks, threads>>>(d_cg_temp_, sources, config_.dt_abm, n);
+        vector_axpy<<<blocks, threads>>>(d_cg_temp_, sources, config_.dt_abm, n);  // Apply dt to sources
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Create timing events
@@ -970,10 +1054,10 @@ void PDESolver::solve_timestep() {
         // Use hybrid approach: multigrid for most, PCG for zero-decay (O2)
         bool use_pcg = (lambda < 1e-10f);
         if (use_pcg) {
-            substrate_iters[sub] = solve_implicit_cg(C_curr, d_cg_temp_, D, lambda,
+            substrate_iters[sub] = solve_implicit_cg(C_curr, d_cg_temp_, uptakes, D, lambda,
                                                      config_.dt_abm, config_.voxel_size);
         } else {
-            substrate_iters[sub] = solve_multigrid(C_curr, d_cg_temp_, D, lambda,
+            substrate_iters[sub] = solve_multigrid(C_curr, d_cg_temp_, uptakes, D, lambda,
                                                    config_.dt_abm, config_.voxel_size);
         }
 
@@ -1094,6 +1178,13 @@ float* PDESolver::get_device_source_ptr(int substrate_idx) {
     return d_sources_ + substrate_idx * get_total_voxels();
 }
 
+float* PDESolver::get_device_uptake_ptr(int substrate_idx) {
+    if (substrate_idx < 0 || substrate_idx >= config_.num_substrates) {
+        return nullptr;
+    }
+    return d_uptakes_ + substrate_idx * get_total_voxels();
+}
+
 void PDESolver::reset_concentrations() {
     int total_voxels = get_total_voxels();
     size_t total_size = total_voxels * config_.num_substrates * sizeof(float);
@@ -1105,6 +1196,12 @@ void PDESolver::reset_sources() {
     int total_voxels = get_total_voxels();
     size_t total_size = total_voxels * config_.num_substrates * sizeof(float);
     CUDA_CHECK(cudaMemset(d_sources_, 0, total_size));
+}
+
+void PDESolver::reset_uptakes() {
+    int total_voxels = get_total_voxels();
+    size_t total_size = total_voxels * config_.num_substrates * sizeof(float);
+    CUDA_CHECK(cudaMemset(d_uptakes_, 0, total_size));
 }
 
 void PDESolver::reset_recruitment_sources() {

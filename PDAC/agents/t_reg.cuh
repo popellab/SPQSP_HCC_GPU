@@ -800,7 +800,11 @@ FLAMEGPU_AGENT_FUNCTION(treg_update_chemicals, flamegpu::MessageNone, flamegpu::
 // TReg agent function: Compute chemical sources
 FLAMEGPU_AGENT_FUNCTION(treg_compute_chemical_sources, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int dead = FLAMEGPU->getVariable<int>("dead");
-    
+
+    const float IL10_release = FLAMEGPU->environment.getProperty<float>("PARAM_TREG_IL10_RELEASE");
+    const float TGFB_release = FLAMEGPU->environment.getProperty<float>("PARAM_TREG_TGFB_RELEASE");
+    const float IL2_release = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
+
     // Dead cells don't produce
     if (dead == 1) {
         FLAMEGPU->setVariable<float>("IL10_release_rate", 0.0f);
@@ -808,7 +812,12 @@ FLAMEGPU_AGENT_FUNCTION(treg_compute_chemical_sources, flamegpu::MessageNone, fl
         FLAMEGPU->setVariable<float>("IL2_release_rate", 0.0f);
         return flamegpu::ALIVE;
     }
-    
+
+    // Living TRegs produce IL-10 and TGF-β
+    FLAMEGPU->setVariable<float>("IL10_release_rate", IL10_release);
+    FLAMEGPU->setVariable<float>("TGFB_release_rate", TGFB_release);
+    FLAMEGPU->setVariable<float>("IL2_release_rate", IL2_release);
+
     return flamegpu::ALIVE;
 }
 

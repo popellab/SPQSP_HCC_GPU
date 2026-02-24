@@ -153,14 +153,16 @@ void collect_chemical_from_agents(
     cudaMemcpy(d_source_rates, h_source_rates.data(), 
                agent_count * sizeof(float), cudaMemcpyHostToDevice);
     
-    // Get PDE source device pointer
+    // Get PDE source and uptake device pointers
     float* d_pde_sources = g_pde_solver->get_device_source_ptr(substrate_idx);
+    float* d_pde_uptakes = g_pde_solver->get_device_uptake_ptr(substrate_idx);
 
     // Calculate voxel volume in cm^3 for unit conversion
-    // Release rates (amount/cell/time) need division by volume to get concentration/time
+    // Release rates (amount/cell/time) need to be multiplied by dt and divided by volume to get concentration change
     // Uptake rates are already in correct units and should NOT be divided
     const float voxel_size_cm = host_api.environment.getProperty<float>("voxel_size") * 1e-4f;  // µm to cm
     const float voxel_volume = voxel_size_cm * voxel_size_cm * voxel_size_cm;  // cm^3
+    const float dt = host_api.environment.getProperty<float>("PARAM_SEC_PER_SLICE");  // seconds per ABM step
 
     // Launch kernel
     int threads = 256;
@@ -168,12 +170,14 @@ void collect_chemical_from_agents(
 
     add_sources_from_agents<<<blocks, threads>>>(
         d_pde_sources,
+        d_pde_uptakes,
         d_x, d_y, d_z,
         d_source_rates,
         agent_count,
         substrate_idx,
         grid_x, grid_y, grid_z,
-        voxel_volume
+        voxel_volume,
+        dt
     );
 
     cudaDeviceSynchronize();
@@ -361,8 +365,9 @@ FLAMEGPU_HOST_FUNCTION(collect_agent_sources) {
 
     nvtxRangePush("Collect Agent Sources");
 
-    // Reset sources for this timestep
+    // Reset sources and uptakes for this timestep
     g_pde_solver->reset_sources();
+    g_pde_solver->reset_uptakes();  // NEW: reset uptakes for BioFVM approach
     
     // Collect O2 consumption from cancer cells (should be negative)
     collect_chemical_from_agents(*FLAMEGPU, AGENT_CANCER_CELL, CHEM_O2, "O2_uptake_rate");
@@ -661,6 +666,15 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
     int treg_recruited = 0;
     int th_recruited = 0;
 
+    // Count total sources available
+    int total_t_sources = 0;
+    for (int idx = 0; idx < total_voxels; idx++) {
+        if ((h_sources[idx] & 1) != 0) total_t_sources++;
+    }
+    if (total_t_sources > 0) {
+        std::cout << "[DEBUG] Found " << total_t_sources << " T cell recruitment sources" << std::endl;
+    }
+
     // Scan for T source voxels (bit 0 set)
     for (int idx = 0; idx < total_voxels; idx++) {
         if ((h_sources[idx] & 1) == 0) continue;  // Not a T source
@@ -806,9 +820,12 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
             }
         }
     }
-    FLAMEGPU->environment.setProperty<int>("ABM_TEFF_REC",teff_recruited);
-    FLAMEGPU->environment.setProperty<int>("ABM_TREG_REC",treg_recruited);
-    FLAMEGPU->environment.setProperty<int>("ABM_TH_REC",th_recruited);
+
+    // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
+    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
+    counters[ABM_COUNT_TEFF_REC] += teff_recruited;
+    counters[ABM_COUNT_TH_REC] += th_recruited;
+    counters[ABM_COUNT_TREG_REC] += treg_recruited;
 }
 
 // Recruit MDSCs at marked MDSC source voxels
@@ -875,7 +892,10 @@ FLAMEGPU_HOST_FUNCTION(recruit_mdscs) {
             }
         }
     }
-    FLAMEGPU->environment.setProperty<int>("ABM_MDSC_REC",mdsc_recruited);
+
+    // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
+    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
+    counters[ABM_COUNT_MDSC_REC] += mdsc_recruited;
 }
 
 // Mark macrophage sources based on CCL2 concentration
@@ -978,7 +998,10 @@ FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
             }
         }
     }
-    FLAMEGPU->environment.setProperty<int>("ABM_MAC_REC", mac_recruited);
+
+    // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
+    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
+    counters[ABM_COUNT_MAC_REC] += mac_recruited;
 }
 
 // ============================================================================

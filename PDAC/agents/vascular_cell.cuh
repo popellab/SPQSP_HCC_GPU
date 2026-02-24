@@ -374,7 +374,7 @@ FLAMEGPU_AGENT_FUNCTION(vascular_mark_t_sources, flamegpu::MessageNone, flamegpu
     const float local_IFNg = FLAMEGPU->getVariable<float>("local_IFNg");  // Will be set correctly when we add IFN read
 
     // Calculate Hill function (simplified from HCC - no tumor scaling for now)
-    const float ec50_ifng = FLAMEGPU->environment.getProperty<int>("PARAM_TEFF_IFN_EC50");
+    const float ec50_ifng = FLAMEGPU->environment.getProperty<float>("PARAM_TEFF_IFN_EC50");
     const float H_IFNg = local_IFNg / (local_IFNg + ec50_ifng);
 
     // Probability check

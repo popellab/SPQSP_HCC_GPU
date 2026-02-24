@@ -49,6 +49,11 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addHostFunction(update_agent_counts);
     }
     // 0b. Recruitment system (following HCC Tumor::timeSlice order)
+    // Reset ABM event counters (for this step's recruitment and death counts)
+    {
+        flamegpu::LayerDescription layer = model.newLayer("reset_abm_event_counters_start");
+        layer.addHostFunction(reset_abm_event_counters);
+    }
     // Reset recruitment sources
     {
         flamegpu::LayerDescription layer = model.newLayer("reset_recruitment_sources");

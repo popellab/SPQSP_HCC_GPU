@@ -21,7 +21,7 @@ LymphCentralWrapper::LymphCentralWrapper()
     , _cabo_on(false), _cabo_dose(0.0), _cabo_interval_s(0.0), _cabo_doses_given(0)
     , _treatment_started(false), _treatment_start_time(0.0)
     , _nivo_next_dose_t(0.0), _cabo_next_dose_t(0.0) {
-    _abm_signals = {0, 0, 0, 0, 0.0, 0, 0.0};
+    _abm_signals = {0, 0, 0, 0, 0.0};
 }
 
 // Destructor
@@ -240,17 +240,13 @@ void LymphCentralWrapper::update_from_abm(
     int cancer_deaths,
     int teff_recruited,
     int treg_recruited,
-    int mdsc_recruited,
-    double tumor_volume,
-    int tumor_cell_count,
+    int th_recruited,
     double abm_scaler)
 {
     _abm_signals.cancer_deaths_last_step  = cancer_deaths;
     _abm_signals.teff_recruited_last_step = teff_recruited;
     _abm_signals.treg_recruited_last_step = treg_recruited;
-    _abm_signals.mdsc_recruited_last_step = mdsc_recruited;
-    _abm_signals.tumor_volume             = tumor_volume;
-    _abm_signals.tumor_cell_count         = tumor_cell_count;
+    _abm_signals.th_recruited_last_step   = th_recruited;
     _abm_signals.abm_scaler               = abm_scaler;
 }
 
@@ -471,28 +467,25 @@ void LymphCentralWrapper::_apply_abm_feedback() {
     using namespace CancerVCT;
     auto* ode = _qsp_model->getSystem();
     const double avogadros = 6.022140857e23;
-    const double scaler_inv_avo = _abm_signals.abm_scaler / avogadros;
+    const double scaler = _abm_signals.abm_scaler / avogadros;
 
-    // 1. Cancer cell deaths (T cell killing) → reduce V_T_C1
-    if (_abm_signals.cancer_deaths_last_step > 0) {
-        double kills_moles = _abm_signals.cancer_deaths_last_step * scaler_inv_avo;
-        double c1_cur = ode->getSpeciesVar(SP_V_T_C1);
-        ode->setSpeciesVar(SP_V_T_C1, std::max(0.0, c1_cur - kills_moles));
-    }
+    // Antigen increase
+    double p0 = ode->getSpeciesVar(SP_V_T_P0, false);
+    double p1 = ode->getSpeciesVar(SP_V_T_P0, false);
+    double factor_p0 = ode->get_class_param(P_n_T0_clones) * ode->get_class_param(P_P0_C1);
+    double factor_p1 = ode->get_class_param(P_n_T1_clones) * ode->get_class_param(P_P1_C1);
 
-    // 2. Teff recruited (central → tumor) → reduce V_C_T1
-    if (_abm_signals.teff_recruited_last_step > 0) {
-        double teff_moles = _abm_signals.teff_recruited_last_step * scaler_inv_avo;
-        double t1c_cur = ode->getSpeciesVar(SP_V_C_T1);
-        ode->setSpeciesVar(SP_V_C_T1, std::max(0.0, t1c_cur - teff_moles));
-    }
+    ode->setSpeciesVar(SP_V_T_P0, _abm_signals.cancer_deaths_last_step * scaler * factor_p0, false);
+    ode->setSpeciesVar(SP_V_T_P1, _abm_signals.cancer_deaths_last_step * scaler * factor_p1, false);
 
-    // 3. TReg recruited (central → tumor) → reduce V_C_T0
-    if (_abm_signals.treg_recruited_last_step > 0) {
-        double treg_moles = _abm_signals.treg_recruited_last_step * scaler_inv_avo;
-        double t0c_cur = ode->getSpeciesVar(SP_V_C_T0);
-        ode->setSpeciesVar(SP_V_C_T0, std::max(0.0, t0c_cur - treg_moles));
-    }
+    // Recruitment decrease
+    double cent_t_eff = ode->getSpeciesVar(SP_V_T_T1, false);
+    double cent_t_reg = ode->getSpeciesVar(SP_V_T_T0, false);
+    double cent_t_h = ode->getSpeciesVar(SP_V_T_Th, false);
+
+    ode->setSpeciesVar(SP_V_T_T1, std::max(0.0, cent_t_eff - _abm_signals.teff_recruited_last_step * scaler), false);
+    ode->setSpeciesVar(SP_V_T_T0, std::max(0.0, cent_t_reg - _abm_signals.treg_recruited_last_step * scaler), false);
+    ode->setSpeciesVar(SP_V_T_Th, std::max(0.0, cent_t_h - _abm_signals.th_recruited_last_step * scaler), false);
 }
 
 } // namespace PDAC
