@@ -280,16 +280,6 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
     float k_th = FLAMEGPU->environment.getProperty<float>("PARAM_TH_RECRUIT_K");
     float p_recruit_th = std::min(qsp_th_conc * k_th, 1.0f);
 
-    // Debug output (periodic)
-    // static int debug_counter = 0;
-    // if (debug_counter % 10 == 0) {
-    //     std::cout << "T cell recruitment probabilities: Teff=" << p_recruit_teff
-    //               << " (conc=" << qsp_teff_conc << ", k=" << k_teff << ")"
-    //               << ", Treg=" << p_recruit_treg
-    //               << " (conc=" << qsp_th_conc << ", k=" << k_treg << ")" << std::endl;
-    // }
-    // debug_counter++;
-
     // Copy recruitment sources to host
     int total_voxels = nx * ny * nz;
     std::vector<int> h_sources(total_voxels);
@@ -308,9 +298,6 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
     int total_t_sources = 0;
     for (int idx = 0; idx < total_voxels; idx++) {
         if ((h_sources[idx] & 1) != 0) total_t_sources++;
-    }
-    if (total_t_sources > 0) {
-        std::cout << "[DEBUG] Found " << total_t_sources << " T cell recruitment sources" << std::endl;
     }
 
     // Scan for T source voxels (bit 0 set)
@@ -345,17 +332,16 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent.setVariable<int>("z", nz_new);
                             new_agent.setVariable<int>("cell_state", 0);  // Effector state
 
-                            double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_T_CELL_LIFE_MEAN_SLICE");
-                            double lifeSd = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_LIFESPAN_SD_SLICE");
+                            float lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_T_CELL_LIFE_MEAN_SLICE");
 
                             float rnd = static_cast<float>(rand()) / RAND_MAX;
                             int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
                             if (life < 1) life = 1;
 
-                            new_agent.setVariable<float>("life", life);
+                            new_agent.setVariable<int>("life", life);
 
-                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_DIV_INTERNAL"));
-                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_DIV_LIMIT"));
+                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_INTERNAL"));
+                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_LIMIT"));
 
                             new_agent.setVariable<float>("IL2_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_RELEASE_TIME"));
 
@@ -389,17 +375,16 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent.setVariable<int>("z", nz_new);
                             new_agent.setVariable<int>("cell_state", 0);
 
-                            double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
-                            double lifeSd = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_LIFESPAN_SD_SLICE");
+                            float lifeMean_treg = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
 
-                            float rnd = static_cast<float>(rand()) / RAND_MAX;
-                            int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
-                            if (life < 1) life = 1;
+                            float rnd_treg = static_cast<float>(rand()) / RAND_MAX;
+                            int life_treg = static_cast<int>(lifeMean_treg * std::log(1.0f / (rnd_treg + 0.0001f)) + 0.5f);
+                            if (life_treg < 1) life_treg = 1;
 
-                            new_agent.setVariable<int>("life", life);
+                            new_agent.setVariable<int>("life", life_treg);
 
-                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_DIV_INTERNAL"));
-                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_DIV_LIMIT"));
+                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL"));
+                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT"));
 
                             new_agent.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
 
@@ -428,27 +413,26 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             ny_new >= 0 && ny_new < ny &&
                             nz_new >= 0 && nz_new < nz) {
 
-                            auto new_agent = treg_api.newAgent();
-                            new_agent.setVariable<int>("x", nx_new);
-                            new_agent.setVariable<int>("y", ny_new);
-                            new_agent.setVariable<int>("z", nz_new);
-                            new_agent.setVariable<int>("cell_state", 1);
+                            auto new_agent_th = treg_api.newAgent();
+                            new_agent_th.setVariable<int>("x", nx_new);
+                            new_agent_th.setVariable<int>("y", ny_new);
+                            new_agent_th.setVariable<int>("z", nz_new);
+                            new_agent_th.setVariable<int>("cell_state", 1);
 
-                            double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
-                            double lifeSd = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_LIFESPAN_SD_SLICE");
+                            float lifeMean_th = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
 
-                            float rnd = static_cast<float>(rand()) / RAND_MAX;
-                            int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
-                            if (life < 1) life = 1;
+                            float rnd_th = static_cast<float>(rand()) / RAND_MAX;
+                            int life_th = static_cast<int>(lifeMean_th * std::log(1.0f / (rnd_th + 0.0001f)) + 0.5f);
+                            if (life_th < 1) life_th = 1;
 
-                            new_agent.setVariable<int>("life", life);
+                            new_agent_th.setVariable<int>("life", life_th);
 
-                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_DIV_INTERNAL"));
-                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_DIV_LIMIT"));
+                            new_agent_th.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL"));
+                            new_agent_th.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT"));
 
-                            new_agent.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
+                            new_agent_th.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
 
-                            new_agent.setVariable<float>("CTLA4", 0.0);
+                            new_agent_th.setVariable<float>("CTLA4", 0.0f);
 
                             th_recruited++;
                             placed = true;

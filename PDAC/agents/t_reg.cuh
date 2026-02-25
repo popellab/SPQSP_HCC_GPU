@@ -152,7 +152,7 @@ FLAMEGPU_AGENT_FUNCTION(treg_scan_neighbors, flamegpu::MessageSpatial3D, flamegp
     return flamegpu::ALIVE;
 }
 
-__device__ __forceinline__ float get_CTLA4_ipi(float ipi, float k_on, float k_off, 
+__device__ __noinline__ float get_CTLA4_ipi(float ipi, float k_on, float k_off,
                                                 float gamma_T_ipi,float chi_CTLA4, float a_Tcell,
                                                  float n_CTLA4_TCD4, float CTLA4_50, float K_ADCC) {
     double a = k_on * chi_CTLA4 / a_Tcell / k_off;
@@ -215,9 +215,16 @@ FLAMEGPU_AGENT_FUNCTION(treg_state_step, flamegpu::MessageNone, flamegpu::Messag
 
     const int nx_ts = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int ny_ts = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int nz_ts = FLAMEGPU->environment.getProperty<int>("grid_size_z");
     const int ax_ts = FLAMEGPU->getVariable<int>("x");
     const int ay_ts = FLAMEGPU->getVariable<int>("y");
     const int az_ts = FLAMEGPU->getVariable<int>("z");
+    // Bounds check before PDE access
+    if (ax_ts < 0 || ax_ts >= nx_ts || ay_ts < 0 || ay_ts >= ny_ts || az_ts < 0 || az_ts >= nz_ts) {
+        printf("[TREG BOUNDS] id=%u bad coords (%d,%d,%d) grid=(%d,%d,%d) state=%d\n",
+               FLAMEGPU->getID(), ax_ts, ay_ts, az_ts, nx_ts, ny_ts, nz_ts, cell_state);
+        return flamegpu::ALIVE;
+    }
     const int voxel_ts = az_ts * ny_ts*nx_ts + ay_ts * nx_ts + ax_ts;
     float TGFB = reinterpret_cast<const float*>(
         FLAMEGPU->environment.getProperty<uint64_t>("pde_concentration_ptr_4"))[voxel_ts];
@@ -228,48 +235,48 @@ FLAMEGPU_AGENT_FUNCTION(treg_state_step, flamegpu::MessageNone, flamegpu::Messag
 
     float TGFB_release_remain = FLAMEGPU->getVariable<float>("TGFB_release_remain");
     float sec_per_slice = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
-    int divide_flag;
+    int divide_flag = 0;  // initialize to prevent UB for TH cells that don't convert
     if (cell_state == TCD4_TH) {
         float denominator = TGFB + MAC_TGFB_EC50;
         float alpha = (denominator > 1e-12f) ? K_TH_TREG * (1 + TGFB / denominator) : K_TH_TREG;  // Prevent division by zero
         float p_th_treg = 1 - std::exp(-alpha);
         //convert TH to TREG
         if (FLAMEGPU->random.uniform<float>() < p_th_treg) {
-            FLAMEGPU->setVariable<int>("cell_state", T_CELL_CYT);
-            FLAMEGPU->setVariable<float>("divide_cd",TCD4_DIV_INTERNAL);
+            FLAMEGPU->setVariable<int>("cell_state", TCD4_TREG);  // was T_CELL_CYT (wrong enum value)
+            FLAMEGPU->setVariable<int>("divide_cd", TCD4_DIV_INTERNAL);  // was setVariable<float> (type mismatch)
             FLAMEGPU->setVariable<float>("CTLA4", CTLA4);
             return flamegpu::ALIVE;
         }
 
     } else if (cell_state == TCD4_TREG) {
-        float TGFB_release_remain = FLAMEGPU->getVariable<float>("TGFB_release_remain");
-        if (found_progenitor == 1 && TGFB_release_remain >= 0){
-            FLAMEGPU->setVariable<float>("TGFB_release_remain", TGFB_release_remain - sec_per_slice);
+        float TGFB_release_remain2 = FLAMEGPU->getVariable<float>("TGFB_release_remain");
+        if (found_progenitor == 1 && TGFB_release_remain2 >= 0){
+            FLAMEGPU->setVariable<float>("TGFB_release_remain", TGFB_release_remain2 - sec_per_slice);
         }
-        float k_on = FLAMEGPU->environment.getProperty<float>("PARAM_KON_CTLA4_IPI");
-        float k_off = FLAMEGPU->environment.getProperty<float>("PARAM_KOFF_CTLA4_IPI");
-        float gamma_T_ipi_on = FLAMEGPU->environment.getProperty<float>("PARAM_GAMMA_T_IPI");
-        float chi_CTLA4 = FLAMEGPU->environment.getProperty<float>("PARAM_CHI_CTLA4_IPI");
-        float a_Tcell = FLAMEGPU->environment.getProperty<float>("PARAM_A_TCELL");
-        float n_CTLA4_TCD4 = FLAMEGPU->environment.getProperty<float>("PARAM_CTLA4_TREG");
-        float TREG_CTLA4_50 = FLAMEGPU->environment.getProperty<float>("PARAM_TREG_CTLA4_50");
-        float K_ADCC = FLAMEGPU->environment.getProperty<float>("PARAM_K_ADCC");
-
-        float tumor_ipi = 0.0f; // TODO: replace with IPI calculation from QSP model
-        float p_ADCC_death = get_CTLA4_ipi(tumor_ipi, k_on, k_off, gamma_T_ipi_on,
-                                            chi_CTLA4,a_Tcell, n_CTLA4_TCD4, TREG_CTLA4_50, K_ADCC);
-        if (FLAMEGPU->random.uniform<float>() < p_ADCC_death) {
-            return flamegpu::DEAD;
-        }
+        // NOTE: CTLA4-ipi ADCC death disabled: tumor_ipi=0 always → p_ADCC_death=0.
+        // Disabled to reduce register pressure / stack usage (caused cudaErrorIllegalAddress).
+        // TODO: re-enable when IPI drug coupling from QSP is implemented.
+        // float k_on = FLAMEGPU->environment.getProperty<float>("PARAM_KON_CTLA4_IPI");
+        // float k_off = FLAMEGPU->environment.getProperty<float>("PARAM_KOFF_CTLA4_IPI");
+        // float gamma_T_ipi_on = FLAMEGPU->environment.getProperty<float>("PARAM_GAMMA_T_IPI");
+        // float chi_CTLA4 = FLAMEGPU->environment.getProperty<float>("PARAM_CHI_CTLA4_IPI");
+        // float a_Tcell = FLAMEGPU->environment.getProperty<float>("PARAM_A_TCELL");
+        // float n_CTLA4_TCD4 = FLAMEGPU->environment.getProperty<float>("PARAM_CTLA4_TREG");
+        // float TREG_CTLA4_50 = FLAMEGPU->environment.getProperty<float>("PARAM_TREG_CTLA4_50");
+        // float K_ADCC = FLAMEGPU->environment.getProperty<float>("PARAM_K_ADCC");
+        // float tumor_ipi = 0.0f; // TODO: replace with IPI from QSP model
+        // float p_ADCC_death = get_CTLA4_ipi(tumor_ipi, k_on, k_off, gamma_T_ipi_on,
+        //                                     chi_CTLA4, a_Tcell, n_CTLA4_TCD4, TREG_CTLA4_50, K_ADCC);
+        // if (FLAMEGPU->random.uniform<float>() < p_ADCC_death) { return flamegpu::DEAD; }
 
         float MDSC_EC50_ArgI_Treg = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_EC50_ArgI_Treg");
         float ArgI = reinterpret_cast<const float*>(
             FLAMEGPU->environment.getProperty<uint64_t>("pde_concentration_ptr_6"))[voxel_ts];
         float H_ArgI = ArgI / (ArgI + MDSC_EC50_ArgI_Treg);
-        if (FLAMEGPU->random.uniform<float>() < H_ArgI && FLAMEGPU->getVariable<float>("divide_limit") > 0){
+        int divide_limit = FLAMEGPU->getVariable<int>("divide_limit");
+        if (FLAMEGPU->random.uniform<float>() < H_ArgI && divide_limit > 0){
             divide_cd = 0;
         }
-        int divide_limit = FLAMEGPU->getVariable<int>("divide_limit");
         if (divide_limit > 0 && divide_cd <= 0) {
             divide_flag = 1;
         } else {

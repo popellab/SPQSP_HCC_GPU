@@ -164,6 +164,27 @@ set_target_properties(pdac PROPERTIES
 # Installation
 install(TARGETS pdac DESTINATION bin)
 
+# ============================================================================
+# PDE Solver Validation Tests (no FLAMEGPU dependency — standalone CUDA only)
+# ============================================================================
+add_executable(pde_test
+    ../pde/pde_test.cu
+    ../pde/pde_solver.cu
+)
+
+set_target_properties(pde_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+target_include_directories(pde_test PRIVATE
+    ${MY_PARENT_DIR}/pde
+)
+
+target_compile_options(pde_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=1301>
+)
+
 # Print configuration summary
 message(STATUS "")
 message(STATUS "=== PDAC GPU Configuration ===")

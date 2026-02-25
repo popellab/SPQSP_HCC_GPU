@@ -565,6 +565,9 @@ int main(int argc, const char** argv) {
     model->addExitCondition(checkSimulationEnd);
     
     // ========== CREATE SIMULATION ==========
+    // Increase CUDA per-thread stack size for complex kernels (default 1KB is too small
+    // for cancer_cell_state_step with inlined Newton-Raphson double-precision math)
+    cudaDeviceSetLimit(cudaLimitStackSize, 16384);  // 16KB per thread
     std::cout << "Creating CUDA simulation..." << std::endl;
     flamegpu::CUDASimulation simulation(*model);
     simulation.SimulationConfig().steps = config.steps;

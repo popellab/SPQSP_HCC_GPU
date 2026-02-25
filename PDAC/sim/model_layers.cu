@@ -228,17 +228,17 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         flamegpu::LayerDescription layer = model.newLayer("debug_before_state_transitions_layer");
         layer.addHostFunction(debug_before_state_transitions);
     }
-    // 8. Agent state transitions (killing, division decisions, etc.)
-    {
-        flamegpu::LayerDescription layer = model.newLayer("state_transitions");
-        layer.addAgentFunction(AGENT_CANCER_CELL, "state_step");
-        layer.addAgentFunction(AGENT_TCELL, "state_step");
-        layer.addAgentFunction(AGENT_TREG, "state_step");
-        layer.addAgentFunction(AGENT_MDSC, "state_step");
-        layer.addAgentFunction(AGENT_MACROPHAGE, "state_step");
-        layer.addAgentFunction(AGENT_FIBROBLAST, "state_step");
-        layer.addAgentFunction(AGENT_VASCULAR, "state_step");
-    }
+    // 8. Agent state transitions — split into individual layers for crash isolation
+    { flamegpu::LayerDescription l = model.newLayer("st_cancer"); l.addAgentFunction(AGENT_CANCER_CELL, "state_step"); }
+    { flamegpu::LayerDescription l = model.newLayer("st_cancer_done"); l.addHostFunction(chk_after_div_cancer); }
+    { flamegpu::LayerDescription l = model.newLayer("st_tcell");  l.addAgentFunction(AGENT_TCELL,       "state_step"); }
+    { flamegpu::LayerDescription l = model.newLayer("st_tcell_done"); l.addHostFunction(chk_after_div_tcell); }
+    { flamegpu::LayerDescription l = model.newLayer("st_treg");   l.addAgentFunction(AGENT_TREG,        "state_step"); }
+    { flamegpu::LayerDescription l = model.newLayer("st_treg_done"); l.addHostFunction(chk_after_div_treg); }
+    { flamegpu::LayerDescription l = model.newLayer("st_mdsc");   l.addAgentFunction(AGENT_MDSC,        "state_step"); }
+    { flamegpu::LayerDescription l = model.newLayer("st_mac");    l.addAgentFunction(AGENT_MACROPHAGE,  "state_step"); }
+    { flamegpu::LayerDescription l = model.newLayer("st_fib");    l.addAgentFunction(AGENT_FIBROBLAST,  "state_step"); }
+    { flamegpu::LayerDescription l = model.newLayer("st_vas");    l.addAgentFunction(AGENT_VASCULAR,    "state_step"); }
     // DEBUG: After state transitions
     {
         flamegpu::LayerDescription layer = model.newLayer("debug_after_state_transitions_layer");

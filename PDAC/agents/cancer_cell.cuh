@@ -443,20 +443,25 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
 
         const float PDL1 = FLAMEGPU->getVariable<float>("PDL1_syn");
         float nivo = FLAMEGPU->environment.getProperty<float>("qsp_nivo_tumor");
-        float bond = get_PD1_PDL1(PDL1, nivo, 
+        float bond = get_PD1_PDL1(PDL1, nivo,
                         FLAMEGPU->environment.getProperty<float>("PARAM_PD1_SYN"),
                         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K1"),
                         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K2"),
                         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K3"));
-        float supp = get_PD1_supp(bond, 
+        float supp = get_PD1_supp(bond,
                         FLAMEGPU->environment.getProperty<float>("PARAM_N_PD1_PDL1"),
                         FLAMEGPU->environment.getProperty<float>("PARAM_PD1_PDL1_HALF"));
 
         const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
         const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+        const int nz_check = FLAMEGPU->environment.getProperty<int>("grid_size_z");
         const int ax = FLAMEGPU->getVariable<int>("x");
         const int ay = FLAMEGPU->getVariable<int>("y");
         const int az = FLAMEGPU->getVariable<int>("z");
+        // Safety guard: skip PDE access if coordinates are out of bounds
+        if (ax < 0 || ax >= nx || ay < 0 || ay >= ny || az < 0 || az >= nz_check) {
+            return flamegpu::ALIVE;
+        }
         const int voxel = az * ny*nx + ay * nx + ax;
         float NO = reinterpret_cast<const float*>(
             FLAMEGPU->environment.getProperty<uint64_t>("pde_concentration_ptr_7"))[voxel];

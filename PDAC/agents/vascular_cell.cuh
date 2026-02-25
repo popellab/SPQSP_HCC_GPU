@@ -401,9 +401,18 @@ FLAMEGPU_AGENT_FUNCTION(vascular_mark_t_sources, flamegpu::MessageNone, flamegpu
     const float H_IFNg = local_IFNg / (local_IFNg + ec50_ifng);
 
     // Probability check
-    double max_cancer = grid_x * grid_y * grid_z;
-	double tumor_scaler = std::sqrt(1e5 * max_cancer / (FLAMEGPU->environment.getProperty<float>("qsp_cc_tumor") * FLAMEGPU->environment.getProperty<float>("AVOGADROS")));
-    double vas_scaler = 100 / 200; // Should get the current total of vasculature cells, need a property to set this
+    // tumor_scaler: normalizes recruitment rate relative to QSP cancer cell count
+    //   sqrt(1e5 * N_voxels / cc_molecules) — prevents over-recruitment when tumor is large
+    //   Guard against cc_tumor=0 at simulation start
+    const float qsp_cc_mol = FLAMEGPU->environment.getProperty<float>("qsp_cc_tumor")
+                             * FLAMEGPU->environment.getProperty<float>("AVOGADROS");
+    double max_cancer = static_cast<double>(grid_x) * grid_y * grid_z;
+    double tumor_scaler = (qsp_cc_mol > 0.0f)
+        ? std::sqrt(1e5 * max_cancer / static_cast<double>(qsp_cc_mol))
+        : 1.0;
+    // vas_scaler: fraction of vascular cells that are active ports
+    // TODO: replace 100.0/200.0 with actual phalanx count from env property
+    double vas_scaler = 100.0 / 200.0;
     const float p_entry = H_IFNg * tumor_scaler * vas_scaler;
 
     if (FLAMEGPU->random.uniform<float>() < p_entry) {
