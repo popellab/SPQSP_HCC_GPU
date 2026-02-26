@@ -15,7 +15,8 @@
       "WebSearch",
       "Bash(du:*)",
       "Bash(/tmp/delivery_checklist.txt:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(cd:*)"
     ]
   }
 }

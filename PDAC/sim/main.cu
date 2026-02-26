@@ -228,10 +228,10 @@ void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescripti
             int x = mac_pop[i].getVariable<int>("x");
             int y = mac_pop[i].getVariable<int>("y");
             int z = mac_pop[i].getVariable<int>("z");
-            int mac_state = mac_pop[i].getVariable<int>("mac_state");
+            int cell_state = mac_pop[i].getVariable<int>("cell_state");
             int life = mac_pop[i].getVariable<int>("life");
             file << "MAC," << id << "," << x << "," << y << "," << z << ","
-                 << (mac_state == PDAC::MAC_M1 ? "M1" : "M2")
+                 << (cell_state == PDAC::MAC_M1 ? "M1" : "M2")
                  << ",life=" << life << "\n";
         }
     }
@@ -244,10 +244,10 @@ void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescripti
             int x = fib_pop[i].getVariable<int>("x");
             int y = fib_pop[i].getVariable<int>("y");
             int z = fib_pop[i].getVariable<int>("z");
-            int fib_state = fib_pop[i].getVariable<int>("fib_state");
+            int cell_state = fib_pop[i].getVariable<int>("cell_state");
             int life = fib_pop[i].getVariable<int>("life");
             file << "FIB," << id << "," << x << "," << y << "," << z << ","
-                 << (fib_state == PDAC::FIB_CAF ? "CAF" : "NORMAL")
+                 << (cell_state == PDAC::FIB_CAF ? "CAF" : "NORMAL")
                  << ",life=" << life << "\n";
         }
     }
@@ -261,7 +261,7 @@ void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescripti
             int x = vas_pop[i].getVariable<int>("x");
             int y = vas_pop[i].getVariable<int>("y");
             int z = vas_pop[i].getVariable<int>("z");
-            int vas_state = vas_pop[i].getVariable<int>("vascular_state");
+            int vas_state = vas_pop[i].getVariable<int>("cell_state");
             int life = 0;
             std::string state_name;
             switch (vas_state) {
@@ -397,11 +397,11 @@ FLAMEGPU_STEP_FUNCTION(exportABMData) {
                 int x = mac_pop[i].getVariable<int>("x");
                 int y = mac_pop[i].getVariable<int>("y");
                 int z = mac_pop[i].getVariable<int>("z");
-                int mac_state = mac_pop[i].getVariable<int>("mac_state");
+                int cell_state = mac_pop[i].getVariable<int>("cell_state");
                 int life = mac_pop[i].getVariable<int>("life");
 
                 file << "MAC," << id << "," << x << "," << y << "," << z << ","
-                     << (mac_state == PDAC::MAC_M1 ? "M1" : "M2")
+                     << (cell_state == PDAC::MAC_M1 ? "M1" : "M2")
                      << ",life=" << life << "\n";
             }
         }
@@ -417,11 +417,11 @@ FLAMEGPU_STEP_FUNCTION(exportABMData) {
                 int x = fib_pop[i].getVariable<int>("x");
                 int y = fib_pop[i].getVariable<int>("y");
                 int z = fib_pop[i].getVariable<int>("z");
-                int fib_state = fib_pop[i].getVariable<int>("fib_state");
+                int cell_state = fib_pop[i].getVariable<int>("cell_state");
                 int life = fib_pop[i].getVariable<int>("life");
 
                 file << "FIB," << id << "," << x << "," << y << "," << z << ","
-                     << (fib_state == PDAC::FIB_CAF ? "CAF" : "NORMAL")
+                     << (cell_state == PDAC::FIB_CAF ? "CAF" : "NORMAL")
                      << ",life=" << life << "\n";
             }
         }

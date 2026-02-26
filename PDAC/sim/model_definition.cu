@@ -366,7 +366,7 @@ void defineMacrophageAgent(flamegpu::ModelDescription& model, bool include_state
     mac.newVariable<int>("z");
 
     // Macrophage state (0=M1, 1=M2)
-    mac.newVariable<int>("mac_state", 1);  // Default: M2
+    mac.newVariable<int>("cell_state", 1);  // Default: M2
 
     // Movement state for run-tumble chemotaxis
     mac.newVariable<float>("move_direction_x", 0.0f);
@@ -417,7 +417,7 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
     fib.newVariable<int>("z");
 
     // Fibroblast state (0=NORMAL, 1=CAF)
-    fib.newVariable<int>("fib_state", FIB_NORMAL);
+    fib.newVariable<int>("cell_state", FIB_NORMAL);
 
     // Movement state for run-tumble chemotaxis
     fib.newVariable<float>("move_direction_x", 0.0f);
@@ -473,7 +473,7 @@ void defineVascularCellAgent(flamegpu::ModelDescription& model) {
     agent.newVariable<int>("z");
 
     // State (VAS_TIP, VAS_STALK, VAS_PHALANX)
-    agent.newVariable<int>("vascular_state", VAS_PHALANX);  // Default: mature vessel
+    agent.newVariable<int>("cell_state", VAS_PHALANX);  // Default: mature vessel
 
     // Movement direction (for tip cells)
     agent.newVariable<float>("move_direction_x", 1.0f);
@@ -640,6 +640,9 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     env.newProperty<float>("qsp_tum_vol", 0.0f);  
     env.newProperty<float>("qsp_tum_cmax", 0.0f);   
     env.newProperty<float>("qsp_f_tum_cap", 0.0f);
+
+    // Drug properties
+    env.newProperty<float>("R_cabo", 0.0f); // Resistance to Cabo
 
     // Occupancy grid: stores per-voxel cell counts indexed by AgentType enum value.
     // Dimensions are compile-time constants; only [0..grid_size-1] are used at runtime.

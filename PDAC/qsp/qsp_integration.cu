@@ -44,14 +44,12 @@ FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
 
     // Read ABM event counts (set by agent functions and recruitment during this step)
     const int cancer_deaths  = FLAMEGPU->environment.getProperty<int>("ABM_cc_death");
-    const int cc_death_t_kill = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_t_kill");
-    const int cc_death_mac_kill = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_mac_kill");
-    const int cc_death_natural = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_natural");
+    // const int cc_death_t_kill = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_t_kill");
+    // const int cc_death_mac_kill = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_mac_kill");
+    // const int cc_death_natural = FLAMEGPU->environment.getProperty<int>("ABM_cc_death_natural");
     const int teff_recruited = FLAMEGPU->environment.getProperty<int>("ABM_TEFF_REC");
     const int th_recruited = FLAMEGPU->environment.getProperty<int>("ABM_TH_REC");
     const int treg_recruited = FLAMEGPU->environment.getProperty<int>("ABM_TREG_REC");
-    const int mdsc_recruited = FLAMEGPU->environment.getProperty<int>("ABM_MDSC_REC");
-    const int mac_recruited = FLAMEGPU->environment.getProperty<int>("ABM_MAC_REC");
 
     // Pass scaled events to wrapper (applied inside time_step via _apply_abm_feedback)
     // Note: cancer_deaths includes deaths from T cells, macrophages, and senescence
@@ -62,8 +60,7 @@ FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
     // if (step % 50 == 0 && cancer_deaths > 0) {
     //     std::cout << "ABM→QSP Events (step " << step << "): CC_deaths=" << cancer_deaths
     //               << " (T=" << cc_death_t_kill << ", MAC=" << cc_death_mac_kill << ", nat=" << cc_death_natural << ")"
-    //               << ", Teff_rec=" << teff_recruited << ", TReg_rec=" << treg_recruited
-    //               << ", MDSC_rec=" << mdsc_recruited << ", MAC_rec=" << mac_recruited << std::endl;
+    //               << ", Teff_rec=" << teff_recruited << ", TReg_rec=" << treg_recruited << std::endl;
     // }
 
     // Solve ODE for one ABM timestep (CPU-based)
@@ -107,13 +104,9 @@ FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
                                                             FLAMEGPU->environment.getProperty<float>("AVOGADROS") /
                                                             qsp_state.tum_cmax);
 
-    // // Debug output
-    // if (step % 10 == 0) {
-    //     std::cout << "QSP state (step " << step << "): "
-    //               << "Teff=" << qsp_state.teff_tumor
-    //               << ", Th=" << qsp_state.th_tumor
-    //               << ", MDSC=" << qsp_state.mdsc_tumor << std::endl;
-    // }
-}
+    // Update Cabo resistance
+    float cabo = static_cast<float>(qsp_state.cabo_tumor);
+    FLAMEGPU->environment.setProperty<float>("R_cabo", cabo/ (cabo + FLAMEGPU->environment.getProperty<float>("PARAM_IC50_AXL")));
 
+    }
 }

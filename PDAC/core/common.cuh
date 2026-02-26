@@ -52,6 +52,13 @@ enum FibroblastState : int {
     FIB_CAF = 1      // Cancer-associated fibroblast
 };
 
+// Vascular cell cell_states
+enum VascularCellState : int {
+    VAS_TIP = 0,      // Actively sprouting tip cell
+    VAS_STALK = 1,    // Connecting stalk cell
+    VAS_PHALANX = 2   // Mature vessel (O2 secreting)
+};
+
 // Message names
 constexpr const char* MSG_CELL_LOCATION = "cell_location";
 constexpr const char* MSG_INTENT = "intent_message";
@@ -101,6 +108,84 @@ enum ABMEventCounterIndex : int {
     ABM_COUNT_MAC_REC = 8             // Macrophages recruited to tumor
 };
 
+// ============================================================
+// PDE Environment Property Name Constants
+// Maps chemical names to their environment pointer property names.
+// Indices match ChemicalSubstrate enum in pde_solver.cuh:
+//   O2=0, IFN=1, IL2=2, IL10=3, TGFB=4, CCL2=5, ARGI=6, NO=7, IL12=8, VEGFA=9
+// ============================================================
+
+// PDE environment pointer property name constants.
+// Using #define so these work as string literals in both host and device code
+// (FLAMEGPU's getProperty requires a string literal / const char(&)[N]).
+// Indices match ChemicalSubstrate enum in pde_solver.cuh.
+
+// Concentration pointers (read-only in agent functions)
+#define PDE_CONC_O2    "pde_concentration_ptr_0"
+#define PDE_CONC_IFN   "pde_concentration_ptr_1"
+#define PDE_CONC_IL2   "pde_concentration_ptr_2"
+#define PDE_CONC_IL10  "pde_concentration_ptr_3"
+#define PDE_CONC_TGFB  "pde_concentration_ptr_4"
+#define PDE_CONC_CCL2  "pde_concentration_ptr_5"
+#define PDE_CONC_ARGI  "pde_concentration_ptr_6"
+#define PDE_CONC_NO    "pde_concentration_ptr_7"
+#define PDE_CONC_IL12  "pde_concentration_ptr_8"
+#define PDE_CONC_VEGFA "pde_concentration_ptr_9"
+
+// Source pointers (atomicAdd secretion rate / voxel_volume → [conc/s])
+#define PDE_SRC_O2    "pde_source_ptr_0"
+#define PDE_SRC_IFN   "pde_source_ptr_1"
+#define PDE_SRC_IL2   "pde_source_ptr_2"
+#define PDE_SRC_IL10  "pde_source_ptr_3"
+#define PDE_SRC_TGFB  "pde_source_ptr_4"
+#define PDE_SRC_CCL2  "pde_source_ptr_5"
+#define PDE_SRC_ARGI  "pde_source_ptr_6"
+#define PDE_SRC_NO    "pde_source_ptr_7"
+#define PDE_SRC_IL12  "pde_source_ptr_8"
+#define PDE_SRC_VEGFA "pde_source_ptr_9"
+
+// Uptake pointers (atomicAdd first-order decay rate [1/s], no volume scaling)
+#define PDE_UPT_O2    "pde_uptake_ptr_0"
+#define PDE_UPT_IFN   "pde_uptake_ptr_1"
+#define PDE_UPT_IL2   "pde_uptake_ptr_2"
+#define PDE_UPT_IL10  "pde_uptake_ptr_3"
+#define PDE_UPT_TGFB  "pde_uptake_ptr_4"
+#define PDE_UPT_CCL2  "pde_uptake_ptr_5"
+#define PDE_UPT_ARGI  "pde_uptake_ptr_6"
+#define PDE_UPT_NO    "pde_uptake_ptr_7"
+#define PDE_UPT_IL12  "pde_uptake_ptr_8"
+#define PDE_UPT_VEGFA "pde_uptake_ptr_9"
+
+// Gradient pointers (read-only, filled by compute_pde_gradients each step)
+#define PDE_GRAD_IFN_X   "pde_grad_IFN_x"
+#define PDE_GRAD_IFN_Y   "pde_grad_IFN_y"
+#define PDE_GRAD_IFN_Z   "pde_grad_IFN_z"
+#define PDE_GRAD_TGFB_X  "pde_grad_TGFB_x"
+#define PDE_GRAD_TGFB_Y  "pde_grad_TGFB_y"
+#define PDE_GRAD_TGFB_Z  "pde_grad_TGFB_z"
+#define PDE_GRAD_CCL2_X  "pde_grad_CCL2_x"
+#define PDE_GRAD_CCL2_Y  "pde_grad_CCL2_y"
+#define PDE_GRAD_CCL2_Z  "pde_grad_CCL2_z"
+#define PDE_GRAD_VEGFA_X "pde_grad_VEGFA_x"
+#define PDE_GRAD_VEGFA_Y "pde_grad_VEGFA_y"
+#define PDE_GRAD_VEGFA_Z "pde_grad_VEGFA_z"
+
+// ============================================================
+// PDE Access Helper Macros
+// Usage examples:
+//   float o2  = PDE_READ(FLAMEGPU, PDE_CONC_O2, voxel);
+//   PDE_SECRETE(FLAMEGPU, PDE_SRC_CCL2, voxel, rate / voxel_volume);
+//   PDE_UPTAKE(FLAMEGPU, PDE_UPT_IFN, voxel, rate_per_sec);
+// ============================================================
+#define PDE_READ(fgpu, name, voxel) \
+    (reinterpret_cast<const float*>((fgpu)->environment.getProperty<uint64_t>(name))[(voxel)])
+
+#define PDE_SECRETE(fgpu, name, voxel, rate_per_vol) \
+    atomicAdd(&reinterpret_cast<float*>((fgpu)->environment.getProperty<uint64_t>(name))[(voxel)], (rate_per_vol))
+
+#define PDE_UPTAKE(fgpu, name, voxel, rate_per_sec) \
+    atomicAdd(&reinterpret_cast<float*>((fgpu)->environment.getProperty<uint64_t>(name))[(voxel)], (rate_per_sec))
+
 // Helper device function to check grid bounds
 __device__ __forceinline__ bool is_in_bounds(int x, int y, int z, int size_x, int size_y, int size_z) {
     return x >= 0 && x < size_x && y >= 0 && y < size_y && z >= 0 && z < size_z;
@@ -130,6 +215,75 @@ __device__ __forceinline__ float hill_equation(float x, float k50, float n) {
     const float kn = powf(k50, n);
     return xn / (kn + xn);
 }
+
+__device__ __forceinline__ float get_PD1_PDL1(float PDL1, float Nivo,
+     float T1, float k1, float k2, float k3) {
+    
+    double T2 = PDL1;
+    double a = 1;
+	double b = (Nivo*k2/k1*(2*k3/k1-1) - 2*T2 - T1 - 1/k1)/T2;
+	double c = (Nivo*k2/k1 + 1/k1  +T2 + 2*T1 )/T2;
+	double d = -T1/T2;
+
+	//Newton_Raphson_root
+	int max_iter = 20;
+	double tol_rel = 1E-5;
+	double root = 0;
+	double res, root_new, f, f1;
+	int i = 0;
+	while (i < max_iter){
+		f = a*std::pow(root, 3) + b*std::pow(root, 2)+ c*root + d;
+		f1 = 3.0*a*std::pow(root, 2) + 2.0*b*root + c;
+		root_new = root - f/f1;
+		res = std::abs(root_new - root) / root_new;
+		if (res > tol_rel){
+			i++;
+			root = root_new;
+		}
+		else{
+			break;
+		}
+	}
+
+	return T2*root;
+}
+
+// Helper: Calculate T cell killing probability
+__device__ __forceinline__ float get_kill_probability_supp(float supp, float q, float kill_rate) {
+    return 1 - std::pow(kill_rate, q*(1-supp));
+}
+
+// Helper: Calculate M1 macrophage killing probability
+__device__ __forceinline__ float get_kill_probability(float q, float kill_rate) {
+    return 1 - std::pow(kill_rate, q);
+}
+
+// Helper function to get Moore neighborhood direction
+// Returns direction offset for index 0-25
+// Indices 0-5 are Von Neumann (face) neighbors, 6-25 are edge/corner neighbors
+__device__ __forceinline__ void get_moore_direction(int idx, int& dx, int& dy, int& dz) {
+    // Face neighbors (6): indices 0-5 - these are Von Neumann neighbors
+    // Edge neighbors (12): indices 6-17
+    // Corner neighbors (8): indices 18-25
+    const int dirs[26][3] = {
+        // Face neighbors (Von Neumann)
+        {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1},
+        // Edge neighbors
+        {-1, -1, 0}, {-1, 1, 0}, {1, -1, 0}, {1, 1, 0},
+        {-1, 0, -1}, {-1, 0, 1}, {1, 0, -1}, {1, 0, 1},
+        {0, -1, -1}, {0, -1, 1}, {0, 1, -1}, {0, 1, 1},
+        // Corner neighbors
+        {-1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {-1, 1, 1},
+        {1, -1, -1}, {1, -1, 1}, {1, 1, -1}, {1, 1, 1}
+    };
+    dx = dirs[idx][0];
+    dy = dirs[idx][1];
+    dz = dirs[idx][2];
+}
+
+// Not using currently but saving for reference
+// Von Neumann mask: only face neighbors (bits 0-5)
+constexpr unsigned int VON_NEUMANN_MASK = 0x3Fu;  // binary: 00111111
 
 } // namespace PDAC
 

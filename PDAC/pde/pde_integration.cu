@@ -596,13 +596,13 @@ FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
                             new_agent.setVariable<int>("z", nz_new);
 
                             // Recruit as M1 state
-                            int mac_state = MAC_M1;
+                            int cell_state = MAC_M1;
 
                             // 30% chance to become M2
                             if (FLAMEGPU->random.uniform<float>() < 0.3f) {
-                                mac_state = MAC_M2;
+                                cell_state = MAC_M2;
                             }
-                            new_agent.setVariable<int>("mac_state", mac_state);
+                            new_agent.setVariable<int>("cell_state", cell_state);
 
                             // Set lifespan
                             double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_LIFE_MEAN");
@@ -777,18 +777,4 @@ FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
     return;
 }
 
-// ---- Debug checkpoints: disabled for production ----
-FLAMEGPU_HOST_FUNCTION(chk_after_zero_occ)    { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_write_occ)   { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_move_cancer) { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_move_tcell)  { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_move_treg)   { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_move_mdsc)   { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_move_vas)    { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_div_cancer)  { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_div_tcell)   { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_div_treg)    { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_after_div_vas)     { /* disabled */ }
-FLAMEGPU_HOST_FUNCTION(chk_start_step)     {std::cout << "[debug] Step starting" << std::endl;}
-FLAMEGPU_HOST_FUNCTION(chk_break)     {std::cout << "[debug] Made it here" << std::endl;}
 } // namespace PDAC

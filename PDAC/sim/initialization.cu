@@ -417,7 +417,7 @@ void initializeMacrophages(
         agent.setVariable<int>("z", z);
 
         // Macrophage state (1=M2 by default)
-        agent.setVariable<int>("mac_state", 1);
+        agent.setVariable<int>("cell_state", 1);
 
         // Lifecycle
         agent.setVariable<int>("life", life);
@@ -456,7 +456,7 @@ inline void setVascularCellVariables(
     agent.setVariable<int>("x", x);
     agent.setVariable<int>("y", y);
     agent.setVariable<int>("z", z);
-    agent.setVariable<int>("vascular_state", state);
+    agent.setVariable<int>("cell_state", state);
     agent.setVariable<float>("move_direction_x", move_dir_x);
     agent.setVariable<float>("move_direction_y", move_dir_y);
     agent.setVariable<float>("move_direction_z", move_dir_z);
@@ -968,7 +968,7 @@ void initializeMacsFromQSP(
                 agent.setVariable<int>("y", y);
                 agent.setVariable<int>("z", z);
                 agent.setVariable<int>("life", life);
-                agent.setVariable<int>("mac_state", MAC_M2);
+                agent.setVariable<int>("cell_state", MAC_M2);
 
                 placed++;
             }
@@ -1022,7 +1022,7 @@ void initializeFibroblasts(
         agent.setVariable<int>("x", x);
         agent.setVariable<int>("y", y);
         agent.setVariable<int>("z", z);
-        agent.setVariable<int>("fib_state", FIB_NORMAL);
+        agent.setVariable<int>("cell_state", FIB_NORMAL);
         agent.setVariable<int>("life", life);
 
         placed++;
@@ -1126,7 +1126,7 @@ void initializeFibroblastsFromQSP(
                     agent.setVariable<int>("x", cx[c]);
                     agent.setVariable<int>("y", cy[c]);
                     agent.setVariable<int>("z", cz[c]);
-                    agent.setVariable<int>("fib_state", FIB_NORMAL);
+                    agent.setVariable<int>("cell_state", FIB_NORMAL);
                     agent.setVariable<int>("life", life);
                     agent.setVariable<int>("my_slot", slot_counter + c);
                     // TAIL (c==actual_len-1): leader_slot=-1 (moves via chemotaxis)

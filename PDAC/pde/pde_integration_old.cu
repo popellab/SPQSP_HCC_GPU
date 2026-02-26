@@ -974,13 +974,13 @@ FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
                             new_agent.setVariable<int>("z", nz_new);
 
                             // Recruit as M1 state
-                            int mac_state = MAC_M1;
+                            int cell_state = MAC_M1;
 
                             // 30% chance to become M2
                             if (FLAMEGPU->random.uniform<float>() < 0.3f) {
-                                mac_state = MAC_M2;
+                                cell_state = MAC_M2;
                             }
-                            new_agent.setVariable<int>("mac_state", mac_state);
+                            new_agent.setVariable<int>("cell_state", cell_state);
 
                             // Set lifespan
                             double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_LIFE_MEAN");
@@ -1188,7 +1188,7 @@ FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
 
         const int head_slot = fib_vec[i].getVariable<int>("my_slot");
         const int ls        = fib_vec[i].getVariable<int>("leader_slot");
-        const int fs        = fib_vec[i].getVariable<int>("fib_state");
+        const int fs        = fib_vec[i].getVariable<int>("cell_state");
 
         // Safety: must be a HEAD in a chain and still NORMAL
         if (head_slot < 0 || ls == -1 || fs != FIB_NORMAL) {
@@ -1254,7 +1254,7 @@ FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
             cell2.setVariable<int>("x", new_x[0]);
             cell2.setVariable<int>("y", new_y[0]);
             cell2.setVariable<int>("z", new_z[0]);
-            cell2.setVariable<int>("fib_state", FIB_NORMAL);
+            cell2.setVariable<int>("cell_state", FIB_NORMAL);
             cell2.setVariable<int>("my_slot", slot_A);
             cell2.setVariable<int>("leader_slot", head_slot);  // Points to old HEAD
             cell2.setVariable<int>("life", static_cast<int>(mean_life));
@@ -1273,7 +1273,7 @@ FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
             cell1.setVariable<int>("x", new_x[1]);
             cell1.setVariable<int>("y", new_y[1]);
             cell1.setVariable<int>("z", new_z[1]);
-            cell1.setVariable<int>("fib_state", FIB_NORMAL);
+            cell1.setVariable<int>("cell_state", FIB_NORMAL);
             cell1.setVariable<int>("my_slot", slot_B);
             cell1.setVariable<int>("leader_slot", slot_A);   // Points to NEW_HEAD_2
             cell1.setVariable<int>("life", static_cast<int>(mean_life));
@@ -1286,7 +1286,7 @@ FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
 
         // --- Convert entire chain to CAF ---
         // HEAD itself
-        fib_vec[i].setVariable<int>("fib_state", FIB_CAF);
+        fib_vec[i].setVariable<int>("cell_state", FIB_CAF);
         fib_vec[i].setVariable<int>("divide_flag", 0);
 
         // Follow leader_slot chain to TAIL
@@ -1295,7 +1295,7 @@ FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
             auto it = slot_to_idx.find(follow);
             if (it == slot_to_idx.end()) break;
             unsigned int idx = it->second;
-            fib_vec[idx].setVariable<int>("fib_state", FIB_CAF);
+            fib_vec[idx].setVariable<int>("cell_state", FIB_CAF);
             follow = fib_vec[idx].getVariable<int>("leader_slot");
         }
     }
