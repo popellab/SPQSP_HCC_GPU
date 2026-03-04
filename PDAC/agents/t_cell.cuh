@@ -301,7 +301,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_divide, flamegpu::MessageNone, flamegpu::MessageNo
         const int nx = my_x + dx, ny = my_y + dy, nz = my_z + dz;
         if (!is_in_bounds(nx, ny, nz, size_x, size_y, size_z)) continue;
 
-        bool has_cancer = (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u);
+        bool has_cancer = (occ[nx][ny][nz][CELL_TYPE_CANCER] > 0u);
         max_cap[n_cands] = static_cast<unsigned int>(has_cancer ? MAX_T_PER_VOXEL_WITH_CANCER : MAX_T_PER_VOXEL);
 
         if (occ[nx][ny][nz][CELL_TYPE_T] < max_cap[n_cands]) {
@@ -392,14 +392,9 @@ FLAMEGPU_AGENT_FUNCTION(tcell_compute_chemical_sources, flamegpu::MessageNone, f
             IL2_uptake_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_UPTAKE");
         } else if (cell_state == T_CELL_CYT) {
             IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
-            IL2_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
             IL2_uptake_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_UPTAKE");
-            if (found_progenitor == 0){
-                IFNg_release_rate = 0.0f;
-            }
-            float IL2_release_remain = FLAMEGPU->getVariable<float>("IL2_release_remain");
-            if (IL2_release_remain <= 0){
-                IL2_release_rate = 0.0f;
+            if (found_progenitor == 1 && FLAMEGPU->getVariable<float>("IL2_release_remain") > 0){
+                IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
             }
         }
     }

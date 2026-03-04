@@ -518,7 +518,7 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent.setVariable<int>("x", nx_new);
                             new_agent.setVariable<int>("y", ny_new);
                             new_agent.setVariable<int>("z", nz_new);
-                            new_agent.setVariable<int>("cell_state", 0);
+                            new_agent.setVariable<int>("cell_state", TCD4_TREG);
 
                             float lifeMean_treg = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
 
@@ -562,7 +562,7 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent_th.setVariable<int>("x", nx_new);
                             new_agent_th.setVariable<int>("y", ny_new);
                             new_agent_th.setVariable<int>("z", nz_new);
-                            new_agent_th.setVariable<int>("cell_state", 1);
+                            new_agent_th.setVariable<int>("cell_state", TCD4_TH);
 
                             float lifeMean_th = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
 

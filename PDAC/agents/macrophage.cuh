@@ -87,6 +87,11 @@ FLAMEGPU_AGENT_FUNCTION(mac_compute_chemical_sources, flamegpu::MessageNone, fla
     int cancer_count = FLAMEGPU->getVariable<int>("neighbor_cancer_count");
     if (dead == 0) {
         if (cell_state == MAC_M1){
+            // if (cancer_count > 0 || FLAMEGPU->getVariable<int>("ifng_active") == 1){
+            //     FLAMEGPU->setVariable<int>("ifng_active", 1);
+            //     IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
+            //     IL12_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL12_RELEASE");
+            // }
             IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
             IL12_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL12_RELEASE");
         } else {

@@ -755,7 +755,7 @@ void initializeCancerCellsRandom(
                 int div = 0;
                 int divide_flag = 0;
                 int is_stem = 0;
-                if (i < progenitor_div_max + 1){
+                if (i <= progenitor_div_max + 1){
                     cancer_agents.push_back();
                     flamegpu::AgentVector::Agent agent = cancer_agents.back();
                     if (i==0) {

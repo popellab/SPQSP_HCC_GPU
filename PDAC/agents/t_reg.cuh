@@ -319,7 +319,7 @@ FLAMEGPU_AGENT_FUNCTION(treg_divide, flamegpu::MessageNone, flamegpu::MessageNon
         const int nx = my_x + dx, ny = my_y + dy, nz = my_z + dz;
         if (!is_in_bounds(nx, ny, nz, size_x, size_y, size_z)) continue;
 
-        bool has_cancer = (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u);
+        bool has_cancer = (occ[nx][ny][nz][CELL_TYPE_CANCER] > 0u);
         max_cap[n_cands] = static_cast<unsigned int>(has_cancer ? MAX_T_PER_VOXEL_WITH_CANCER : MAX_T_PER_VOXEL);
 
         if (occ[nx][ny][nz][CELL_TYPE_T] < max_cap[n_cands]) {

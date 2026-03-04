@@ -39,6 +39,55 @@ is no longer the primary validation target, or update both models simultaneously
 
 ---
 
+## M1 Macrophage IFN-γ Production: Unconditional vs Contact-Dependent
+
+**File**: `PDAC/agents/macrophage.cuh` — `mac_compute_chemical_sources`
+
+**HCC behavior** (`Mac.cpp:40-44`, copy constructor):
+```cpp
+if (_state == AgentStateEnum::MAC_M1)
+    setup_chem_source(_source_IFNg, CHEM_IFN, params.getVal(PARAM_IFN_G_RELEASE));
+```
+All M1 MACs initialize IFN-γ at full rate immediately on creation. `agent_state_scan` calls
+`update_chem_source(_source_IFNg, rate)` only when a cancer neighbor is found — it never resets
+to zero when cancer is absent. Net result: **M1 MACs produce IFN-γ unconditionally** once
+created, regardless of cancer contact.
+
+**PDAC behavior** (currently matches HCC):
+M1 MACs produce IFN-γ unconditionally at full rate.
+
+**Suspected bug in HCC**: The `agent_state_scan` contact-dependent update was likely intended
+to gate IFN-γ on cancer contact, but because the copy constructor pre-initializes the source
+to full rate and the scan never zeros it when cancer is absent, the contact check has no
+practical effect. Biologically, M1 macrophage IFN-γ secretion should require activation
+via cancer/pathogen contact.
+
+**Impact**: Unconditional IFN-γ elevates diffuse concentration across the grid, upregulating
+PDL1 on cancer cells (via Hill equation in `cancer_cell_state_step`), which increases T cell
+exhaustion rates via PDL1-PD1 interaction.
+
+**Current status**: Kept unconditional to match HCC. Flag for future biological validation
+and potential fix in both models simultaneously.
+
+---
+
+## T Cell Division Capacity Check: Inverted Occupancy Bug (Fixed Mar 2026)
+
+**File**: `PDAC/agents/t_cell.cuh` — `tcell_divide`; `PDAC/agents/t_reg.cuh` — `treg_divide`
+
+**Bug**: The `has_cancer` boolean used `== 0u` (true when NO cancer present), causing
+`MAX_T_PER_VOXEL_WITH_CANCER = 1` to be applied to empty voxels and `MAX_T_PER_VOXEL = 8`
+to cancer-occupied voxels — the opposite of intent and of HCC behavior.
+
+**HCC behavior** (`TumorGridVoxel.cpp:64-65`): cancer voxels cap at `PARAM_N_T_VOXEL_C = 1`,
+empty voxels cap at `PARAM_N_T_VOXEL = 8`. PDAC values match exactly.
+
+**Fix**: Changed to `> 0u`. Both T cell and TReg divide functions now match HCC.
+
+**Current status**: Fixed.
+
+---
+
 ## T Cell Tumble Phase: Weighted Direction vs Uniform Random
 
 **File**: `PDAC/agents/t_cell.cuh` — `tcell_move`, tumble phase (~line 540)

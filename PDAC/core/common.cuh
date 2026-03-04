@@ -33,10 +33,10 @@ enum TCellState : int {
     T_CELL_SUPP = 2
 };
 
-// T reg state enumeration
+// T reg state enumeration (TH=0 matches HCC convention: TCD4_Th < TCD4_TREG)
 enum TCD4State : int {
-    TCD4_TREG = 0,
-    TCD4_TH = 1,
+    TCD4_TH = 0,
+    TCD4_TREG = 1,
 };
 
 // Macrophage state enumeration (M1/M2 polarization)

@@ -224,7 +224,7 @@ void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divid
     treg.newVariable<int>("y");
     treg.newVariable<int>("z");
 
-    // State: TCD4_TREG=0, TCD4_TH=1
+    // State: TCD4_TH=0, TCD4_TREG=1 (matches HCC convention: Th < TREG)
     treg.newVariable<int>("cell_state", TCD4_TREG);
 
     // Division control
@@ -382,6 +382,8 @@ void defineMacrophageAgent(flamegpu::ModelDescription& model, bool include_state
 
     // Neighbor counts (computed via messaging)
     mac.newVariable<int>("neighbor_cancer_count", 0);
+
+    mac.newVariable<int>("ifng_active",0);
 
     // Lifecycle
     mac.newVariable<int>("life", 0);
