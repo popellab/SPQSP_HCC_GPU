@@ -144,7 +144,7 @@ void defineTCellAgent(flamegpu::ModelDescription& model, bool include_state_divi
     tcell.newVariable<float>("move_direction_x", 0.0f);
     tcell.newVariable<float>("move_direction_y", 0.0f);
     tcell.newVariable<float>("move_direction_z", 0.0f);
-    tcell.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
+    tcell.newVariable<int>("tumble", 1);  // 0=running, 1=tumbling (default: tumble to pick initial direction)
 
     // Molecular state (affects behavior)
     tcell.newVariable<float>("PDL1_syn", 0.0f);
@@ -236,7 +236,7 @@ void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divid
     treg.newVariable<float>("move_direction_x", 0.0f);
     treg.newVariable<float>("move_direction_y", 0.0f);
     treg.newVariable<float>("move_direction_z", 0.0f);
-    treg.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
+    treg.newVariable<int>("tumble", 1);  // 0=running, 1=tumbling (default: tumble to pick initial direction)
 
     treg.newVariable<float>("TGFB_release_remain", 0.0f);
 
@@ -309,7 +309,7 @@ void defineMDSCAgent(flamegpu::ModelDescription& model, bool include_state) {
     mdsc.newVariable<float>("move_direction_x", 0.0f);
     mdsc.newVariable<float>("move_direction_y", 0.0f);
     mdsc.newVariable<float>("move_direction_z", 0.0f);
-    mdsc.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
+    mdsc.newVariable<int>("tumble", 1);  // 0=running, 1=tumbling (default: tumble to pick initial direction)
 
     // Molecular state (affects behavior)
     mdsc.newVariable<float>("PDL1_syn", 0.0f);
@@ -372,7 +372,7 @@ void defineMacrophageAgent(flamegpu::ModelDescription& model, bool include_state
     mac.newVariable<float>("move_direction_x", 0.0f);
     mac.newVariable<float>("move_direction_y", 0.0f);
     mac.newVariable<float>("move_direction_z", 0.0f);
-    mac.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
+    mac.newVariable<int>("tumble", 1);  // 0=running, 1=tumbling (default: tumble to pick initial direction)
 
     // Molecular state (affects behavior)
     mac.newVariable<float>("PDL1_syn", 0.0f);
@@ -425,7 +425,7 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
     fib.newVariable<float>("move_direction_x", 0.0f);
     fib.newVariable<float>("move_direction_y", 0.0f);
     fib.newVariable<float>("move_direction_z", 0.0f);
-    fib.newVariable<int>("tumble", 0);  // 0=running, 1=tumbling
+    fib.newVariable<int>("tumble", 1);  // 0=running, 1=tumbling (default: tumble to pick initial direction)
 
     // Chain-based follower-leader movement variables
     // Chain: HEAD (divides, future) → MIDDLE → TAIL (senses gradient, chemotaxis)
@@ -676,6 +676,11 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     env.newProperty<uint64_t>("event_th_prolif_ptr", 0u);     // Pointer to GPU counter
     env.newProperty<uint64_t>("event_th_recruit_ptr", 0u);    // Pointer to GPU counter
     env.newProperty<uint64_t>("event_treg_prolif_ptr", 0u);   // Pointer to GPU counter
+    // Cancer event counters
+    env.newProperty<uint64_t>("event_cancer_t_kill_ptr", 0u);    // Cancer killed by T cell
+    env.newProperty<uint64_t>("event_cancer_mac_kill_ptr", 0u);  // Cancer killed by macrophage
+    env.newProperty<uint64_t>("event_cancer_nat_death_ptr", 0u); // Cancer natural (senescent) death
+    env.newProperty<uint64_t>("event_cancer_divide_ptr", 0u);    // Cancer successful division
 
     // Populate ALL other parameters from XML
     params.populateFlameGPUEnvironment(env);

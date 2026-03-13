@@ -23,6 +23,7 @@ namespace PDAC {
 extern bool is_presim_mode_active();
 extern double get_last_pde_ms();
 extern double get_last_qsp_ms();
+extern RecruitStats get_last_recruit_stats();
 }
 
 // QSP CSV export step function (defined in qsp_integration.cu)
@@ -551,8 +552,8 @@ int main(int argc, const char** argv) {
     // ========== ALLOCATE GPU MEMORY FOR EVENT COUNTERS ==========
     // Do this BEFORE creating CUDASimulation so environment properties are synced
     unsigned int* device_event_counters = nullptr;
-    cudaMalloc(&device_event_counters, 5 * sizeof(unsigned int));
-    cudaMemset(device_event_counters, 0, 5 * sizeof(unsigned int));
+    cudaMalloc(&device_event_counters, 9 * sizeof(unsigned int));
+    cudaMemset(device_event_counters, 0, 9 * sizeof(unsigned int));
 
     // Store pointers to event counters in model environment (before CUDASimulation init)
     model->Environment().setProperty<uint64_t>("event_tcell_prolif_ptr",
@@ -565,6 +566,14 @@ int main(int argc, const char** argv) {
         reinterpret_cast<uint64_t>(device_event_counters + 3));
     model->Environment().setProperty<uint64_t>("event_treg_prolif_ptr",
         reinterpret_cast<uint64_t>(device_event_counters + 4));
+    model->Environment().setProperty<uint64_t>("event_cancer_t_kill_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 5));
+    model->Environment().setProperty<uint64_t>("event_cancer_mac_kill_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 6));
+    model->Environment().setProperty<uint64_t>("event_cancer_nat_death_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 7));
+    model->Environment().setProperty<uint64_t>("event_cancer_divide_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 8));
 
     // ========== CREATE SIMULATION ==========
     // Increase CUDA per-thread stack size for complex kernels (default 1KB is too small
@@ -580,6 +589,9 @@ int main(int argc, const char** argv) {
     if (config.init_method == 1) {
         std::cout << "Initializing agents from QSP steady-state (init_method=1)..." << std::endl;
         PDAC::initializeToQSP(simulation, *model, config, _lymph);
+    } else if (config.init_method == 2) {
+        std::cout << "Initializing for neighbor scan test (init_method=2)..." << std::endl;
+        PDAC::initializeNeighborTest(simulation, *model, config);
     } else {
         std::cout << "Initializing agents with default distribution (init_method=0)..." << std::endl;
         PDAC::initializeAllAgents(simulation, *model, config);
@@ -652,9 +664,13 @@ int main(int argc, const char** argv) {
     // Open event output file for per-step event tracking
     std::ofstream event_file("outputs/event.csv");
     if (event_file.is_open()) {
-        event_file << "Step,prolif.CD8.cytotoxic,recruit.CD8.effector,prolif.Th.default,recruit.Th.default,prolif.Treg.default\n";
+        event_file << "Step,prolif.CD8.cytotoxic,recruit.CD8.effector,prolif.Th.default,recruit.Th.default,prolif.Treg.default,"
+                   << "teff_rec,treg_rec,th_rec,mdsc_rec,mac_rec,"
+                   << "p_teff,p_treg,p_th,t_sources,"
+                   << "qsp_teff,qsp_treg,qsp_th,"
+                   << "cancer_t_kill,cancer_mac_kill,cancer_nat_death,cancer_divide\n";
         // Step 0: initial condition — no events yet
-        event_file << "0,0,0,0,0,0\n";
+        event_file << "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
     }
 
     // Open timing output file for per-step timing CSV
@@ -705,16 +721,25 @@ int main(int argc, const char** argv) {
 
         // Read event counts from GPU and output
         if (event_file.is_open()) {
-            unsigned int host_events[5];
-            cudaMemcpy(host_events, device_event_counters, 5 * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            unsigned int host_events[9];
+            cudaMemcpy(host_events, device_event_counters, 9 * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+            PDAC::RecruitStats rs = PDAC::get_last_recruit_stats();
 
             // Output: step index matches agents_step_{i+1}.csv (events that occurred during step i+1)
-            event_file << (i + 1) << "," << host_events[0] << "," << host_events[1] << ","
-                       << host_events[2] << "," << host_events[3] << "," << host_events[4] << "\n";
+            event_file << (i + 1) << ","
+                       << host_events[0] << "," << host_events[1] << ","
+                       << host_events[2] << "," << host_events[3] << "," << host_events[4] << ","
+                       << rs.teff_rec << "," << rs.treg_rec << "," << rs.th_rec << ","
+                       << rs.mdsc_rec << "," << rs.mac_rec << ","
+                       << rs.p_teff << "," << rs.p_treg << "," << rs.p_th << "," << rs.t_sources << ","
+                       << rs.qsp_teff << "," << rs.qsp_treg << "," << rs.qsp_th << ","
+                       << host_events[5] << "," << host_events[6] << ","
+                       << host_events[7] << "," << host_events[8] << "\n";
             event_file.flush();
 
             // Reset counters for next step
-            cudaMemset(device_event_counters, 0, 5 * sizeof(unsigned int));
+            cudaMemset(device_event_counters, 0, 9 * sizeof(unsigned int));
         }
 
         if (!continue_sim) {

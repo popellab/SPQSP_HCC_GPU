@@ -84,7 +84,8 @@ constexpr int MAX_T_PER_VOXEL_WITH_CANCER = 1;  // Max T cells when cancer prese
 constexpr int MAX_CANCER_PER_VOXEL = 1;         // Max cancer cells per voxel
 constexpr int MAX_MDSC_PER_VOXEL = 1;           // Max MDSC per voxel (exclusive)
 constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exclusive)
-constexpr int MAX_FIB_SLOTS = 5000;             // Max fibroblast slots in chain position MacroProperty
+constexpr int MAX_FIB_SLOTS      = 12000;       // Total slot capacity for chain MacroProperties (init + expansion)
+constexpr int MAX_FIB_INIT_SLOTS = 4347;        // Temporary: match HCC initial fibroblast count (~4933 at step 1)
 constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max cells per fibroblast chain (HEAD + N-1 followers); grows via division
 constexpr int ABM_EVENT_COUNTER_SIZE = 9;      // Array size for ABM→QSP event counters (deaths + recruitment)
 
@@ -214,6 +215,17 @@ __device__ __forceinline__ float hill_equation(float x, float k50, float n) {
     const float xn = powf(x, n);
     const float kn = powf(k50, n);
     return xn / (kn + xn);
+}
+
+__device__ __forceinline__ float update_PDL1(float local_IFNg, float IFNg_PDL1_EC50, float IFNg_PDL1_hill, float PDL1_syn_max, float PDL1_current) {
+    float H_IFNg = hill_equation(local_IFNg, IFNg_PDL1_EC50, IFNg_PDL1_hill);
+    float minPDL1 = PDL1_syn_max * H_IFNg;
+
+    if (PDL1_current < minPDL1) {
+        return minPDL1;
+    } else {
+        return PDL1_current;
+    }
 }
 
 __device__ __forceinline__ float get_PD1_PDL1(float PDL1, float Nivo,

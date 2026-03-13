@@ -71,6 +71,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_count_neighbors, flamegpu::MessageSpatial3D, flam
             const int agent_type = msg.getVariable<int>("agent_type");
             const int agent_cell_state = msg.getVariable<int>("cell_state");
 
+
             // Find direction index
             int dir_idx = -1;
             for (int i = 0; i < 26; i++) {
@@ -184,10 +185,10 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
-    // Collect Von Neumann (face) neighbors that appear empty for cancer and MDSC.
-    int cand_x[6], cand_y[6], cand_z[6];
+    // Collect Moore (26-direction) neighbors that appear empty for cancer and MDSC.
+    int cand_x[26], cand_y[26], cand_z[26];
     int n_cands = 0;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 26; i++) {
         int dx, dy, dz;
         get_moore_direction(i, dx, dy, dz);
         const int nx = my_x + dx, ny = my_y + dy, nz = my_z + dz;
@@ -228,6 +229,11 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
         const int target_z = cand_z[i];
 
         if (cell_state == CANCER_STEM) {
+            float cabo = FLAMEGPU->environment.getProperty<float>("qsp_cabo_tumor");
+            float R_cabo = FLAMEGPU->environment.getProperty<float>("R_cabo");
+            float cabo_prolif_factor = 1 - (FLAMEGPU->environment.getProperty<float>("PARAM_LAMBDA_C_CABO") * 
+                                            cabo / (cabo + FLAMEGPU->environment.getProperty<float>("PARAM_IC50_MET"))) * R_cabo;
+
             if (FLAMEGPU->random.uniform<float>() < asymmetric_div_prob) {
                 // Asymmetric: daughter is progenitor
                 const float div_int = FLAMEGPU->environment.getProperty<float>(
@@ -245,11 +251,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 const float div_int = FLAMEGPU->environment.getProperty<float>(
                     "PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE");
 
-                float cabo = FLAMEGPU->environment.getProperty<float>("qsp_cabo_tumor");
-                float R_cabo = FLAMEGPU->environment.getProperty<float>("R_cabo");
-                float cabo_prolif_factor = 1 - (FLAMEGPU->environment.getProperty<float>("PARAM_LAMBDA_C_CABO") * 
-                                                cabo / (cabo + FLAMEGPU->environment.getProperty<float>("PARAM_IC50_MET"))) * R_cabo;
-
                 FLAMEGPU->agent_out.setVariable<int>("x", target_x);
                 FLAMEGPU->agent_out.setVariable<int>("y", target_y);
                 FLAMEGPU->agent_out.setVariable<int>("z", target_z);
@@ -261,7 +262,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
             }
             // Reset parent divideCD
             FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(
-                FLAMEGPU->environment.getProperty<float>("PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE") + 0.5f));
+                (FLAMEGPU->environment.getProperty<float>("PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE")/cabo_prolif_factor) + 0.5f));
 
         } else if (cell_state == CANCER_PROGENITOR) {
             int divideCountRemaining = FLAMEGPU->getVariable<int>("divideCountRemaining");
@@ -295,6 +296,11 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
             }
         }
 
+        // Count successful division
+        unsigned int* div_ctr = reinterpret_cast<unsigned int*>(
+            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_divide_ptr"));
+        atomicAdd(div_ctr, 1u);
+
         break;  // Division done; stop trying candidates
     }
 
@@ -323,32 +329,33 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         if (life <= 0) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 0);  // 0 = natural senescence
+            unsigned int* ctr = reinterpret_cast<unsigned int*>(
+                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_nat_death_ptr"));
+            atomicAdd(ctr, 1u);
             return flamegpu::DEAD;
         }
         FLAMEGPU->setVariable<int>("life", life);
     }
 
     // Hypoxia check for division
-    if (cell_state == CANCER_PROGENITOR){
-        const float O2_hypoxia_threshold = FLAMEGPU->environment.getProperty<float>("PARAM_CANCER_HYPOXIA_TH");
-        float O2 = PDE_READ(FLAMEGPU, PDE_CONC_O2, voxel);
-        int hypoxic = (O2 < O2_hypoxia_threshold) ? 1 : 0;
-        int divide_flag = (O2 < O2_hypoxia_threshold) ? 1 : 0;
-        FLAMEGPU->setVariable<int>("hypoxic", hypoxic);
-        FLAMEGPU->setVariable<int>("divideFlag", divide_flag);
-    }
+    // if (cell_state == CANCER_PROGENITOR){
+    //     const float O2_hypoxia_threshold = FLAMEGPU->environment.getProperty<float>("PARAM_CANCER_HYPOXIA_TH");
+    //     float O2 = PDE_READ(FLAMEGPU, PDE_CONC_O2, voxel);
+    //     int hypoxic = (O2 < O2_hypoxia_threshold) ? 1 : 0;
+    //     int divide_flag = (O2 < O2_hypoxia_threshold) ? 0 : 1;
+    //     FLAMEGPU->setVariable<int>("hypoxic", hypoxic);
+    //     FLAMEGPU->setVariable<int>("divideFlag", divide_flag);
+    // }
 
     // Update PDL1
-    float IFNg = PDE_READ(FLAMEGPU, PDE_CONC_IFN, voxel);
-    const float IFNg_PDL1_EC50 = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_HALF");
-    const float IFNg_PDL1_hill = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_N");
-    float H_IFNg = hill_equation(IFNg, IFNg_PDL1_EC50, IFNg_PDL1_hill);
-    const float PDL1_syn_max = FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_SYN_MAX");
-    float minPDL1 = PDL1_syn_max * H_IFNg;
-    float PDL1_current = FLAMEGPU->getVariable<float>("PDL1_syn");
-    if (PDL1_current < minPDL1) {
-        FLAMEGPU->setVariable<float>("PDL1_syn", minPDL1);
-    }
+    float local_IFNg = PDE_READ(FLAMEGPU, PDE_CONC_IFN, voxel);
+    float PDL1 = update_PDL1(local_IFNg,
+         FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_HALF"),
+         FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_N"),
+         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_SYN_MAX"),
+         FLAMEGPU->getVariable<float>("PDL1_syn"));
+
+    FLAMEGPU->setVariable<float>("PDL1_syn", PDL1);
 
     // === T CELL KILLING ===
     int neighbor_Teff = FLAMEGPU->getVariable<int>("neighbor_Teff_count");
@@ -385,6 +392,9 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 1);  // 1 = T cell killing
+            unsigned int* ctr = reinterpret_cast<unsigned int*>(
+                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_t_kill_ptr"));
+            atomicAdd(ctr, 1u);
             return flamegpu::DEAD;
         }
     }
@@ -422,11 +432,14 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         double q = double(neighbor_M1) / (neighbor_M1 + neighbor_cancer
                    + FLAMEGPU->environment.getProperty<float>("PARAM_CELL"))
                    * (1 - H_Mac_C) * (1 - H_IL10_phago);
-        double p_kill = get_kill_probability(FLAMEGPU->environment.getProperty<float>("PARAM_ESCAPE_MAC_BASE"), q);
+        double p_kill = get_kill_probability(q, FLAMEGPU->environment.getProperty<float>("PARAM_ESCAPE_MAC_BASE"));
 
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 2);  // 2 = macrophage killing
+            unsigned int* ctr = reinterpret_cast<unsigned int*>(
+                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_mac_kill_ptr"));
+            atomicAdd(ctr, 1u);
             return flamegpu::DEAD;
         }
     }
@@ -447,7 +460,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             FLAMEGPU->setVariable<int>("divideFlag", 0);
             const float mean_life = FLAMEGPU->environment.getProperty<float>("PARAM_CANCER_SENESCENT_MEAN_LIFE");
             const float rand_val  = FLAMEGPU->random.uniform<float>();
-            const int life = static_cast<int>(-mean_life * logf(rand_val + 0.0001f) + 0.5f);
+            const int life = static_cast<int>(-mean_life * logf(rand_val) + 0.5f);
             FLAMEGPU->setVariable<int>("life", life > 0 ? life : 1);
         }
     }
@@ -537,7 +550,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_reset_moves, flamegpu::MessageNone, flamegpu::Mes
 
 // Single-phase cancer cell movement using occupancy grid.
 // Replaces two-phase select_move_target + execute_move.
-// Reads occ_grid to find open Von Neumann neighbors, claims atomically with CAS.
+// Reads occ_grid to find open Moore neighbors (26 directions), claims atomically with CAS.
 // Cancer cells require target voxel to have no cancer, no MDSC, and no fibroblast.
 FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNone) {
     if (FLAMEGPU->getVariable<int>("dead") == 1) return flamegpu::ALIVE;
@@ -566,18 +579,16 @@ FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNon
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
-    // Von Neumann neighbor offsets (6 face directions)
-    const int ddx[6] = {-1, 1,  0, 0,  0, 0};
-    const int ddy[6] = { 0, 0, -1, 1,  0, 0};
-    const int ddz[6] = { 0, 0,  0, 0, -1, 1};
-
+    // Moore neighborhood offsets (26 directions)
     // Build candidate list: neighbors empty of cancer and Fibs and low T numbers
-    int cands[6];
+    int cands[26];
     int n_cands = 0;
-    for (int i = 0; i < 6; i++) {
-        int nx = x + ddx[i];
-        int ny = y + ddy[i];
-        int nz = z + ddz[i];
+    for (int i = 0; i < 26; i++) {
+        int ddx, ddy, ddz;
+        get_moore_direction(i, ddx, ddy, ddz);
+        int nx = x + ddx;
+        int ny = y + ddy;
+        int nz = z + ddz;
         if (nx < 0 || nx >= size_x || ny < 0 || ny >= size_y || nz < 0 || nz >= size_z) continue;
         if (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u && occ[nx][ny][nz][CELL_TYPE_FIB] == 0u &&
             occ[nx][ny][nz][CELL_TYPE_T] <= 1u &&
@@ -596,10 +607,11 @@ FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNon
     // Try candidates in shuffled order; CAS to atomically claim new voxel
     const unsigned int claim_val = static_cast<unsigned int>(cell_state) + 1u;
     for (int i = 0; i < n_cands; i++) {
-        int idx = cands[i];
-        int nx = x + ddx[idx];
-        int ny = y + ddy[idx];
-        int nz = z + ddz[idx];
+        int ddx, ddy, ddz;
+        get_moore_direction(cands[i], ddx, ddy, ddz);
+        int nx = x + ddx;
+        int ny = y + ddy;
+        int nz = z + ddz;
         unsigned int old = occ[nx][ny][nz][CELL_TYPE_CANCER].CAS(0u, claim_val);
         if (old == 0u) {
             // Won the voxel — release old and update position

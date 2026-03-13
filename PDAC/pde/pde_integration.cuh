@@ -17,6 +17,16 @@ extern double g_last_pde_ms;
 // Accessor for last PDE solve time (milliseconds)
 double get_last_pde_ms();
 
+// Per-step recruitment stats — populated by recruit_t_cells / recruit_mdscs / recruit_macrophages
+struct RecruitStats {
+    int teff_rec = 0, treg_rec = 0, th_rec = 0;
+    int mdsc_rec = 0, mac_rec = 0;
+    float p_teff = 0.f, p_treg = 0.f, p_th = 0.f;
+    int t_sources = 0;
+    float qsp_teff = 0.f, qsp_treg = 0.f, qsp_th = 0.f;
+};
+RecruitStats get_last_recruit_stats();
+
 // FLAME GPU 2 host functions for PDE integration
 // (Declared and implemented in pde_integration.cu)
 

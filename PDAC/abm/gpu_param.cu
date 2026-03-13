@@ -338,7 +338,7 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     env.newProperty<float>("PARAM_TREG_TGFB_RELEASE", getFloat(PARAM_TREG_TGFB_RELEASE));    // TRegs
     env.newProperty<float>("PARAM_STEM_TGFB_RELEASE", getFloat(PARAM_STEM_TGFB_RELEASE));    // Stem Cancer
     env.newProperty<float>("PARAM_PROG_TGFB_RELEASE", getFloat(PARAM_PROG_TGFB_RELEASE));    // Prog Cancer
-    env.newProperty<float>("PARAM_MAC_TGFB_RELEASE", getFloat(PARAM_MAC_TGFB_RELEASE)); 
+    env.newProperty<float>("PARAM_MAC_TGFB_RELEASE", getFloat(PARAM_MAC_TGFB_RELEASE));
     env.newProperty<float>("PARAM_TREG_IL10_RELEASE", getFloat(PARAM_TREG_IL10_RELEASE));    // TRegs
     env.newProperty<float>("PARAM_MAC_IL10_RELEASE", getFloat(PARAM_MAC_IL10_RELEASE));
     env.newProperty<float>("PARAM_IL12_RELEASE", getFloat(PARAM_IL12_RELEASE));
@@ -361,6 +361,10 @@ void GPUParam::populateFlameGPUEnvironment(flamegpu::EnvironmentDescription& env
     env.newProperty<float>("PARAM_IL12_MOLECULAR_WEIGHT", getFloat(PARAM_IL12_MOLECULAR_WEIGHT));
     env.newProperty<float>("PARAM_VEGFA_MOLECULAR_WEIGHT", getFloat(PARAM_VEGFA_MOLECULAR_WEIGHT));
     env.newProperty<float>("PARAM_O2_MOLECULAR_WEIGHT", getFloat(PARAM_O2_MOLECULAR_WEIGHT));
+
+    // Internally processed parameters
+    // float SEC_PER_DAY = 24.0f * 60.0f * 60.0f;
+    // env.newProperty<float>("PARAM_TCELL_LIFESPAN_SD_SLICE", getFloat(PARAM_TCELL_LIFESPAN_SD) / getFloat(PARAM_SEC_PER_SLICE) * SEC_PER_DAY);
 
     std::cout << "Populated " << (static_cast<int>(GPU_PARAM_FLOAT_COUNT) + static_cast<int>(GPU_PARAM_INT_COUNT) + static_cast<int>(GPU_PARAM_BOOL_COUNT))
               << " parameters into FLAMEGPU environment from XML" << std::endl;

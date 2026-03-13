@@ -96,7 +96,9 @@ FLAMEGPU_AGENT_FUNCTION(tcell_scan_neighbors, flamegpu::MessageSpatial3D, flameg
                 } else if (agent_type == CELL_TYPE_T) {
                     neighbor_counts[dir_idx][1]++;
                 } else if (agent_type == CELL_TYPE_TREG) {
-                    treg_count++;
+                    if (agent_state == TCD4_TREG) {
+                        treg_count++;
+                    }
                     neighbor_counts[dir_idx][2]++;
                 }
             }
@@ -183,6 +185,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
     // EFF -> CYT: Found cancer progenitor in neighborhood
     if (cell_state == T_CELL_EFF) {
         if (found_progenitor == 1) {
+            cell_state = T_CELL_CYT;
             FLAMEGPU->setVariable<int>("cell_state", T_CELL_CYT);
             FLAMEGPU->setVariable<int>("divide_flag", 1);
         }
@@ -194,6 +197,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
         float IL2_release_remain = FLAMEGPU->getVariable<float>("IL2_release_remain");
         if (IL2_release_remain > 0) {
             IL2_release_remain -= sec_per_slice;
+            FLAMEGPU->setVariable<float>("IL2_release_remain", IL2_release_remain);
         }
 
         // Check for exhaustion
@@ -207,7 +211,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
             const float exhaust_base_Treg = FLAMEGPU->environment.getProperty<float>("PARAM_EXHUAST_BASE_TREG");
 
             float denominator = neighbor_all + param_cell;
-            const float q_exh = (denominator > 1e-12f) ? static_cast<float>(neighbor_Treg) / denominator : 1.0f;  // Prevent division by zero
+            const float q_exh = static_cast<float>(neighbor_Treg) / denominator;
             const float p_exhaust_treg = 1.0f - powf(exhaust_base_Treg, q_exh);
 
             if (FLAMEGPU->random.uniform<float>() < p_exhaust_treg){
@@ -291,11 +295,11 @@ FLAMEGPU_AGENT_FUNCTION(tcell_divide, flamegpu::MessageNone, flamegpu::MessageNo
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
-    // Collect Von Neumann neighbors below T cell capacity
-    int cand_x[6], cand_y[6], cand_z[6];
+    // Collect Moore (26-direction) neighbors below T cell capacity
+    int cand_x[26], cand_y[26], cand_z[26];
     int n_cands = 0;
-    unsigned int max_cap[6];
-    for (int i = 0; i < 6; i++) {
+    unsigned int max_cap[26];
+    for (int i = 0; i < 26; i++) {
         int dx, dy, dz;
         get_moore_direction(i, dx, dy, dz);
         const int nx = my_x + dx, ny = my_y + dy, nz = my_z + dz;
@@ -386,15 +390,17 @@ FLAMEGPU_AGENT_FUNCTION(tcell_compute_chemical_sources, flamegpu::MessageNone, f
     float IL2_uptake_rate = 0.0f;
     if (dead == 0){
         int found_progenitor = FLAMEGPU->getVariable<int>("found_progenitor");
+        // EFF cells secrete IFN-γ only when in contact with cancer (matching HCC)
+        // EFF cells do NOT secrete IL-2 — only CYT cells do, after activation
         if (cell_state == T_CELL_EFF && found_progenitor == 1){
-            IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
-            IL2_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
-            IL2_uptake_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_UPTAKE");
+
         } else if (cell_state == T_CELL_CYT) {
-            IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
+            if (found_progenitor == 1){
+                IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_RELEASE");
+            }
             IL2_uptake_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_UPTAKE");
-            if (found_progenitor == 1 && FLAMEGPU->getVariable<float>("IL2_release_remain") > 0){
-                IFNg_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
+            if (FLAMEGPU->getVariable<float>("IL2_release_remain") > 0){
+                IL2_release_rate = FLAMEGPU->environment.getProperty<float>("PARAM_IL2_RELEASE");
             }
         }
     }
@@ -479,18 +485,15 @@ FLAMEGPU_AGENT_FUNCTION(tcell_move, flamegpu::MessageNone, flamegpu::MessageNone
         float v_z = move_dir_z / dt;
 
         float norm_gradient = std::sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
-
-        // Compute alignment to gradient
         float dot_product = v_x * grad_x + v_y * grad_y + v_z * grad_z;
         float norm_v = std::sqrt(v_x * v_x + v_y * v_y + v_z * v_z);
         float cos_theta = dot_product / (norm_v * norm_gradient);
 
-        // Hill function: bias tumble rate based on gradient alignment and strength
         const float EC50_grad = 1.0f;
         float H_grad = norm_gradient / (norm_gradient + EC50_grad);
         if (cos_theta < 0) H_grad = -H_grad;
 
-        const float lambda = 0.0000168;  // Base tumble rate
+        const float lambda = 0.0000168;
         float tumble_rate = (lambda / 2.0f) * (1.0f - cos_theta) * (1.0f - H_grad) * dt;
         float p_tumble = 1.0f - std::exp(-tumble_rate);
 
@@ -499,66 +502,67 @@ FLAMEGPU_AGENT_FUNCTION(tcell_move, flamegpu::MessageNone, flamegpu::MessageNone
             return flamegpu::ALIVE;
         }
 
-        // Continue running: move in current direction
-        target_x = x + static_cast<int>(std::round(move_dir_x));
-        target_y = y + static_cast<int>(std::round(move_dir_y));
-        target_z = z + static_cast<int>(std::round(move_dir_z));
+        int tx = x + static_cast<int>(std::round(move_dir_x));
+        int ty = y + static_cast<int>(std::round(move_dir_y));
+        int tz = z + static_cast<int>(std::round(move_dir_z));
 
-        // Check bounds
-        if (target_x < 0 || target_x >= grid_x ||
-            target_y < 0 || target_y >= grid_y ||
-            target_z < 0 || target_z >= grid_z) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
+        if (tx < 0 || tx >= grid_x || ty < 0 || ty >= grid_y || tz < 0 || tz >= grid_z) {
+            // FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
         }
-    }
-    // === TUMBLE PHASE (tumble == 1) ===
-    // Pick a uniformly random direction from all 26 Moore neighbors (matches HCC behavior).
-    else {
-        int dirs[26][3];
-        int n_dirs = 0;
 
-        for (int i = -1; i <= 1; i++) {
-            for (int j = -1; j <= 1; j++) {
-                for (int k = -1; k <= 1; k++) {
-                    if (i == 0 && j == 0 && k == 0) continue;
-                    dirs[n_dirs][0] = i;
-                    dirs[n_dirs][1] = j;
-                    dirs[n_dirs][2] = k;
-                    n_dirs++;
-                }
-            }
-        }
-
-        // Uniform random selection (n_dirs == 26 always)
-        int selected_idx = static_cast<int>(FLAMEGPU->random.uniform<float>() * n_dirs);
-        if (selected_idx >= n_dirs) selected_idx = n_dirs - 1;
-
-        FLAMEGPU->setVariable<float>("move_direction_x", static_cast<float>(dirs[selected_idx][0]));
-        FLAMEGPU->setVariable<float>("move_direction_y", static_cast<float>(dirs[selected_idx][1]));
-        FLAMEGPU->setVariable<float>("move_direction_z", static_cast<float>(dirs[selected_idx][2]));
-        FLAMEGPU->setVariable<int>("tumble", 0);
-
-        target_x = x + dirs[selected_idx][0];
-        target_y = y + dirs[selected_idx][1];
-        target_z = z + dirs[selected_idx][2];
-    }
-
-    // Try to move to target voxel (if valid and has capacity)
-    if (target_x >= 0 && target_x < grid_x &&
-        target_y >= 0 && target_y < grid_y &&
-        target_z >= 0 && target_z < grid_z) {
-
-        unsigned int max_t = (occ[target_x][target_y][target_z][CELL_TYPE_CANCER] > 0u)
+        unsigned int max_t = (occ[tx][ty][tz][CELL_TYPE_CANCER] > 0u)
             ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
             : static_cast<unsigned int>(MAX_T_PER_VOXEL);
 
-        if (occ[target_x][target_y][target_z][CELL_TYPE_T] < max_t) {
-            // Won: release old voxel and move
+        if (occ[tx][ty][tz][CELL_TYPE_T] < max_t) {
             occ[x][y][z][CELL_TYPE_T] -= 1u;
-            FLAMEGPU->setVariable<int>("x", target_x);
-            FLAMEGPU->setVariable<int>("y", target_y);
-            FLAMEGPU->setVariable<int>("z", target_z);
+            FLAMEGPU->setVariable<int>("x", tx);
+            FLAMEGPU->setVariable<int>("y", ty);
+            FLAMEGPU->setVariable<int>("z", tz);
+        } else {
+            // FLAMEGPU->setVariable<int>("tumble", 1);
+        }
+    }
+    // === TUMBLE PHASE (tumble == 1) ===
+    // Collect all free Moore neighbors, shuffle, try each in order.
+    else {
+        int cand_x[26], cand_y[26], cand_z[26];
+        int n_cands = 0;
+        for (int di = -1; di <= 1; di++) for (int dj = -1; dj <= 1; dj++) for (int dk = -1; dk <= 1; dk++) {
+            if (di==0 && dj==0 && dk==0) continue;
+            int nx = x+di, ny = y+dj, nz = z+dk;
+            if (nx<0||nx>=grid_x||ny<0||ny>=grid_y||nz<0||nz>=grid_z) continue;
+            unsigned int max_t = (occ[nx][ny][nz][CELL_TYPE_CANCER] > 0u)
+                ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
+                : static_cast<unsigned int>(MAX_T_PER_VOXEL);
+            if (occ[nx][ny][nz][CELL_TYPE_T] >= max_t) continue;
+            cand_x[n_cands] = nx; cand_y[n_cands] = ny; cand_z[n_cands] = nz;
+            n_cands++;
+        }
+        if (n_cands == 0) return flamegpu::ALIVE;
+        for (int i = n_cands-1; i > 0; i--) {
+            int j = static_cast<int>(FLAMEGPU->random.uniform<float>() * (i+1));
+            if (j > i) j = i;
+            int tx=cand_x[i]; cand_x[i]=cand_x[j]; cand_x[j]=tx;
+            int ty=cand_y[i]; cand_y[i]=cand_y[j]; cand_y[j]=ty;
+            int tz=cand_z[i]; cand_z[i]=cand_z[j]; cand_z[j]=tz;
+        }
+        for (int i = 0; i < n_cands; i++) {
+            unsigned int max_t = (occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_CANCER] > 0u)
+                ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
+                : static_cast<unsigned int>(MAX_T_PER_VOXEL);
+            if (occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_T] < max_t) {
+                occ[x][y][z][CELL_TYPE_T] -= 1u;
+                FLAMEGPU->setVariable<int>("x", cand_x[i]);
+                FLAMEGPU->setVariable<int>("y", cand_y[i]);
+                FLAMEGPU->setVariable<int>("z", cand_z[i]);
+                FLAMEGPU->setVariable<float>("move_direction_x", static_cast<float>(cand_x[i]-x));
+                FLAMEGPU->setVariable<float>("move_direction_y", static_cast<float>(cand_y[i]-y));
+                FLAMEGPU->setVariable<float>("move_direction_z", static_cast<float>(cand_z[i]-z));
+                FLAMEGPU->setVariable<int>("tumble", 0);
+                break;
+            }
         }
     }
 

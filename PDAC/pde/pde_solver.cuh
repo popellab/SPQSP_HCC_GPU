@@ -37,8 +37,8 @@ struct PDEConfig {
     int num_substrates;                 // Number of chemical species
     float voxel_size;                   // Spatial resolution (cm)
     float dt_abm;                       // ABM timestep (seconds)
-    float dt_pde;                       // PDE timestep (seconds, = dt_abm since LOD is unconditionally stable)
-    int substeps_per_abm;               // Unused (LOD needs no substeps)
+    float dt_pde;                       // PDE substep (seconds, = dt_abm / substeps_per_abm)
+    int substeps_per_abm;               // Molecular substeps per ABM step (36, matches BioFVM)
     int boundary_type;                  // Unused (always Neumann no-flux)
 
     float diffusion_coeffs[NUM_SUBSTRATES];  // cm²/s
@@ -48,20 +48,18 @@ struct PDEConfig {
 /**
  * PDESolver: LOD (Locally One-Dimensional) implicit diffusion + exact ODE source/uptake
  *
- * Mathematics (matches HCC BioFVM exactly):
+ * Mathematics (matches BioFVM LOD_3D exactly):
  *
- * Source/uptake/decay step (exact ODE, unconditionally stable at any dt):
- *   dp/dt = S - (λ+U)*p
- *   if (λ+U) > 1e-10: p_new = (p - S/(λ+U))*exp(-(λ+U)*dt) + S/(λ+U)
- *   else:             p_new = p + S*dt
- *   where S [conc/s] = secretion / voxel_volume, U [1/s] = cell uptake, λ [1/s] = decay
- *   → p_ss = S/(λ+U) correct for any timestep (no large-dt instability)
+ * Step 1 — Source/uptake (exact ODE, cell terms only):
+ *   dp/dt = S - U*p
+ *   if U > 1e-10: p_new = (p - S/U)*exp(-U*dt) + S/U
+ *   else:         p_new = p + S*dt
+ *   S [conc/s] = secretion/voxel_volume, U [1/s] = cell uptake only (no λ here)
  *
- * LOD diffusion step (3 implicit 1D sweeps, diffusion only):
- *   ∂p/∂t = D∇²p
- *   Thomas algorithm per line, c2 = 0 (decay handled above)
- *   c1 = dt*D/dx²
- *   Diagonal: 1 + 2*c1 (interior), 1 + c1 (boundary)
+ * Step 2 — LOD diffusion+decay (3 implicit 1D Thomas sweeps):
+ *   c1 = dt*D/dx²,  c2 = dt*λ/3 (decay split over 3 sweeps, matching BioFVM)
+ *   Interior diagonal: 1 + 2*c1 + c2
+ *   Boundary diagonal: 1 + c1 + c2
  *   Off-diagonal: -c1
  *
  * Agent-PDE coupling (direct device pointer access):

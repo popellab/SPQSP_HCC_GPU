@@ -3,8 +3,6 @@
 #include "../qsp/LymphCentral_wrapper.h"
 #include "../qsp/ode/QSP_enum.h"
 #include <nvtx3/nvToolsExt.h>
-
-
 #define QP(x) CancerVCT::ODE_system::get_class_param(x)
 
 #define AVOGADROS 6.022140857E23 
@@ -242,11 +240,6 @@ void set_internal_params(flamegpu::ModelDescription& model, const PDAC::LymphCen
     env.newProperty<float>("PARAM_FIB_ECM_BASELINE", QP(CancerVCT::P_ECM_base) * 1e3);
     env.newProperty<float>("PARAM_FIB_ECM_SATURATION", QP(CancerVCT::P_ECM_max) * 1e3);
     env.newProperty<float>("PARAM_FIB_ECM_MOT_EC50", QP(CancerVCT::P_ECM_50_T_mot) * 5e3);
-    // CAF TGFB secretion rate per cell per timestep (using M2 macrophage rate as proxy)
-    // units: mole/cell/s * t_step_sec -> mole/cell/timestep
-    env.newProperty<float>("PARAM_FIB_TGFB_RELEASE",
-                    QP(CancerVCT::P_k_TGFb_Msec) * t_step_sec
-                    * env.getProperty<float>("PARAM_TGFB_MOLECULAR_WEIGHT") * 1e9);
     // mean lifespan of fibroblast in timesteps (use avg of fib and CAF death rates)
     env.newProperty<float>("PARAM_FIB_LIFE_MEAN",
                     1.0f / ((QP(CancerVCT::P_k_fib_death) + QP(CancerVCT::P_k_CAF_death)) / 2.0)
@@ -351,8 +344,8 @@ void set_internal_params(flamegpu::ModelDescription& model, const PDAC::LymphCen
                     / env.getProperty<float>("PARAM_SEC_PER_SLICE") * SEC_PER_DAY);
 
     env.newProperty<float>("PARAM_FLOAT_CANCER_CELL_PROGENITOR_DIV_INTERVAL_SLICE",
-                    std::log(2)/ env.getProperty<float>("PARAM_PROG_GROWTH_RATE") 
-                    * SEC_PER_DAY 
+                    std::log(2)/ env.getProperty<float>("PARAM_PROG_GROWTH_RATE")
+                    * SEC_PER_DAY
                     / env.getProperty<float>("PARAM_SEC_PER_SLICE")  + .5);
 
 }

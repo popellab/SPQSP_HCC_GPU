@@ -230,12 +230,15 @@ void initializeTCells(
         agent.setVariable<int>("divide_flag", 0);
         agent.setVariable<int>("divide_cd", div_cd);
         agent.setVariable<int>("divide_limit", div_limit);
-        
+
         // Chemical production/exposure
         agent.setVariable<float>("IL2_release_remain", IL2_release_time);
-        
+
         // Lifecycle
         agent.setVariable<int>("life", life);
+
+        // Movement: start in tumble phase to pick a random initial direction
+        agent.setVariable<int>("tumble", 1);
 
         placed++;
     }
@@ -306,6 +309,9 @@ void initializeTRegs(
 
         // State
         agent.setVariable<int>("cell_state", TCD4_TH); // initialize as T-Helper cells
+
+        // Movement: start in tumble phase to pick a random initial direction
+        agent.setVariable<int>("tumble", 1);
 
         placed++;
     }
@@ -434,7 +440,7 @@ void initializeMacrophages(
         agent.setVariable<float>("move_direction_x", 0.0f);
         agent.setVariable<float>("move_direction_y", 0.0f);
         agent.setVariable<float>("move_direction_z", 0.0f);
-        agent.setVariable<int>("tumble", 0);
+        agent.setVariable<int>("tumble", 1);
         agent.setVariable<int>("moves_remaining", 0);
 
         // Initialize neighbor counts
@@ -458,7 +464,8 @@ inline void setVascularCellVariables(
     float move_dir_x = 1.0f,
     float move_dir_y = 0.0f,
     float move_dir_z = 0.0f,
-    unsigned int tip_id = 0)
+    unsigned int tip_id = 0,
+    int branch = 0)
 {
     agent.setVariable<int>("x", x);
     agent.setVariable<int>("y", y);
@@ -474,14 +481,15 @@ inline void setVascularCellVariables(
     agent.setVariable<int>("target_z", -1);
     agent.setVariable<unsigned int>("tip_id", tip_id);
     agent.setVariable<int>("mature_to_phalanx", 0);
-    agent.setVariable<int>("branch", 0);
+    agent.setVariable<int>("branch", branch);
 }
 
 void initializeVascularCellsRandom(
     flamegpu::AgentVector& vascular_agents,
     int grid_x, int grid_y, int grid_z,
     int tumor_radius,
-    int num_segments)
+    int num_segments,
+    float branch_prob)
 {
     const int center_x = grid_x / 2;
     const int center_y = grid_y / 2;
@@ -492,6 +500,10 @@ void initializeVascularCellsRandom(
     // Random number generator
     std::srand(12345);  // Use fixed seed for reproducibility
     auto rand_unif = []() { return static_cast<double>(std::rand()) / RAND_MAX; };
+
+    // HCC Tumor.cpp line 1518: initial phalanx cells have p_branch = PARAM_VAS_BRANCH_PROB/5
+    // chance to have branch=1 at init, allowing sprouting on step 1 before VEGFA exists
+    const double p_branch_init = branch_prob / 5.0;
 
     int total_vessels = 0;
 
@@ -552,8 +564,9 @@ void initializeVascularCellsRandom(
         if (dist_sq > radius * radius) {
             vascular_agents.push_back();
             flamegpu::AgentVector::Agent agent = vascular_agents.back();
+            int branch_flag = (rand_unif() < p_branch_init) ? 1 : 0;
             setVascularCellVariables(agent, current_x, current_y, current_z,
-                                   2, 1.0f, 0.0f, 0.0f, 0u);  // VAS_PHALANX, tip_id=0 (all initial vessels same network)
+                                   2, 1.0f, 0.0f, 0.0f, 0u, branch_flag);
             total_vessels++;
         }
 
@@ -666,8 +679,9 @@ void initializeVascularCellsRandom(
             if (dist_sq > radius * radius) {
                 vascular_agents.push_back();
                 flamegpu::AgentVector::Agent agent = vascular_agents.back();
+                int branch_flag = (rand_unif() < p_branch_init) ? 1 : 0;
                 setVascularCellVariables(agent, current_x, current_y, current_z,
-                                       2, 1.0f, 0.0f, 0.0f, 0u);  // VAS_PHALANX, tip_id=0 (all initial vessels same network)
+                                       2, 1.0f, 0.0f, 0.0f, 0u, branch_flag);
                 total_vessels++;
             }
 
@@ -836,7 +850,8 @@ void initializeTHCellsFromQSP(
                 agent.setVariable<int>("z", z);
                 agent.setVariable<int>("cell_state", TCD4_TH);
                 agent.setVariable<int>("divide_flag", 0);
-                agent.setVariable<int>("divide_cd", div_cd);
+                // agent.setVariable<int>("divide_cd", div_cd);
+                agent.setVariable<int>("divide_cd", div_interval);
                 agent.setVariable<int>("divide_limit", div_limit);
                 agent.setVariable<int>("life", life);
 
@@ -1040,6 +1055,10 @@ void initializeFibroblasts(
         agent.setVariable<int>("z", z);
         agent.setVariable<int>("cell_state", FIB_NORMAL);
         agent.setVariable<int>("life", life);
+        // Assign slot so fib_state_step and fib_execute_divide can track this cell.
+        // Isolated cells have leader_slot=-1 (they are their own sensor/front).
+        agent.setVariable<int>("my_slot", placed);
+        agent.setVariable<int>("leader_slot", -1);
 
         placed++;
     }
@@ -1087,14 +1106,14 @@ void initializeFibroblastsFromQSP(
 {
     int placed = 0;
     int slot_counter = 0;
-    const int chain_len = MAX_FIB_CHAIN_LENGTH;  // 3: HEAD → MIDDLE → TAIL
+    const int chain_len = 3;  // Initial chains: HEAD → MIDDLE → TAIL (activation adds 2 more → max 5)
 
     for (int z = 0; z < grid_z; z++) {
         for (int y = 0; y < grid_y; y++) {
             for (int x = 0; x < grid_x; x++) {
                 const float rnd = static_cast<float>(rand()) / RAND_MAX;
                 if (rnd >= static_cast<float>(p_fib)) continue;
-                if (slot_counter + chain_len > MAX_FIB_SLOTS) break;
+                if (slot_counter + chain_len > MAX_FIB_INIT_SLOTS) break;
 
                 // Check if starting voxel is free
                 int idx0 = x + y * grid_x + z * grid_x * grid_y;
@@ -1123,7 +1142,7 @@ void initializeFibroblastsFromQSP(
                 // Assign slots for this chain: [slot_counter .. slot_counter+actual_len-1]
                 // Chain: cell[0]=HEAD (divides, future), cell[1]=MIDDLE, cell[actual_len-1]=TAIL (chemotaxis, leader_slot=-1)
                 //        cell[2] (leader_slot=slot_counter+1), etc.
-                if (slot_counter + actual_len > MAX_FIB_SLOTS) {
+                if (slot_counter + actual_len > MAX_FIB_INIT_SLOTS) {
                     // Not enough slots left — undo occupancy and stop placing
                     for (int c = 0; c < actual_len; c++) {
                         int idxc = cx[c] + cy[c] * grid_x + cz[c] * grid_x * grid_y;
@@ -1186,6 +1205,7 @@ void initializeAllAgents(
     const float mdsc_life = model.Environment().getProperty<float>("PARAM_MDSC_LIFE_MEAN_SLICE");
     const float mac_life = model.Environment().getProperty<float>("PARAM_MAC_LIFE_MEAN");
     const float fib_life = model.Environment().getProperty<float>("PARAM_FIB_LIFE_MEAN");
+    const float vas_branch_prob = model.Environment().getProperty<float>("PARAM_VAS_BRANCH_PROB");
 
     // Initialize cancer cells
     {
@@ -1264,7 +1284,8 @@ void initializeAllAgents(
                 vascular_vec,
                 config.grid_x, config.grid_y, config.grid_z,
                 config.cluster_radius,
-                num_segments);
+                num_segments,
+                vas_branch_prob);
         }
         else if (config.vascular_mode == "xml") {
             // XML-based initialization (Phase 2)
@@ -1413,6 +1434,7 @@ void initializeToQSP(
     const float mdsc_life        = model.Environment().getProperty<float>("PARAM_MDSC_LIFE_MEAN_SLICE");
     const float mac_life        = model.Environment().getProperty<float>("PARAM_MAC_LIFE_MEAN");
     const float fib_life        = model.Environment().getProperty<float>("PARAM_FIB_LIFE_MEAN");
+    const float vas_branch_prob = model.Environment().getProperty<float>("PARAM_VAS_BRANCH_PROB");
     // -----------------------------------------------------------------------
     // Get CDF for cancer cell population
     // -----------------------------------------------------------------------
@@ -1512,7 +1534,8 @@ void initializeToQSP(
             initializeVascularCellsRandom(
                 vascular_vec,
                 config.grid_x, config.grid_y, config.grid_z,
-                cluster_radius, /*num_segments=*/1);
+                cluster_radius, /*num_segments=*/1,
+                vas_branch_prob);
         } else if (config.vascular_mode == "test") {
             initializeVascularCellsTest(vascular_vec, config.grid_x, config.grid_y, config.grid_z);
         } else {
@@ -1526,6 +1549,126 @@ void initializeToQSP(
     }
 
     std::cout << "QSP-based agent initialization complete\n" << std::endl;
+}
+
+// ============================================================================
+// Neighbor Scan Test Initialization (init_method=2)
+// ============================================================================
+// Creates exactly 3 agents in an 11^3 grid for testing neighbor detection:
+// - M1 macrophage at (5,5,5)
+// - PROGENITOR cancer at (5,5,6) [adjacent to mac]
+// - EFFECTOR T cell at (5,5,7) [not adjacent to mac]
+//
+// Expected after correct broadcast/scan:
+// - Cancer at (5,5,6): neighbor_Mac1_count = 1, neighbor_Teff_count = 0
+// - Macrophage at (5,5,5): neighbor_cancer_count = 1
+// - T cell at (5,5,7): neighbor_cancer_count = 1
+void initializeNeighborTest(
+    flamegpu::CUDASimulation& simulation,
+    flamegpu::ModelDescription& model,
+    const SimulationConfig& config)
+{
+    std::cout << "\n=== Initializing Neighbor Scan Test (init_method=2) ===" << std::endl;
+
+    // 1. Create and place M1 macrophage at (5,5,5)
+    {
+        flamegpu::AgentVector mac_vec(model.Agent(AGENT_MACROPHAGE));
+        mac_vec.push_back();
+        auto agent = mac_vec.back();
+        agent.setVariable<int>("x", 5);
+        agent.setVariable<int>("y", 5);
+        agent.setVariable<int>("z", 5);
+        agent.setVariable<int>("cell_state", MAC_M1);
+        agent.setVariable<int>("dead", 0);
+        agent.setVariable<int>("life", 500);
+        agent.setVariable<int>("neighbor_cancer_count", 0);
+        agent.setVariable<int>("tumble", 0);
+        agent.setVariable<float>("move_direction_x", 0.0f);
+        agent.setVariable<float>("move_direction_y", 0.0f);
+        agent.setVariable<float>("move_direction_z", 0.0f);
+        simulation.setPopulationData(mac_vec);
+    }
+    std::cout << "[TEST] Placed M1 macrophage at (5,5,5)" << std::endl;
+
+    // 2. Create and place TWO cancer cells:
+    //    - PROGENITOR at (5,5,6) [adjacent to mac at (5,5,5)] - Moore neighborhood
+    //    - PROGENITOR at (2,2,2) [FAR from mac] - Outside Moore neighborhood, tests radius limit
+    {
+        flamegpu::AgentVector cancer_vec(model.Agent(AGENT_CANCER_CELL));
+
+        // Cancer 1: Adjacent (Moore neighbor)
+        cancer_vec.push_back();
+        auto agent = cancer_vec.back();
+        agent.setVariable<int>("x", 5);
+        agent.setVariable<int>("y", 5);
+        agent.setVariable<int>("z", 6);
+        agent.setVariable<int>("cell_state", CANCER_PROGENITOR);
+        agent.setVariable<int>("dead", 0);
+        agent.setVariable<float>("PDL1_syn", 0.0f);
+        agent.setVariable<int>("neighbor_Teff_count", 0);
+        agent.setVariable<int>("neighbor_Treg_count", 0);
+        agent.setVariable<int>("neighbor_MDSC_count", 0);
+        agent.setVariable<int>("neighbor_cancer_count", 0);
+        agent.setVariable<int>("neighbor_Mac1_count", 0);
+        agent.setVariable<int>("divideCD", 0);
+        agent.setVariable<int>("divideFlag", 0);
+        agent.setVariable<int>("divideCountRemaining", 0);
+        agent.setVariable<unsigned int>("stemID", 0);
+
+        // Cancer 2: Far away (outside spatial query radius)
+        cancer_vec.push_back();
+        {
+            auto agent2 = cancer_vec.back();
+            agent2.setVariable<int>("x", 2);
+            agent2.setVariable<int>("y", 2);
+            agent2.setVariable<int>("z", 2);
+            agent2.setVariable<int>("cell_state", CANCER_PROGENITOR);
+            agent2.setVariable<int>("dead", 0);
+            agent2.setVariable<float>("PDL1_syn", 0.0f);
+            agent2.setVariable<int>("neighbor_Teff_count", 0);
+            agent2.setVariable<int>("neighbor_Treg_count", 0);
+            agent2.setVariable<int>("neighbor_MDSC_count", 0);
+            agent2.setVariable<int>("neighbor_cancer_count", 0);
+            agent2.setVariable<int>("neighbor_Mac1_count", 0);
+            agent2.setVariable<int>("divideCD", 0);
+            agent2.setVariable<int>("divideFlag", 0);
+            agent2.setVariable<int>("divideCountRemaining", 0);
+            agent2.setVariable<unsigned int>("stemID", 0);
+        }
+
+        simulation.setPopulationData(cancer_vec);
+    }
+    std::cout << "[TEST] Placed PROGENITOR cancer at (5,5,6) [Moore neighbor to MAC]" << std::endl;
+    std::cout << "[TEST] Placed PROGENITOR cancer at (2,2,2) [far from MAC, radius test]" << std::endl;
+
+    // 3. Create and place EFFECTOR T cell at (5,5,7) [NOT adjacent to mac at (5,5,5)]
+    {
+        flamegpu::AgentVector tcell_vec(model.Agent(AGENT_TCELL));
+        tcell_vec.push_back();
+        auto agent = tcell_vec.back();
+        agent.setVariable<int>("x", 5);
+        agent.setVariable<int>("y", 5);
+        agent.setVariable<int>("z", 7);
+        agent.setVariable<int>("cell_state", T_CELL_EFF);
+        agent.setVariable<int>("dead", 0);
+        agent.setVariable<int>("life", 500);
+        agent.setVariable<int>("neighbor_cancer_count", 0);
+        agent.setVariable<int>("neighbor_Treg_count", 0);
+        agent.setVariable<int>("divide_flag", 0);
+        agent.setVariable<int>("divide_cd", 0);
+        agent.setVariable<int>("divide_limit", 0);
+        agent.setVariable<int>("tumble", 1);
+        agent.setVariable<float>("IL2_release_remain", 0.0f);
+        simulation.setPopulationData(tcell_vec);
+    }
+    std::cout << "[TEST] Placed EFFECTOR T cell at (5,5,7)" << std::endl;
+
+    std::cout << "[TEST] Neighbor test initialization complete" << std::endl;
+    std::cout << "[TEST] Expected results after neighbor scans:" << std::endl;
+    std::cout << "  Cancer(5,5,6): neighbor_Mac1_count=1 (adjacent to MAC)" << std::endl;
+    std::cout << "  Cancer(2,2,2): neighbor_Mac1_count=0 (too far from MAC, ~5.2 voxels away)" << std::endl;
+    std::cout << "  MAC(5,5,5):    neighbor_cancer_count=1 (only sees (5,5,6), NOT (2,2,2))" << std::endl;
+    std::cout << "  T(5,5,7):      neighbor_cancer_count=1 (only sees (5,5,6))" << std::endl;
 }
 
 } // namespace PDAC

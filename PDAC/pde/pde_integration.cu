@@ -3,7 +3,21 @@
 #include "../core/layer_timing.h"
 #include <iostream>
 #include <vector>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <nvtx3/nvToolsExt.h>
+#include <cmath>
+
+// Helper: sample normal random variate via Box-Muller (matches HCC getTCellLife / getTCD4Life)
+// Returns mean + N(0,1)*sd, clamped to at least 1
+static inline int sample_normal_life(float mean, float sd) {
+    float u1 = (static_cast<float>(rand()) + 1.0f) / (static_cast<float>(RAND_MAX) + 2.0f);
+    float u2 = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+    float z  = std::sqrt(-2.0f * std::log(u1)) * std::cos(2.0f * 3.14159265f * u2);
+    int life = static_cast<int>(mean + z * sd + 0.5f);
+    return life > 0 ? life : 1;
+}
 
 // ============================================================================
 // Layer Timing Globals (defined once here, declared extern in layer_timing.h)
@@ -30,6 +44,10 @@ namespace PDAC {
 // ============================================================================
 PDESolver* g_pde_solver = nullptr;
 double g_last_pde_ms = 0.0;  // exposed for timing CSV
+
+static RecruitStats g_recruit_stats;
+
+RecruitStats get_last_recruit_stats() { return g_recruit_stats; }
 
 // Flat device array: cancer occupancy per voxel (0 = empty, >0 = cancer present).
 // Populated by cancer_write_to_occ_grid, zeroed by zero_occupancy_grid.
@@ -478,17 +496,16 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent.setVariable<int>("cell_state", 0);  // Effector state
 
                             float lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_T_CELL_LIFE_MEAN_SLICE");
+                            float lifeSd   = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_LIFESPAN_SD");
 
-                            float rnd = static_cast<float>(rand()) / RAND_MAX;
-                            int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
-                            if (life < 1) life = 1;
-
-                            new_agent.setVariable<int>("life", life);
+                            new_agent.setVariable<int>("life", sample_normal_life(lifeMean, lifeSd));
 
                             new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_INTERNAL"));
                             new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_LIMIT"));
 
                             new_agent.setVariable<float>("IL2_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_RELEASE_TIME"));
+
+                            new_agent.setVariable<int>("tumble", 1);
 
                             teff_recruited++;
                             placed = true;
@@ -521,12 +538,9 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent.setVariable<int>("cell_state", TCD4_TREG);
 
                             float lifeMean_treg = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
+                            float lifeSd_treg   = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFESPAN_SD");
 
-                            float rnd_treg = static_cast<float>(rand()) / RAND_MAX;
-                            int life_treg = static_cast<int>(lifeMean_treg * std::log(1.0f / (rnd_treg + 0.0001f)) + 0.5f);
-                            if (life_treg < 1) life_treg = 1;
-
-                            new_agent.setVariable<int>("life", life_treg);
+                            new_agent.setVariable<int>("life", sample_normal_life(lifeMean_treg, lifeSd_treg));
 
                             new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL"));
                             new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT"));
@@ -534,6 +548,8 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
 
                             new_agent.setVariable<float>("CTLA4", FLAMEGPU->environment.getProperty<float>("PARAM_CTLA4_TREG"));
+
+                            new_agent.setVariable<int>("tumble", 1);
 
                             treg_recruited++;
                             placed = true;
@@ -565,12 +581,9 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent_th.setVariable<int>("cell_state", TCD4_TH);
 
                             float lifeMean_th = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
+                            float lifeSd_th   = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFESPAN_SD");
 
-                            float rnd_th = static_cast<float>(rand()) / RAND_MAX;
-                            int life_th = static_cast<int>(lifeMean_th * std::log(1.0f / (rnd_th + 0.0001f)) + 0.5f);
-                            if (life_th < 1) life_th = 1;
-
-                            new_agent_th.setVariable<int>("life", life_th);
+                            new_agent_th.setVariable<int>("life", sample_normal_life(lifeMean_th, lifeSd_th));
 
                             new_agent_th.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL"));
                             new_agent_th.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT"));
@@ -578,6 +591,8 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
                             new_agent_th.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
 
                             new_agent_th.setVariable<float>("CTLA4", 0.0f);
+
+                            new_agent_th.setVariable<int>("tumble", 1);
 
                             th_recruited++;
                             placed = true;
@@ -587,6 +602,18 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
             }
         }
     }
+
+    // Stash stats in global for main.cu to read after step()
+    g_recruit_stats.teff_rec  = teff_recruited;
+    g_recruit_stats.treg_rec  = treg_recruited;
+    g_recruit_stats.th_rec    = th_recruited;
+    g_recruit_stats.p_teff    = p_recruit_teff;
+    g_recruit_stats.p_treg    = p_recruit_treg;
+    g_recruit_stats.p_th      = p_recruit_th;
+    g_recruit_stats.t_sources = total_t_sources;
+    g_recruit_stats.qsp_teff  = FLAMEGPU->environment.getProperty<float>("qsp_teff_central");
+    g_recruit_stats.qsp_treg  = FLAMEGPU->environment.getProperty<float>("qsp_treg_central");
+    g_recruit_stats.qsp_th    = FLAMEGPU->environment.getProperty<float>("qsp_th_central");
 
     // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
     auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
@@ -670,6 +697,7 @@ FLAMEGPU_HOST_FUNCTION(recruit_mdscs) {
                             if (life < 1) life = 1;
 
                             new_agent.setVariable<int>("life", life);
+                            new_agent.setVariable<int>("tumble", 1);
 
                             mdsc_recruited++;
                             placed = true;
@@ -679,6 +707,8 @@ FLAMEGPU_HOST_FUNCTION(recruit_mdscs) {
             }
         }
     }
+
+    g_recruit_stats.mdsc_rec = mdsc_recruited;
 
     // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
     auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
@@ -780,6 +810,7 @@ FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
                             if (life < 1) life = 1;
 
                             new_agent.setVariable<int>("life", life);
+                            new_agent.setVariable<int>("tumble", 1);
 
                             mac_recruited++;
                             placed = true;
@@ -789,6 +820,8 @@ FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
             }
         }
     }
+
+    g_recruit_stats.mac_rec = mac_recruited;
 
     // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
     auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
@@ -937,16 +970,216 @@ FLAMEGPU_HOST_FUNCTION(reset_abm_event_counters) {
 }
 
 // ============================================================================
-// Fibroblast HEAD Division: Create 2 new HEAD cells and convert chain to CAF
+// Fibroblast Activation/Expansion: Convert chain to CAF and extend at back.
+//
+// Matches HCC Fib::agent_state_step + Tumor.cpp expansion logic:
+//   - Only the TRUE BACK of a chain (no other cell follows it) can expand.
+//   - On activation: back cell + 2 new cells become CAF; entire chain → CAF.
+//   - New cells are added behind the back cell (away from the chemotaxis sensor).
+//
+// Three-phase approach avoids the old crash (DeviceAgentVector + newAgent() conflict):
+//   Phase 1: Read all fib data into host memory → close DeviceAgentVector.
+//   Phase 2: Create new agents via fib_api.newAgent() (no open vector).
+//   Phase 3: Re-open DeviceAgentVector to update cell_state + reset divide_flag.
 // ============================================================================
-// DISABLED 2026-02-24: Fibroblast division function causes FLAME GPU device memory corruption
-// Issue: Calling fib_api.newAgent() in a host function corrupts DeviceAgentVector state
-// This causes cudaErrorInvalidValue on subsequent steps
-// TODO: Either rewrite to avoid newAgent() calls, or use different mechanism for fibroblast growth
 FLAMEGPU_HOST_FUNCTION(fib_execute_divide) {
-    // DISABLED - fibroblast division was not functioning correctly and caused CUDA crashes
-    // Fibroblasts will persist but not divide
-    return;
+    nvtxRangePush("Fib Execute Divide");
+    auto fib_api = FLAMEGPU->agent(AGENT_FIBROBLAST);
+    const unsigned int fib_count = fib_api.count();
+    if (fib_count == 0) { nvtxRangePop(); return; }
+
+    const int grid_x    = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y    = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z    = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+    const float mean_life = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_LIFE_MEAN");
+
+    // --- Phase 1: Read all fib data into host-side struct ---
+    struct FibData {
+        int x, y, z;
+        int my_slot, leader_slot;
+        int cell_state, divide_flag;
+    };
+    std::vector<FibData> all_fibs(fib_count);
+
+    {   // Scoped block: DeviceAgentVector is released before Phase 2
+        flamegpu::DeviceAgentVector fib_vec = fib_api.getPopulationData();
+        for (unsigned int i = 0; i < fib_count; i++) {
+            all_fibs[i].x           = fib_vec[i].getVariable<int>("x");
+            all_fibs[i].y           = fib_vec[i].getVariable<int>("y");
+            all_fibs[i].z           = fib_vec[i].getVariable<int>("z");
+            all_fibs[i].my_slot     = fib_vec[i].getVariable<int>("my_slot");
+            all_fibs[i].leader_slot = fib_vec[i].getVariable<int>("leader_slot");
+            all_fibs[i].cell_state  = fib_vec[i].getVariable<int>("cell_state");
+            all_fibs[i].divide_flag = fib_vec[i].getVariable<int>("divide_flag");
+        }
+    }   // fib_vec destroyed: any pending writes committed to device
+
+    // --- Build auxiliary data structures ---
+    std::unordered_map<int, unsigned int> slot_to_idx;  // my_slot → index in all_fibs
+    std::unordered_set<int> all_leader_slots;            // Every leader_slot value in use
+    int max_slot = -1;
+
+    for (unsigned int i = 0; i < fib_count; i++) {
+        int ms = all_fibs[i].my_slot;
+        if (ms >= 0) {
+            slot_to_idx[ms] = i;
+            if (ms > max_slot) max_slot = ms;
+        }
+        int ls = all_fibs[i].leader_slot;
+        if (ls >= 0) all_leader_slots.insert(ls);
+    }
+    int next_slot = max_slot + 1;
+
+    auto occ      = FLAMEGPU->environment.getMacroProperty<unsigned int,
+                        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+    auto fib_pos_x = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_x");
+    auto fib_pos_y = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_y");
+    auto fib_pos_z = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_z");
+
+    const int dx6[] = {1,-1,0,0,0,0};
+    const int dy6[] = {0,0,1,-1,0,0};
+    const int dz6[] = {0,0,0,0,1,-1};
+
+    // Tracks positions claimed this function call (prevent double-placement)
+    std::set<std::tuple<int,int,int>> claimed;
+
+    struct ExpansionPlan {
+        int n_new;                       // 0, 1, or 2 new cells
+        int new_x[2], new_y[2], new_z[2];
+        int new_slot[2];
+        std::vector<int> chain_slots;    // my_slot of every cell in chain → set to CAF
+    };
+    std::vector<ExpansionPlan> plans;
+
+    for (unsigned int i = 0; i < fib_count; i++) {
+        const auto& fib = all_fibs[i];
+
+        // Must have valid slot, be NORMAL, and have divide_flag set
+        if (fib.my_slot < 0 || fib.cell_state != FIB_NORMAL || fib.divide_flag == 0) continue;
+
+        // Must be TRUE BACK of chain: no other cell has leader_slot == my_slot
+        if (all_leader_slots.count(fib.my_slot) > 0) continue;
+
+        // Guard slot capacity
+        if (next_slot + 1 >= MAX_FIB_SLOTS) continue;
+
+        // --- Find up to 2 adjacent free face-neighbor voxels ---
+        int new_x[2], new_y[2], new_z[2];
+        int n_found = 0;
+
+        for (int d = 0; d < 6 && n_found < 1; d++) {
+            int nx = fib.x + dx6[d], ny = fib.y + dy6[d], nz = fib.z + dz6[d];
+            if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+            if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_FIB])    > 0u) continue;
+            if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_CANCER]) > 0u) continue;
+            if (claimed.count({nx, ny, nz})) continue;
+            new_x[0] = nx; new_y[0] = ny; new_z[0] = nz;
+            n_found = 1;
+        }
+        if (n_found == 1) {
+            claimed.insert({new_x[0], new_y[0], new_z[0]});
+            for (int d = 0; d < 6; d++) {
+                int nx = new_x[0]+dx6[d], ny = new_y[0]+dy6[d], nz = new_z[0]+dz6[d];
+                if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+                if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_FIB])    > 0u) continue;
+                if (static_cast<unsigned int>(occ[nx][ny][nz][CELL_TYPE_CANCER]) > 0u) continue;
+                if (claimed.count({nx, ny, nz})) continue;
+                new_x[1] = nx; new_y[1] = ny; new_z[1] = nz;
+                n_found = 2;
+                claimed.insert({nx, ny, nz});
+                break;
+            }
+        }
+        if (n_found == 0) continue;  // No space — skip this activation
+
+        // --- Build expansion plan ---
+        ExpansionPlan plan;
+        plan.n_new = n_found;
+        for (int k = 0; k < n_found; k++) {
+            plan.new_x[k] = new_x[k];
+            plan.new_y[k] = new_y[k];
+            plan.new_z[k] = new_z[k];
+        }
+        plan.new_slot[0] = next_slot;      // Adjacent to existing back
+        plan.new_slot[1] = next_slot + 1;  // Outermost (new back of chain)
+        next_slot += n_found;
+
+        // Collect all chain members (from back → front) to convert to CAF
+        // Walk leader_slot chain: back cell → middle ... → front (leader_slot==-1)
+        plan.chain_slots.push_back(fib.my_slot);
+        int follow = fib.leader_slot;
+        while (follow >= 0) {
+            plan.chain_slots.push_back(follow);
+            auto it = slot_to_idx.find(follow);
+            if (it == slot_to_idx.end()) break;
+            follow = all_fibs[it->second].leader_slot;
+        }
+        // If chain has a front sensor (leader_slot == -1), it was the last valid slot
+        // followed and is already included (the while loop processes it and then stops).
+
+        plans.push_back(std::move(plan));
+    }
+
+    if (plans.empty()) { nvtxRangePop(); return; }
+
+    // --- Phase 2: Create new agents (NO DeviceAgentVector open) ---
+    for (auto& plan : plans) {
+        // Cell adjacent to existing back: leader_slot = parent slot, my_slot = new_slot[0]
+        if (plan.n_new >= 1) {
+            auto cell1 = fib_api.newAgent();
+            cell1.setVariable<int>("x", plan.new_x[0]);
+            cell1.setVariable<int>("y", plan.new_y[0]);
+            cell1.setVariable<int>("z", plan.new_z[0]);
+            cell1.setVariable<int>("cell_state", FIB_CAF);
+            cell1.setVariable<int>("my_slot",     plan.new_slot[0]);
+            cell1.setVariable<int>("leader_slot", plan.chain_slots[0]);  // points to old back
+            cell1.setVariable<int>("divide_flag", 0);
+            cell1.setVariable<int>("life", static_cast<int>(mean_life));
+            occ[plan.new_x[0]][plan.new_y[0]][plan.new_z[0]][CELL_TYPE_FIB] = 1u;
+            fib_pos_x[plan.new_slot[0]] = plan.new_x[0];
+            fib_pos_y[plan.new_slot[0]] = plan.new_y[0];
+            fib_pos_z[plan.new_slot[0]] = plan.new_z[0];
+        }
+        // Outermost new cell: new back of chain, my_slot = new_slot[1]
+        if (plan.n_new >= 2) {
+            auto cell2 = fib_api.newAgent();
+            cell2.setVariable<int>("x", plan.new_x[1]);
+            cell2.setVariable<int>("y", plan.new_y[1]);
+            cell2.setVariable<int>("z", plan.new_z[1]);
+            cell2.setVariable<int>("cell_state", FIB_CAF);
+            cell2.setVariable<int>("my_slot",     plan.new_slot[1]);
+            cell2.setVariable<int>("leader_slot", plan.new_slot[0]);  // points to cell1
+            cell2.setVariable<int>("divide_flag", 0);
+            cell2.setVariable<int>("life", static_cast<int>(mean_life));
+            occ[plan.new_x[1]][plan.new_y[1]][plan.new_z[1]][CELL_TYPE_FIB] = 1u;
+            fib_pos_x[plan.new_slot[1]] = plan.new_x[1];
+            fib_pos_y[plan.new_slot[1]] = plan.new_y[1];
+            fib_pos_z[plan.new_slot[1]] = plan.new_z[1];
+        }
+    }
+
+    // --- Phase 3: Update existing agents to CAF + reset all divide_flags ---
+    // Build set of slots to convert to CAF
+    std::unordered_set<int> caf_slots;
+    for (auto& plan : plans) {
+        for (int s : plan.chain_slots) caf_slots.insert(s);
+    }
+
+    {   // Fresh DeviceAgentVector (new agents from Phase 2 appear at end, indices 0..N-1 are stable)
+        flamegpu::DeviceAgentVector fib_vec2 = fib_api.getPopulationData();
+        for (unsigned int i = 0; i < fib_vec2.size(); i++) {
+            int ms = fib_vec2[i].getVariable<int>("my_slot");
+            // Reset divide_flag for all cells (re-evaluated each step by fib_state_step)
+            if (fib_vec2[i].getVariable<int>("divide_flag") != 0) {
+                fib_vec2[i].setVariable<int>("divide_flag", 0);
+            }
+            // Convert chain members to CAF
+            if (ms >= 0 && caf_slots.count(ms)) {
+                fib_vec2[i].setVariable<int>("cell_state", FIB_CAF);
+            }
+        }
+    }
+    nvtxRangePop();
 }
 
 // ============================================================================

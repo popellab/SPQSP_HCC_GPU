@@ -146,17 +146,13 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_state_step, flamegpu::MessageNone, flamegpu::Messag
         FLAMEGPU->environment.getProperty<uint64_t>(PDE_CONC_IFN))[voxel];
     
     // ========== COMPUTE DERIVED STATES ==========
+    float PDL1 = update_PDL1(local_IFNg,
+         FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_HALF"),
+         FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_N"),
+         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_SYN_MAX"),
+         FLAMEGPU->getVariable<float>("PDL1_syn"));
 
-    const float IFNg_PDL1_EC50 = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_HALF");
-    const float IFNg_PDL1_hill = FLAMEGPU->environment.getProperty<float>("PARAM_IFNG_PDL1_N");
-    float H_IFNg = hill_equation(local_IFNg, IFNg_PDL1_EC50, IFNg_PDL1_hill);
-    const float PDL1_syn_max = FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_SYN_MAX");
-    float minPDL1 = PDL1_syn_max * H_IFNg;
-
-    float PDL1_current = FLAMEGPU->getVariable<float>("PDL1_syn");
-    if (PDL1_current < minPDL1) {
-        FLAMEGPU->setVariable<float>("PDL1_syn", minPDL1);
-    }
+    FLAMEGPU->setVariable<float>("PDL1_syn", PDL1);
 
     return flamegpu::ALIVE;
 }
@@ -267,10 +263,6 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_move, flamegpu::MessageNone, flamegpu::MessageNone)
 
     const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
 
-    int target_x = x;
-    int target_y = y;
-    int target_z = z;
-
     // === RUN PHASE (tumble == 0) ===
     if (tumble == 0) {
         float v_x = move_dir_x / dt;
@@ -278,7 +270,6 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_move, flamegpu::MessageNone, flamegpu::MessageNone)
         float v_z = move_dir_z / dt;
 
         float norm_gradient = std::sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
-
         float dot_product = v_x * grad_x + v_y * grad_y + v_z * grad_z;
         float norm_v = std::sqrt(v_x * v_x + v_y * v_y + v_z * v_z);
         float cos_theta = dot_product / (norm_v * norm_gradient);
@@ -296,63 +287,57 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_move, flamegpu::MessageNone, flamegpu::MessageNone)
             return flamegpu::ALIVE;
         }
 
-        // Continue running: move in current direction
-        target_x = x + static_cast<int>(std::round(move_dir_x));
-        target_y = y + static_cast<int>(std::round(move_dir_y));
-        target_z = z + static_cast<int>(std::round(move_dir_z));
+        int tx = x + static_cast<int>(std::round(move_dir_x));
+        int ty = y + static_cast<int>(std::round(move_dir_y));
+        int tz = z + static_cast<int>(std::round(move_dir_z));
 
-        if (target_x < 0 || target_x >= grid_x ||
-            target_y < 0 || target_y >= grid_y ||
-            target_z < 0 || target_z >= grid_z) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
+        if (tx < 0 || tx >= grid_x || ty < 0 || ty >= grid_y || tz < 0 || tz >= grid_z) {
+            // FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
+        }
+
+        if (occ[tx][ty][tz][CELL_TYPE_MDSC].CAS(0u, 1u) == 0u) {
+            occ[x][y][z][CELL_TYPE_MDSC].exchange(0u);
+            FLAMEGPU->setVariable<int>("x", tx);
+            FLAMEGPU->setVariable<int>("y", ty);
+            FLAMEGPU->setVariable<int>("z", tz);
+        } else {
+            // FLAMEGPU->setVariable<int>("tumble", 1);
         }
     }
     // === TUMBLE PHASE (tumble == 1) ===
-    // Pick a uniformly random direction from all 26 Moore neighbors (matches HCC behavior).
+    // Collect all free Moore neighbors, shuffle, try each until CAS wins.
     else {
-        int dirs[26][3];
-        int n_dirs = 0;
-
-        for (int i = -1; i <= 1; i++) {
-            for (int j = -1; j <= 1; j++) {
-                for (int k = -1; k <= 1; k++) {
-                    if (i == 0 && j == 0 && k == 0) continue;
-                    dirs[n_dirs][0] = i;
-                    dirs[n_dirs][1] = j;
-                    dirs[n_dirs][2] = k;
-                    n_dirs++;
-                }
+        int cand_x[26], cand_y[26], cand_z[26];
+        int n_cands = 0;
+        for (int di = -1; di <= 1; di++) for (int dj = -1; dj <= 1; dj++) for (int dk = -1; dk <= 1; dk++) {
+            if (di==0 && dj==0 && dk==0) continue;
+            int nx = x+di, ny = y+dj, nz = z+dk;
+            if (nx<0||nx>=grid_x||ny<0||ny>=grid_y||nz<0||nz>=grid_z) continue;
+            if (occ[nx][ny][nz][CELL_TYPE_MDSC] != 0u) continue;
+            cand_x[n_cands] = nx; cand_y[n_cands] = ny; cand_z[n_cands] = nz;
+            n_cands++;
+        }
+        if (n_cands == 0) return flamegpu::ALIVE;
+        for (int i = n_cands-1; i > 0; i--) {
+            int j = static_cast<int>(FLAMEGPU->random.uniform<float>() * (i+1));
+            if (j > i) j = i;
+            int tx=cand_x[i]; cand_x[i]=cand_x[j]; cand_x[j]=tx;
+            int ty=cand_y[i]; cand_y[i]=cand_y[j]; cand_y[j]=ty;
+            int tz=cand_z[i]; cand_z[i]=cand_z[j]; cand_z[j]=tz;
+        }
+        for (int i = 0; i < n_cands; i++) {
+            if (occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_MDSC].CAS(0u, 1u) == 0u) {
+                occ[x][y][z][CELL_TYPE_MDSC].exchange(0u);
+                FLAMEGPU->setVariable<int>("x", cand_x[i]);
+                FLAMEGPU->setVariable<int>("y", cand_y[i]);
+                FLAMEGPU->setVariable<int>("z", cand_z[i]);
+                FLAMEGPU->setVariable<float>("move_direction_x", static_cast<float>(cand_x[i]-x));
+                FLAMEGPU->setVariable<float>("move_direction_y", static_cast<float>(cand_y[i]-y));
+                FLAMEGPU->setVariable<float>("move_direction_z", static_cast<float>(cand_z[i]-z));
+                FLAMEGPU->setVariable<int>("tumble", 0);
+                break;
             }
-        }
-
-        // Uniform random selection (n_dirs == 26 always)
-        int selected_idx = static_cast<int>(FLAMEGPU->random.uniform<float>() * n_dirs);
-        if (selected_idx >= n_dirs) selected_idx = n_dirs - 1;
-
-        FLAMEGPU->setVariable<float>("move_direction_x", static_cast<float>(dirs[selected_idx][0]));
-        FLAMEGPU->setVariable<float>("move_direction_y", static_cast<float>(dirs[selected_idx][1]));
-        FLAMEGPU->setVariable<float>("move_direction_z", static_cast<float>(dirs[selected_idx][2]));
-        FLAMEGPU->setVariable<int>("tumble", 0);
-
-        target_x = x + dirs[selected_idx][0];
-        target_y = y + dirs[selected_idx][1];
-        target_z = z + dirs[selected_idx][2];
-
-        if (target_x < 0 || target_x >= grid_x ||
-            target_y < 0 || target_y >= grid_y ||
-            target_z < 0 || target_z >= grid_z) {
-            return flamegpu::ALIVE;
-        }
-    }
-
-    // Try to claim target voxel (CAS — MDSCs are exclusive per voxel)
-    if (target_x != x || target_y != y || target_z != z) {
-        if (occ[target_x][target_y][target_z][CELL_TYPE_MDSC].CAS(0u, 1u) == 0u) {
-            occ[x][y][z][CELL_TYPE_MDSC].exchange(0u);
-            FLAMEGPU->setVariable<int>("x", target_x);
-            FLAMEGPU->setVariable<int>("y", target_y);
-            FLAMEGPU->setVariable<int>("z", target_z);
         }
     }
 

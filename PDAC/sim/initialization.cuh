@@ -168,6 +168,13 @@ void initializeToQSP(
     const SimulationConfig& config,
     const LymphCentralWrapper& lymph);
 
+// Test initialization for neighbor scanning diagnostics (init_method=2)
+// Places exactly 3 agents in an 11^3 grid to test macrophage-cancer neighbor detection
+void initializeNeighborTest(
+    flamegpu::CUDASimulation& simulation,
+    flamegpu::ModelDescription& model,
+    const SimulationConfig& config);
+
 } // namespace PDAC
 
 #endif // INITIALIZATION_H

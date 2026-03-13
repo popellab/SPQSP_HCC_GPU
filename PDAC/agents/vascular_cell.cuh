@@ -199,7 +199,7 @@ FLAMEGPU_AGENT_FUNCTION(vascular_state_step, flamegpu::MessageSpatial3D, flamegp
     else if (cell_state == VAS_STALK) {
         // Empty
     }
-    // VAS_PHALANX: VEGF-dependent sprouting
+    // VAS_PHALANX: VEGF-dependent sprouting, or immediate branch if branch flag set
     else if (cell_state == VAS_PHALANX) {
         const int nx_ss = FLAMEGPU->environment.getProperty<int>("grid_size_x");
         const int ny_ss = FLAMEGPU->environment.getProperty<int>("grid_size_y");
@@ -208,7 +208,10 @@ FLAMEGPU_AGENT_FUNCTION(vascular_state_step, flamegpu::MessageSpatial3D, flamegp
         const float vas_50 = FLAMEGPU->environment.getProperty<float>("PARAM_VAS_50");
         const float p_tip = local_VEGFA / (vas_50 + local_VEGFA);
 
-        if (FLAMEGPU->random.uniform<float>() < p_tip) {
+        const int branch_flag = FLAMEGPU->getVariable<int>("branch");
+        if (branch_flag == 1) FLAMEGPU->setVariable<int>("branch", 0);
+
+        if (branch_flag == 1 || FLAMEGPU->random.uniform<float>() < p_tip) {
             const int min_neighbor_range = static_cast<int>(
                 FLAMEGPU->environment.getProperty<float>("PARAM_VAS_MIN_NEIGHBOR"));
             bool nearby_vessel_exists = false;
@@ -266,6 +269,17 @@ FLAMEGPU_AGENT_FUNCTION(vascular_divide, flamegpu::MessageNone, flamegpu::Messag
         // Parent TIP stays TIP (moves away next step, leaving phalanx behind).
         const unsigned int tip_id = FLAMEGPU->getVariable<unsigned int>("tip_id");
 
+        // Branch probability: newly-created phalanx may immediately flag for sprouting
+        // (HCC Vas.cpp set_phalanx(): p_branch = PARAM_VAS_BRANCH_PROB * VEGFA / (vas_50 + VEGFA))
+        const int size_x_d = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+        const int size_y_d = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+        const int voxel_d = z * size_y_d*size_x_d + y * size_x_d + x;
+        const float local_VEGFA_d = PDE_READ(FLAMEGPU, PDE_CONC_VEGFA, voxel_d);
+        const float vas_50_d = FLAMEGPU->environment.getProperty<float>("PARAM_VAS_50");
+        const float branch_prob = FLAMEGPU->environment.getProperty<float>("PARAM_VAS_BRANCH_PROB");
+        const float p_branch = branch_prob * local_VEGFA_d / (vas_50_d + local_VEGFA_d);
+        const int new_branch = (FLAMEGPU->random.uniform<float>() < p_branch) ? 1 : 0;
+
         FLAMEGPU->agent_out.setVariable<int>("x", x);
         FLAMEGPU->agent_out.setVariable<int>("y", y);
         FLAMEGPU->agent_out.setVariable<int>("z", z);
@@ -275,7 +289,7 @@ FLAMEGPU_AGENT_FUNCTION(vascular_divide, flamegpu::MessageNone, flamegpu::Messag
         FLAMEGPU->agent_out.setVariable<float>("move_direction_y", 0.0f);
         FLAMEGPU->agent_out.setVariable<float>("move_direction_z", 0.0f);
         FLAMEGPU->agent_out.setVariable<int>("tumble", 0);
-        FLAMEGPU->agent_out.setVariable<int>("branch", 0);
+        FLAMEGPU->agent_out.setVariable<int>("branch", new_branch);
         FLAMEGPU->agent_out.setVariable<int>("intent_action", INTENT_NONE);
         FLAMEGPU->agent_out.setVariable<int>("target_x", -1);
         FLAMEGPU->agent_out.setVariable<int>("target_y", -1);
@@ -409,7 +423,7 @@ FLAMEGPU_AGENT_FUNCTION(vascular_move, flamegpu::MessageNone, flamegpu::MessageN
 
         // Only move if target voxel is not occupied by a stationary vascular cell (HCC: voxelIsOpen)
         if (occ[target_x][target_y][target_z][CELL_TYPE_VASCULAR] != 0u) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
+            // FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
         }
     }
@@ -471,6 +485,11 @@ FLAMEGPU_AGENT_FUNCTION(vascular_move, flamegpu::MessageNone, flamegpu::MessageN
         if (target_x < 0 || target_x >= grid_x ||
             target_y < 0 || target_y >= grid_y ||
             target_z < 0 || target_z >= grid_z) {
+            FLAMEGPU->setVariable<int>("tumble", 1);
+            return flamegpu::ALIVE;
+        }
+
+        if (occ[target_x][target_y][target_z][CELL_TYPE_VASCULAR] != 0u) {
             FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
         }
