@@ -363,6 +363,7 @@ FLAMEGPU_AGENT_FUNCTION(treg_divide, flamegpu::MessageNone, flamegpu::MessageNon
         FLAMEGPU->agent_out.setVariable<int>("divide_cd", div_interval);
         FLAMEGPU->agent_out.setVariable<int>("divide_limit", divide_limit - 1);
         FLAMEGPU->agent_out.setVariable<int>("life", daughter_life > 0 ? daughter_life : 1);
+        FLAMEGPU->agent_out.setVariable<int>("tumble", 1);
 
         // Update parent: division state only (life continues counting down)
         FLAMEGPU->setVariable<int>("divide_flag", 1);

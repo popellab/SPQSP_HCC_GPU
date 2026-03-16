@@ -355,6 +355,7 @@ FLAMEGPU_AGENT_FUNCTION(tcell_divide, flamegpu::MessageNone, flamegpu::MessageNo
         FLAMEGPU->agent_out.setVariable<float>("IL2_exposure", IL2_exposure);
         FLAMEGPU->agent_out.setVariable<float>("IL2_release_remain", IL2_release_time);
         FLAMEGPU->agent_out.setVariable<int>("life", daughter_life > 0 ? daughter_life : 1);
+        FLAMEGPU->agent_out.setVariable<int>("tumble", 1);
 
         // Update parent
         FLAMEGPU->setVariable<int>("divide_limit", divide_limit - 1);

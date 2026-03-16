@@ -134,10 +134,9 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
     // CAFs are more motile than normal fibroblasts
-    const float lambda = (cell_state == FIB_CAF) ? 2.0f : 0.5f;
-    const float delta = 1.0f;
-    const float EC50_grad = 1e-10f;
-    const float sigma = 0.524f;
+    const float lambda = 0.000168;
+    const float EC50_grad = 1.0;
+    const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
 
     int target_x = x;
     int target_y = y;
@@ -162,7 +161,8 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
         float H_grad = norm_gradient / (norm_gradient + EC50_grad);
         if (cos_theta < 0) H_grad = -H_grad;
 
-        float p_tumble = 1.0f - std::exp(-0.5f * lambda * (1.0f - cos_theta) * (1.0f - H_grad) + delta);
+        float p_tumble = 0.5f * lambda * (1.0f - cos_theta) * (1.0f - H_grad) * dt;
+        p_tumble = 1 - std::exp(-p_tumble);
         p_tumble = fmaxf(0.0f, fminf(1.0f, p_tumble));
 
         if (FLAMEGPU->random.uniform<float>() < p_tumble) {

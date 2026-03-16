@@ -285,9 +285,10 @@ FLAMEGPU_AGENT_FUNCTION(vascular_divide, flamegpu::MessageNone, flamegpu::Messag
         FLAMEGPU->agent_out.setVariable<int>("z", z);
         FLAMEGPU->agent_out.setVariable<int>("cell_state", VAS_PHALANX);
         FLAMEGPU->agent_out.setVariable<unsigned int>("tip_id", tip_id);
-        FLAMEGPU->agent_out.setVariable<float>("move_direction_x", 0.0f);
-        FLAMEGPU->agent_out.setVariable<float>("move_direction_y", 0.0f);
-        FLAMEGPU->agent_out.setVariable<float>("move_direction_z", 0.0f);
+        // Inherit TIP's move_direction so it can be passed to future sprouted TIPs (HCC copy-ctor).
+        FLAMEGPU->agent_out.setVariable<float>("move_direction_x", FLAMEGPU->getVariable<float>("move_direction_x"));
+        FLAMEGPU->agent_out.setVariable<float>("move_direction_y", FLAMEGPU->getVariable<float>("move_direction_y"));
+        FLAMEGPU->agent_out.setVariable<float>("move_direction_z", FLAMEGPU->getVariable<float>("move_direction_z"));
         FLAMEGPU->agent_out.setVariable<int>("tumble", 0);
         FLAMEGPU->agent_out.setVariable<int>("branch", new_branch);
         FLAMEGPU->agent_out.setVariable<int>("intent_action", INTENT_NONE);
@@ -304,18 +305,17 @@ FLAMEGPU_AGENT_FUNCTION(vascular_divide, flamegpu::MessageNone, flamegpu::Messag
         const unsigned int new_tip_id =
             static_cast<unsigned int>(FLAMEGPU->getID()) + 1000000u;
 
-        // Random initial direction; tip will orient via run-tumble on first step.
-        const float theta = FLAMEGPU->random.uniform<float>() * 2.0f * 3.14159265f;
-        const float phi   = acosf(2.0f * FLAMEGPU->random.uniform<float>() - 1.0f);
-
+        // Inherit phalanx's stored move_direction (HCC copy-ctor: _moveDirection = parent._moveDirection).
+        // Phalanx carries the direction from the TIP that created it; new TIP inherits that direction
+        // and starts in tumble mode so it immediately picks a biased direction on first move step.
         FLAMEGPU->agent_out.setVariable<int>("x", x);
         FLAMEGPU->agent_out.setVariable<int>("y", y);
         FLAMEGPU->agent_out.setVariable<int>("z", z);
         FLAMEGPU->agent_out.setVariable<int>("cell_state", VAS_TIP);
         FLAMEGPU->agent_out.setVariable<unsigned int>("tip_id", new_tip_id);
-        FLAMEGPU->agent_out.setVariable<float>("move_direction_x", sinf(phi) * cosf(theta));
-        FLAMEGPU->agent_out.setVariable<float>("move_direction_y", sinf(phi) * sinf(theta));
-        FLAMEGPU->agent_out.setVariable<float>("move_direction_z", cosf(phi));
+        FLAMEGPU->agent_out.setVariable<float>("move_direction_x", FLAMEGPU->getVariable<float>("move_direction_x"));
+        FLAMEGPU->agent_out.setVariable<float>("move_direction_y", FLAMEGPU->getVariable<float>("move_direction_y"));
+        FLAMEGPU->agent_out.setVariable<float>("move_direction_z", FLAMEGPU->getVariable<float>("move_direction_z"));
         FLAMEGPU->agent_out.setVariable<int>("tumble", 1);
         FLAMEGPU->agent_out.setVariable<int>("branch", 0);
         FLAMEGPU->agent_out.setVariable<int>("intent_action", INTENT_NONE);

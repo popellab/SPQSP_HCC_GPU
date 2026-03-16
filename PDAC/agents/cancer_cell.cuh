@@ -250,7 +250,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 // Symmetric: daughter is stem
                 const float div_int = FLAMEGPU->environment.getProperty<float>(
                     "PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE");
-
                 FLAMEGPU->agent_out.setVariable<int>("x", target_x);
                 FLAMEGPU->agent_out.setVariable<int>("y", target_y);
                 FLAMEGPU->agent_out.setVariable<int>("z", target_z);
@@ -260,7 +259,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 FLAMEGPU->agent_out.setVariable<int>("divideCountRemaining", 0);
                 FLAMEGPU->agent_out.setVariable<unsigned int>("stemID", stem_id);
             }
-            // Reset parent divideCD
+            // Reset parent divideCD — matches HCC deterministic reset
             FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(
                 (FLAMEGPU->environment.getProperty<float>("PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE")/cabo_prolif_factor) + 0.5f));
 
@@ -291,7 +290,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 const int life = static_cast<int>(-mean_life * logf(rand_val + 0.0001f) + 0.5f);
                 FLAMEGPU->setVariable<int>("life", life > 0 ? life : 1);
             } else {
-                // Reset parent divideCD
+                // Reset parent divideCD — matches HCC deterministic reset
                 FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(div_int + 0.5f));
             }
         }
@@ -460,7 +459,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             FLAMEGPU->setVariable<int>("divideFlag", 0);
             const float mean_life = FLAMEGPU->environment.getProperty<float>("PARAM_CANCER_SENESCENT_MEAN_LIFE");
             const float rand_val  = FLAMEGPU->random.uniform<float>();
-            const int life = static_cast<int>(-mean_life * logf(rand_val) + 0.5f);
+            const int life = static_cast<int>(-mean_life * logf(rand_val + 0.0001f) + 0.5f);
             FLAMEGPU->setVariable<int>("life", life > 0 ? life : 1);
         }
     }

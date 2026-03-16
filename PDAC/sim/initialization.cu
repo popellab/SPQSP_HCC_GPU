@@ -145,10 +145,10 @@ void initializeCancerCellCluster(
                 bool is_stem = (dist < cluster_radius * 0.3f);
                 int cell_state = is_stem ? CANCER_STEM : CANCER_PROGENITOR;
 
-                // Randomize division cooldown from uniform distribution [0.0×interval, 1.0×interval]
+                // Randomize division cooldown: uniform [1, interval] matching HCC randomize_div_cd(mean)
                 float base_interval = is_stem ? stem_div_interval : progenitor_div_interval;
-                float random_factor = (static_cast<float>(rand()) / RAND_MAX);  // Range: [0.5, 1.5]
-                int div_cd = static_cast<int>((base_interval * random_factor) + 0.5);
+                float random_factor = (static_cast<float>(rand()) / (RAND_MAX + 1.0f));  // [0, 1)
+                int div_cd = static_cast<int>(base_interval * random_factor) + 1;  // [1, interval]
 
                 // Basic identity and state
                 const int id = agent.getID();
@@ -566,7 +566,7 @@ void initializeVascularCellsRandom(
             flamegpu::AgentVector::Agent agent = vascular_agents.back();
             int branch_flag = (rand_unif() < p_branch_init) ? 1 : 0;
             setVascularCellVariables(agent, current_x, current_y, current_z,
-                                   2, 1.0f, 0.0f, 0.0f, 0u, branch_flag);
+                                   2, static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz), 0u, branch_flag);
             total_vessels++;
         }
 
@@ -681,7 +681,7 @@ void initializeVascularCellsRandom(
                 flamegpu::AgentVector::Agent agent = vascular_agents.back();
                 int branch_flag = (rand_unif() < p_branch_init) ? 1 : 0;
                 setVascularCellVariables(agent, current_x, current_y, current_z,
-                                       2, 1.0f, 0.0f, 0.0f, 0u, branch_flag);
+                                       2, static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz), 0u, branch_flag);
                 total_vessels++;
             }
 
@@ -743,6 +743,7 @@ void initializeCancerCellsRandom(
     float stem_div_interval,
     float progenitor_div_interval,
     int progenitor_div_max,
+    float senescent_mean_life,
     std::vector<double> celltype_cdf)
 {
     unsigned int count = 1;
@@ -775,8 +776,8 @@ void initializeCancerCellsRandom(
                     if (i==0) {
                         cell_state = CANCER_STEM;
 
-                        float random_factor = (static_cast<float>(rand()) / RAND_MAX);
-                        div_cd = static_cast<int>((stem_div_interval * random_factor) + 0.5);
+                        float random_factor = (static_cast<float>(rand()) / (RAND_MAX + 1.0f));
+                        div_cd = static_cast<int>(stem_div_interval * random_factor) + 1;  // [1, interval]
 
                         divide_flag = 1;
 
@@ -789,8 +790,8 @@ void initializeCancerCellsRandom(
                         cell_state = CANCER_PROGENITOR;
                         div = progenitor_div_max + 1 - i;
 
-                        float random_factor = (static_cast<float>(rand()) / RAND_MAX);
-                        div_cd = static_cast<int>((progenitor_div_interval * random_factor) + 0.5);
+                        float random_factor = (static_cast<float>(rand()) / (RAND_MAX + 1.0f));
+                        div_cd = static_cast<int>(progenitor_div_interval * random_factor) + 1;  // [1, interval]
 
                         divide_flag = 1;
                     }
@@ -805,6 +806,13 @@ void initializeCancerCellsRandom(
                     agent.setVariable<int>("divideFlag", divide_flag);
                     agent.setVariable<int>("divideCountRemaining", div);
                     agent.setVariable<unsigned int>("stemID", is_stem ? id : 0);
+
+                    // Senescent cells need a valid life countdown (exponential distribution)
+                    if (cell_state == CANCER_SENESCENT) {
+                        float r = static_cast<float>(rand()) / (RAND_MAX + 1.0f);
+                        int sen_life = static_cast<int>(-senescent_mean_life * logf(r + 0.0001f) + 0.5f);
+                        agent.setVariable<int>("life", sen_life > 0 ? sen_life : 1);
+                    }
 
                     count++;
                 }
@@ -1423,6 +1431,7 @@ void initializeToQSP(
     const float stem_div         = model.Environment().getProperty<float>("PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE");
     const float prog_div         = model.Environment().getProperty<float>("PARAM_FLOAT_CANCER_CELL_PROGENITOR_DIV_INTERVAL_SLICE");
     const int   prog_max         = model.Environment().getProperty<int>("PARAM_PROG_DIV_MAX");
+    const float cancer_sen_life  = model.Environment().getProperty<float>("PARAM_CANCER_SENESCENT_MEAN_LIFE");
     const float tcell_life       = model.Environment().getProperty<float>("PARAM_T_CELL_LIFE_MEAN_SLICE");
     const int   tcell_div_limit  = model.Environment().getProperty<int>("PARAM_TCELL_DIV_LIMIT");
     const float IL2_release_time = model.Environment().getProperty<float>("PARAM_TCELL_IL2_RELEASE_TIME");
@@ -1452,7 +1461,7 @@ void initializeToQSP(
         initializeCancerCellsRandom(
             cancer_pop,
             config.grid_x, config.grid_y, config.grid_z,
-            cluster_radius, stem_div, prog_div, prog_max, celltype_cdf);
+            cluster_radius, stem_div, prog_div, prog_max, cancer_sen_life, celltype_cdf);
         buildOccupancyGrid(cancer_pop, occupied, config.grid_x, config.grid_y);
         simulation.setPopulationData(cancer_pop);
     }
