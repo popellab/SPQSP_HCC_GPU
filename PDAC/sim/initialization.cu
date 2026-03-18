@@ -489,7 +489,8 @@ void initializeVascularCellsRandom(
     int grid_x, int grid_y, int grid_z,
     int tumor_radius,
     int num_segments,
-    float branch_prob)
+    float branch_prob,
+    unsigned int seed)
 {
     const int center_x = grid_x / 2;
     const int center_y = grid_y / 2;
@@ -498,7 +499,7 @@ void initializeVascularCellsRandom(
     const double radius = 0.5 * grid_x;
 
     // Random number generator
-    std::srand(12345);  // Use fixed seed for reproducibility
+    std::srand(seed);
     auto rand_unif = []() { return static_cast<double>(std::rand()) / RAND_MAX; };
 
     // HCC Tumor.cpp line 1518: initial phalanx cells have p_branch = PARAM_VAS_BRANCH_PROB/5
@@ -1293,7 +1294,8 @@ void initializeAllAgents(
                 config.grid_x, config.grid_y, config.grid_z,
                 config.cluster_radius,
                 num_segments,
-                vas_branch_prob);
+                vas_branch_prob,
+                config.random_seed);
         }
         else if (config.vascular_mode == "xml") {
             // XML-based initialization (Phase 2)
@@ -1544,7 +1546,8 @@ void initializeToQSP(
                 vascular_vec,
                 config.grid_x, config.grid_y, config.grid_z,
                 cluster_radius, /*num_segments=*/1,
-                vas_branch_prob);
+                vas_branch_prob,
+                config.random_seed);
         } else if (config.vascular_mode == "test") {
             initializeVascularCellsTest(vascular_vec, config.grid_x, config.grid_y, config.grid_z);
         } else {

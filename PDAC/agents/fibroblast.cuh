@@ -50,6 +50,14 @@ FLAMEGPU_AGENT_FUNCTION(fib_write_to_occ_grid, flamegpu::MessageNone, flamegpu::
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
     occ[x][y][z][CELL_TYPE_FIB].exchange(1u);
+
+    // Flat total occupancy for GPU recruitment kernel
+    const int gx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int gy = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    unsigned int* occ_total = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
+    atomicAdd(&occ_total[z * (gx * gy) + y * gx + x], 1u);
+
     return flamegpu::ALIVE;
 }
 
@@ -133,8 +141,6 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
-    // CAFs are more motile than normal fibroblasts
-    const float lambda = 0.000168;
     const float EC50_grad = 1.0;
     const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
 
@@ -144,26 +150,27 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
 
     // === RUN PHASE (tumble == 0) ===
     if (tumble == 0) {
+
+        float v_x = move_dir_x / dt;
+        float v_y = move_dir_y / dt;
+        float v_z = move_dir_z / dt;
+
+        float dot_product = v_x * grad_x + v_y * grad_y + v_z * grad_z;
+
+        float lambda = 0.0000168;
+        if (cell_state == FIB_CAF) {
+            float lambda = 0.000168;
+        }
+        float norm_v = std::sqrt(v_x * v_x + v_y * v_y + v_z * v_z);
         float norm_gradient = std::sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
 
-        // Switch to tumble if gradient is too weak
-        if (norm_gradient < EC50_grad) {
-            FLAMEGPU->setVariable<int>("tumble", 1);
-            return flamegpu::ALIVE;
-        }
-
-        float norm_v = std::sqrt(move_dir_x * move_dir_x + move_dir_y * move_dir_y + move_dir_z * move_dir_z);
-        if (norm_v < 1e-6f) norm_v = 1.0f;
-
-        float dot_product = move_dir_x * grad_x + move_dir_y * grad_y + move_dir_z * grad_z;
         float cos_theta = dot_product / (norm_v * norm_gradient);
 
         float H_grad = norm_gradient / (norm_gradient + EC50_grad);
         if (cos_theta < 0) H_grad = -H_grad;
 
-        float p_tumble = 0.5f * lambda * (1.0f - cos_theta) * (1.0f - H_grad) * dt;
+        float p_tumble = (lambda/2) * (1.0f-cos_theta) * (1-H_grad) * dt;
         p_tumble = 1 - std::exp(-p_tumble);
-        p_tumble = fmaxf(0.0f, fminf(1.0f, p_tumble));
 
         if (FLAMEGPU->random.uniform<float>() < p_tumble) {
             FLAMEGPU->setVariable<int>("tumble", 1);
@@ -343,12 +350,8 @@ FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu
     const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
 
-    // Read TGFB directly from PDE
-    const int voxel_bd = cz * grid_y*grid_x + cy * grid_x + cx;
-    const float local_TGFB = reinterpret_cast<const float*>(
-        FLAMEGPU->environment.getProperty<uint64_t>(PDE_CONC_TGFB))[voxel_bd];
-
-    const float ec50  = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
+    // Matching HCC: pure Gaussian scatter with CAF/normal scale only.
+    // TGFB amplification is applied per-voxel in update_ecm_grid_kernel, not here.
     const float scale = (cell_state == FIB_CAF) ? 1.0f : 0.5f;
 
     // Gaussian parameters matching HCC (radius=10, sigma=3)
@@ -356,10 +359,6 @@ FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu
     const float variance = 9.0f;  // sigma^2 = 3^2
     // normalizer = 1 / (sigma^3 * sqrt(2*pi)) = 1 / (27 * 2.5066) ≈ 0.014784
     const float normalizer = 0.014784f;
-
-    // TGFB amplification factor at fibroblast's own voxel (pre-multiplied approximation)
-    const float H_TGFB = local_TGFB / (local_TGFB + ec50);
-    const float tgfb_scale = scale * (1.0f + H_TGFB);
 
     float* field_ptr = reinterpret_cast<float*>(
         FLAMEGPU->environment.getProperty<uint64_t>("fib_density_field_ptr"));
@@ -374,7 +373,7 @@ FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu
                 const int nz = cz + dz;
                 if (nz < 0 || nz >= grid_z) continue;
                 float dist_sq = static_cast<float>(dx*dx + dy*dy + dz*dz);
-                float kernel_val = tgfb_scale * normalizer * expf(-dist_sq / (2.0f * variance));
+                float kernel_val = scale * normalizer * expf(-dist_sq / (2.0f * variance));
                 atomicAdd(&field_ptr[nz * (grid_x * grid_y) + ny * grid_x + nx], kernel_val);
             }
         }

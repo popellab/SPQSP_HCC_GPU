@@ -9,16 +9,6 @@
 #include <nvtx3/nvToolsExt.h>
 #include <cmath>
 
-// Helper: sample normal random variate via Box-Muller (matches HCC getTCellLife / getTCD4Life)
-// Returns mean + N(0,1)*sd, clamped to at least 1
-static inline int sample_normal_life(float mean, float sd) {
-    float u1 = (static_cast<float>(rand()) + 1.0f) / (static_cast<float>(RAND_MAX) + 2.0f);
-    float u2 = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-    float z  = std::sqrt(-2.0f * std::log(u1)) * std::cos(2.0f * 3.14159265f * u2);
-    int life = static_cast<int>(mean + z * sd + 0.5f);
-    return life > 0 ? life : 1;
-}
-
 // ============================================================================
 // Layer Timing Globals (defined once here, declared extern in layer_timing.h)
 // ============================================================================
@@ -54,11 +44,28 @@ RecruitStats get_last_recruit_stats() { return g_recruit_stats; }
 // Used by recruitment source-marking kernels to skip tumor-dense voxels.
 static unsigned int* d_cancer_occ = nullptr;
 
+// Per-voxel vascular tip_id map.
+// Written by vascular_write_to_occ_grid (PHALANX/STALK cells write their tip_id).
+// Zeroed by zero_occupancy_grid. Read by vascular_state_step for neighbor check.
+// Layout: idx = z*(nx*ny) + y*nx + x. Value 0 = empty; nonzero = tip_id of vessel.
+static unsigned int* d_vas_tip_id_grid = nullptr;
+
 // Flat device arrays for ECM (extracellular matrix) and fibroblast density field.
 // Replace MacroProperty-based approach to eliminate D2H/H2D copies every step.
 // Layout: idx = z * (nx * ny) + y * nx + x  (z-major, x-minor; matches PDE convention)
 static float* d_ecm_grid = nullptr;
 static float* d_fib_density_field = nullptr;
+
+// Flat occupancy arrays for GPU recruitment kernel (populated by agent write_to_occ_grid).
+// d_occ_total: total agent count per voxel (all types increment via atomicAdd).
+// d_mac_occ / d_mdsc_occ: per-type counts for exclusive placement checks (atomicCAS).
+// d_recruit_requests: compact output buffer for placement decisions (GPU→host).
+// d_recruit_count: atomic counter for number of valid requests in buffer.
+static unsigned int* d_occ_total = nullptr;
+static unsigned int* d_mac_occ = nullptr;
+static unsigned int* d_mdsc_occ = nullptr;
+static RecruitRequest* d_recruit_requests = nullptr;
+static int* d_recruit_count = nullptr;
 
 // ============================================================================
 // CUDA Kernel: ECM Grid Update
@@ -66,10 +73,11 @@ static float* d_fib_density_field = nullptr;
 // Called from update_ecm_grid host function after fib_build_density_field runs.
 // ============================================================================
 __global__ void update_ecm_grid_kernel(
-    float* ecm, const float* fib_field,
+    float* ecm, const float* fib_field, const float* tgfb_conc,
     int nx, int ny, int nz,
     float voxel_vol_cm3, float decay_rate, float dt,
-    float ecm_baseline, float ecm_saturation, float release_rate)
+    float ecm_baseline, float ecm_saturation, float release_rate,
+    float tgfb_ec50)
 {
     const int tx = blockIdx.x * blockDim.x + threadIdx.x;
     const int ty = blockIdx.y * blockDim.y + threadIdx.y;
@@ -81,20 +89,32 @@ __global__ void update_ecm_grid_kernel(
     float curr_ecm     = ecm[idx];
     float curr_ecm_amt = curr_ecm * voxel_vol_cm3;
 
-    // Exponential decay
+    // Exponential decay — matches HCC: exp(-SEC_PER_SLICE * decay_rate)
     float decayed = curr_ecm_amt * expf(-decay_rate * dt);
 
-    // Deposition from fibroblast density field (CAF-weighted Gaussian scatter)
-    float saturation  = fminf(curr_ecm / ecm_saturation, 1.0f);
-    float deposition  = fib_field[idx] * release_rate / 3.0f * (1.0f - saturation);
+    // Per-voxel TGFB amplification — matches HCC: (1 + H_CAF_TGFB) at target voxel
+    float tgfb    = tgfb_conc[idx];
+    float H_TGFB  = tgfb / (tgfb + tgfb_ec50);
+
+    // Deposition: fib_field * (1 + H_TGFB) * release_rate / 3 * (1 - saturation)
+    float saturation = fminf(curr_ecm / ecm_saturation, 1.0f);
+    float deposition = fib_field[idx] * (1.0f + H_TGFB) * release_rate / 3.0f * (1.0f - saturation);
 
     float new_ecm = (decayed + deposition) / voxel_vol_cm3;
 
-    // Clamp to [baseline, saturation]
+    // Floor to baseline only — matches HCC (no upper saturation clamp)
     new_ecm = fmaxf(new_ecm, ecm_baseline);
-    new_ecm = fminf(new_ecm, ecm_saturation);
 
     ecm[idx] = new_ecm;
+}
+
+// ============================================================================
+// CUDA Kernel: Fill ECM grid with a constant value (initialization only)
+// ============================================================================
+__global__ void fill_ecm_kernel(float* ecm, int total_voxels, float value)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_voxels) ecm[idx] = value;
 }
 
 // ============================================================================
@@ -199,12 +219,30 @@ void initialize_pde_solver(int grid_x, int grid_y, int grid_z,
     CUDA_CHECK(cudaMalloc(&d_cancer_occ, total_voxels * sizeof(unsigned int)));
     CUDA_CHECK(cudaMemset(d_cancer_occ, 0, total_voxels * sizeof(unsigned int)));
 
+    // Allocate vascular tip_id grid for efficient neighbor check in vascular_state_step
+    CUDA_CHECK(cudaMalloc(&d_vas_tip_id_grid, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_vas_tip_id_grid, 0, total_voxels * sizeof(unsigned int)));
+
     // Allocate ECM and fibroblast density field device arrays.
-    // Initialized to 0.0f; update_ecm_grid_kernel clamps to ecm_baseline on first call.
+    // ECM starts at 0 here; initialize_ecm_to_saturation() is called after QSP init
+    // (in set_internal_params) to fill with PARAM_FIB_ECM_SATURATION — matching HCC.
     CUDA_CHECK(cudaMalloc(&d_ecm_grid, total_voxels * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_ecm_grid, 0, total_voxels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_fib_density_field, total_voxels * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_fib_density_field, 0, total_voxels * sizeof(float)));
+
+    // Allocate flat occupancy arrays for GPU recruitment kernel
+    CUDA_CHECK(cudaMalloc(&d_occ_total, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_occ_total, 0, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_mac_occ, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_mac_occ, 0, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_mdsc_occ, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_mdsc_occ, 0, total_voxels * sizeof(unsigned int)));
+
+    // Allocate GPU recruitment output buffer + atomic counter
+    CUDA_CHECK(cudaMalloc(&d_recruit_requests, MAX_RECRUITS_PER_STEP * sizeof(RecruitRequest)));
+    CUDA_CHECK(cudaMalloc(&d_recruit_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_recruit_count, 0, sizeof(int)));
 
     std::cout << "PDE Solver initialized and coupled to FLAME GPU 2" << std::endl;
 }
@@ -256,11 +294,23 @@ void set_pde_pointers_in_environment(flamegpu::ModelDescription& model) {
     model.Environment().newProperty<unsigned long long>("cancer_occ_ptr",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_cancer_occ)));
 
+    // Store vascular tip_id grid pointer (for efficient neighbor check in vascular_state_step)
+    model.Environment().newProperty<unsigned long long>("vas_tip_id_grid_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_vas_tip_id_grid)));
+
     // Store ECM and fibroblast density field pointers (replace MacroProperty approach)
     model.Environment().newProperty<unsigned long long>("ecm_grid_ptr",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_ecm_grid)));
     model.Environment().newProperty<unsigned long long>("fib_density_field_ptr",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_density_field)));
+
+    // Store flat occupancy array pointers for GPU recruitment kernel
+    model.Environment().newProperty<unsigned long long>("occ_total_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_occ_total)));
+    model.Environment().newProperty<unsigned long long>("mac_occ_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_mac_occ)));
+    model.Environment().newProperty<unsigned long long>("mdsc_occ_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_mdsc_occ)));
 
     std::cout << "PDE device pointers stored in FLAME GPU environment" << std::endl;
 }
@@ -282,7 +332,30 @@ void cleanup_pde_solver() {
         cudaFree(d_fib_density_field);
         d_fib_density_field = nullptr;
     }
+    if (d_vas_tip_id_grid) {
+        cudaFree(d_vas_tip_id_grid);
+        d_vas_tip_id_grid = nullptr;
+    }
+    if (d_occ_total) { cudaFree(d_occ_total); d_occ_total = nullptr; }
+    if (d_mac_occ)   { cudaFree(d_mac_occ);   d_mac_occ = nullptr; }
+    if (d_mdsc_occ)  { cudaFree(d_mdsc_occ);  d_mdsc_occ = nullptr; }
+    if (d_recruit_requests) { cudaFree(d_recruit_requests); d_recruit_requests = nullptr; }
+    if (d_recruit_count)    { cudaFree(d_recruit_count);    d_recruit_count = nullptr; }
 }
+
+void initialize_ecm_to_saturation(float ecm_saturation) {
+    if (!d_ecm_grid || !g_pde_solver) return;
+    int total_voxels = g_pde_solver->get_total_voxels();
+    int block_size = 256;
+    int grid_size = (total_voxels + block_size - 1) / block_size;
+    fill_ecm_kernel<<<grid_size, block_size>>>(d_ecm_grid, total_voxels, ecm_saturation);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::cout << "[ECM] Initialized ECM grid to saturation value: " << ecm_saturation << std::endl;
+}
+
+float* get_ecm_grid_device_ptr() { return d_ecm_grid; }
+float* get_fib_density_field_device_ptr() { return d_fib_density_field; }
+unsigned int* get_vas_tip_id_grid_device_ptr() { return d_vas_tip_id_grid; }
 
 // ============================================================================
 // Recruitment System Implementation
@@ -420,208 +493,477 @@ FLAMEGPU_HOST_FUNCTION(mark_mdsc_sources) {
     nvtxRangePop();
 }
 
-// Recruit T cells at marked T source voxels
-FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
-    nvtxRangePush("Recruit T Cells");
+// ============================================================================
+// GPU Recruitment Kernel: Packed parameters struct
+// ============================================================================
+struct RecruitKernelParams {
+    int nx, ny, nz;
+    // T cell (CD8) recruitment
+    float p_teff, p_treg, p_th;
+    int nr_t_voxel, nr_t_voxel_c;
+    float t_life_mean, t_life_sd;
+    int t_divide_cd, t_divide_limit;
+    float t_IL2_release;
+    // TCD4 (TReg/TH) recruitment
+    float tcd4_life_mean, tcd4_life_sd;
+    int tcd4_divide_cd, tcd4_divide_limit;
+    float tcd4_TGFB_release;
+    float ctla4_treg;
+    // MDSC recruitment
+    float p_mdsc;
+    float mdsc_life_mean;
+    // MAC recruitment
+    float p_mac;
+    float mac_life_mean;
+    // RNG seed
+    unsigned int seed;
+};
+
+// Device helper: xorshift32 RNG (fast, good enough for recruitment)
+__device__ __forceinline__ unsigned int xorshift32(unsigned int& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+// Device helper: uniform float in [0, 1) from RNG state
+__device__ __forceinline__ float rng_uniform(unsigned int& state) {
+    return (xorshift32(state) & 0x7FFFFFFFu) / 2147483648.0f;
+}
+
+// Device helper: Box-Muller normal sample (mean + sd * N(0,1)), clamped to >= 1
+__device__ __forceinline__ int sample_normal_life_gpu(float mean, float sd, unsigned int& rng) {
+    float u1 = rng_uniform(rng) + 1e-10f;  // Avoid log(0)
+    float u2 = rng_uniform(rng);
+    float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
+    int life = __float2int_rn(mean + z * sd);
+    return life > 0 ? life : 1;
+}
+
+// Device helper: exponential life sample (mean * log(1/u)), clamped to >= 1
+__device__ __forceinline__ int sample_exp_life_gpu(float mean, unsigned int& rng) {
+    float u = rng_uniform(rng) + 1e-4f;  // Avoid log(0)
+    int life = __float2int_rn(mean * logf(1.0f / u));
+    return life > 0 ? life : 1;
+}
+
+// Device helper: try to place a cell at one of the 26 Moore neighbors of (sx, sy, sz).
+// Uses Fisher-Yates shuffle with thread-local RNG. Claims voxel via atomic ops on
+// d_occ_total (for T/TReg cap) and d_mac_occ/d_mdsc_occ (for exclusive placement).
+// Returns true + sets (out_x, out_y, out_z) on success.
+__device__ bool try_find_open_neighbor(
+    int sx, int sy, int sz,
+    int cell_type,
+    int nx, int ny, int nz,
+    int nr_t_voxel, int nr_t_voxel_c,
+    unsigned int* d_occ_total,
+    const unsigned int* d_cancer_occ,
+    unsigned int* d_mac_occ,
+    unsigned int* d_mdsc_occ,
+    unsigned int& rng,
+    int& out_x, int& out_y, int& out_z)
+{
+    // Build 26 Moore neighbor offsets
+    int offsets[26][3];
+    int n = 0;
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                offsets[n][0] = dx; offsets[n][1] = dy; offsets[n][2] = dz;
+                n++;
+            }
+        }
+    }
+
+    // Fisher-Yates shuffle
+    for (int i = n - 1; i > 0; i--) {
+        int j = xorshift32(rng) % (i + 1);
+        int tmp0 = offsets[i][0]; offsets[i][0] = offsets[j][0]; offsets[j][0] = tmp0;
+        int tmp1 = offsets[i][1]; offsets[i][1] = offsets[j][1]; offsets[j][1] = tmp1;
+        int tmp2 = offsets[i][2]; offsets[i][2] = offsets[j][2]; offsets[j][2] = tmp2;
+    }
+
+    for (int i = 0; i < n; i++) {
+        int cx = sx + offsets[i][0];
+        int cy = sy + offsets[i][1];
+        int cz = sz + offsets[i][2];
+        if (cx < 0 || cx >= nx || cy < 0 || cy >= ny || cz < 0 || cz >= nz) continue;
+
+        int vidx = cz * (nx * ny) + cy * nx + cx;
+
+        if (cell_type == CELL_TYPE_T || cell_type == CELL_TYPE_TREG) {
+            // Determine cap based on cancer presence
+            bool has_cancer = (d_cancer_occ[vidx] > 0u);
+            int cap = has_cancer ? nr_t_voxel_c : nr_t_voxel;
+
+            // Atomic claim: increment total, check against cap
+            unsigned int old_total = atomicAdd(&d_occ_total[vidx], 1u);
+            if ((int)old_total >= cap) {
+                atomicSub(&d_occ_total[vidx], 1u);  // Undo
+                continue;
+            }
+            out_x = cx; out_y = cy; out_z = cz;
+            return true;
+        }
+        else if (cell_type == CELL_TYPE_MAC) {
+            // Exclusive: atomicCAS, only place if slot == 0
+            unsigned int old = atomicCAS(&d_mac_occ[vidx], 0u, 1u);
+            if (old != 0u) continue;
+            // Also increment total count
+            atomicAdd(&d_occ_total[vidx], 1u);
+            out_x = cx; out_y = cy; out_z = cz;
+            return true;
+        }
+        else if (cell_type == CELL_TYPE_MDSC) {
+            // Exclusive: atomicCAS, only place if slot == 0
+            unsigned int old = atomicCAS(&d_mdsc_occ[vidx], 0u, 1u);
+            if (old != 0u) continue;
+            atomicAdd(&d_occ_total[vidx], 1u);
+            out_x = cx; out_y = cy; out_z = cz;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// GPU Recruitment Kernel: One thread per voxel. Checks recruitment source flags,
+// rolls probabilities, finds open neighbors, writes compact RecruitRequest buffer.
+// ============================================================================
+__global__ void recruit_all_kernel(
+    const int* __restrict__ d_recruitment_sources,
+    unsigned int* d_occ_total,
+    const unsigned int* __restrict__ d_cancer_occ,
+    unsigned int* d_mac_occ,
+    unsigned int* d_mdsc_occ,
+    RecruitRequest* d_requests,
+    int* d_request_count,
+    RecruitKernelParams p)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x >= p.nx || y >= p.ny || z >= p.nz) return;
+
+    int idx = z * (p.nx * p.ny) + y * p.nx + x;
+    int flags = d_recruitment_sources[idx];
+    if (flags == 0) return;  // No sources marked here
+
+    // Thread-local RNG seeded from position + step seed
+    unsigned int rng = p.seed ^ (idx * 2654435761u + 1);
+    xorshift32(rng);  // Warm up
+
+    int px, py, pz;
+
+    // ── T source (bit 0): recruit Teff, TReg, TH ──
+    if (flags & 1) {
+        // Try Teff
+        if (rng_uniform(rng) < p.p_teff) {
+            if (try_find_open_neighbor(x, y, z, CELL_TYPE_T, p.nx, p.ny, p.nz,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
+                int slot = atomicAdd(d_request_count, 1);
+                if (slot < MAX_RECRUITS_PER_STEP) {
+                    RecruitRequest req;
+                    req.x = px; req.y = py; req.z = pz;
+                    req.cell_type = CELL_TYPE_T;
+                    req.cell_state = T_CELL_EFF;
+                    req.life = sample_normal_life_gpu(p.t_life_mean, p.t_life_sd, rng);
+                    req.divide_cd = p.t_divide_cd;
+                    req.divide_limit = p.t_divide_limit;
+                    req.IL2_release_remain = p.t_IL2_release;
+                    req.TGFB_release_remain = 0.0f;
+                    req.CTLA4 = 0.0f;
+                    d_requests[slot] = req;
+                }
+            }
+        }
+
+        // Try TReg
+        if (rng_uniform(rng) < p.p_treg) {
+            if (try_find_open_neighbor(x, y, z, CELL_TYPE_TREG, p.nx, p.ny, p.nz,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
+                int slot = atomicAdd(d_request_count, 1);
+                if (slot < MAX_RECRUITS_PER_STEP) {
+                    RecruitRequest req;
+                    req.x = px; req.y = py; req.z = pz;
+                    req.cell_type = CELL_TYPE_TREG;
+                    req.cell_state = TCD4_TREG;
+                    req.life = sample_normal_life_gpu(p.tcd4_life_mean, p.tcd4_life_sd, rng);
+                    req.divide_cd = p.tcd4_divide_cd;
+                    req.divide_limit = p.tcd4_divide_limit;
+                    req.IL2_release_remain = 0.0f;
+                    req.TGFB_release_remain = p.tcd4_TGFB_release;
+                    req.CTLA4 = p.ctla4_treg;
+                    d_requests[slot] = req;
+                }
+            }
+        }
+
+        // Try TH
+        if (rng_uniform(rng) < p.p_th) {
+            if (try_find_open_neighbor(x, y, z, CELL_TYPE_TREG, p.nx, p.ny, p.nz,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
+                int slot = atomicAdd(d_request_count, 1);
+                if (slot < MAX_RECRUITS_PER_STEP) {
+                    RecruitRequest req;
+                    req.x = px; req.y = py; req.z = pz;
+                    req.cell_type = CELL_TYPE_TREG;  // TH uses TReg agent type
+                    req.cell_state = TCD4_TH;
+                    req.life = sample_normal_life_gpu(p.tcd4_life_mean, p.tcd4_life_sd, rng);
+                    req.divide_cd = p.tcd4_divide_cd;
+                    req.divide_limit = p.tcd4_divide_limit;
+                    req.IL2_release_remain = 0.0f;
+                    req.TGFB_release_remain = p.tcd4_TGFB_release;
+                    req.CTLA4 = 0.0f;
+                    d_requests[slot] = req;
+                }
+            }
+        }
+    }
+
+    // ── MDSC source (bit 1) ──
+    if (flags & 2) {
+        if (rng_uniform(rng) < p.p_mdsc) {
+            if (try_find_open_neighbor(x, y, z, CELL_TYPE_MDSC, p.nx, p.ny, p.nz,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
+                int slot = atomicAdd(d_request_count, 1);
+                if (slot < MAX_RECRUITS_PER_STEP) {
+                    RecruitRequest req;
+                    req.x = px; req.y = py; req.z = pz;
+                    req.cell_type = CELL_TYPE_MDSC;
+                    req.cell_state = 0;
+                    req.life = sample_exp_life_gpu(p.mdsc_life_mean, rng);
+                    req.divide_cd = 0;
+                    req.divide_limit = 0;
+                    req.IL2_release_remain = 0.0f;
+                    req.TGFB_release_remain = 0.0f;
+                    req.CTLA4 = 0.0f;
+                    d_requests[slot] = req;
+                }
+            }
+        }
+    }
+
+    // ── MAC source (bit 2) ──
+    if (flags & 4) {
+        if (rng_uniform(rng) < p.p_mac) {
+            if (try_find_open_neighbor(x, y, z, CELL_TYPE_MAC, p.nx, p.ny, p.nz,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
+                int slot = atomicAdd(d_request_count, 1);
+                if (slot < MAX_RECRUITS_PER_STEP) {
+                    RecruitRequest req;
+                    req.x = px; req.y = py; req.z = pz;
+                    req.cell_type = CELL_TYPE_MAC;
+                    // 30% chance M2, else M1
+                    req.cell_state = (rng_uniform(rng) < 0.3f) ? MAC_M2 : MAC_M1;
+                    req.life = sample_exp_life_gpu(p.mac_life_mean, rng);
+                    req.divide_cd = 0;
+                    req.divide_limit = 0;
+                    req.IL2_release_remain = 0.0f;
+                    req.TGFB_release_remain = 0.0f;
+                    req.CTLA4 = 0.0f;
+                    d_requests[slot] = req;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Host Function: Launch GPU recruitment kernel
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(recruit_gpu) {
+    nvtxRangePush("Recruit GPU");
     if (!g_pde_solver) { nvtxRangePop(); return; }
 
     const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int nz = FLAMEGPU->environment.getProperty<int>("grid_size_z");
-    const float voxel_size = FLAMEGPU->environment.getProperty<float>("voxel_size");
 
-    // Get QSP concentrations and recruitment rates from environment
-    float qsp_teff_conc = FLAMEGPU->environment.getProperty<float>("qsp_teff_central");
-    float k_teff = FLAMEGPU->environment.getProperty<float>("PARAM_TEFF_RECRUIT_K");
-    float p_recruit_teff = std::min(qsp_teff_conc * k_teff, 1.0f);
+    // Reset atomic counter
+    CUDA_CHECK(cudaMemset(d_recruit_count, 0, sizeof(int)));
 
-    float qsp_treg_conc = FLAMEGPU->environment.getProperty<float>("qsp_treg_central");
-    float k_treg = FLAMEGPU->environment.getProperty<float>("PARAM_TREG_RECRUIT_K");
-    float p_recruit_treg = std::min(qsp_treg_conc * k_treg, 1.0f);
+    // Build parameter struct
+    RecruitKernelParams p;
+    p.nx = nx; p.ny = ny; p.nz = nz;
 
-    float qsp_th_conc = FLAMEGPU->environment.getProperty<float>("qsp_th_central");
-    float k_th = FLAMEGPU->environment.getProperty<float>("PARAM_TH_RECRUIT_K");
-    float p_recruit_th = std::min(qsp_th_conc * k_th, 1.0f);
+    // T cell recruitment probabilities
+    float qsp_teff = FLAMEGPU->environment.getProperty<float>("qsp_teff_central");
+    float qsp_treg = FLAMEGPU->environment.getProperty<float>("qsp_treg_central");
+    float qsp_th   = FLAMEGPU->environment.getProperty<float>("qsp_th_central");
+    p.p_teff = std::min(qsp_teff * FLAMEGPU->environment.getProperty<float>("PARAM_TEFF_RECRUIT_K"), 1.0f);
+    p.p_treg = std::min(qsp_treg * FLAMEGPU->environment.getProperty<float>("PARAM_TREG_RECRUIT_K"), 1.0f);
+    p.p_th   = std::min(qsp_th   * FLAMEGPU->environment.getProperty<float>("PARAM_TH_RECRUIT_K"),   1.0f);
 
-    // Copy recruitment sources to host
-    int total_voxels = nx * ny * nz;
-    std::vector<int> h_sources(total_voxels);
-    int* d_sources = g_pde_solver->get_device_recruitment_sources_ptr();
-    cudaMemcpy(h_sources.data(), d_sources, total_voxels * sizeof(int), cudaMemcpyDeviceToHost);
+    // Voxel caps
+    p.nr_t_voxel   = FLAMEGPU->environment.getProperty<int>("PARAM_NR_T_VOXELS");
+    p.nr_t_voxel_c = FLAMEGPU->environment.getProperty<int>("PARAM_NR_T_VOXELS_C");
 
-    // Get agent APIs for creating new agents
+    // T cell life/division params
+    p.t_life_mean   = FLAMEGPU->environment.getProperty<float>("PARAM_T_CELL_LIFE_MEAN_SLICE");
+    p.t_life_sd     = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_LIFESPAN_SD");
+    p.t_divide_cd   = FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_INTERNAL");
+    p.t_divide_limit = FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_LIMIT");
+    p.t_IL2_release = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_RELEASE_TIME");
+
+    // TCD4 life/division params
+    p.tcd4_life_mean   = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
+    p.tcd4_life_sd     = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFESPAN_SD");
+    p.tcd4_divide_cd   = FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL");
+    p.tcd4_divide_limit = FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT");
+    p.tcd4_TGFB_release = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME");
+    p.ctla4_treg = FLAMEGPU->environment.getProperty<float>("PARAM_CTLA4_TREG");
+
+    // MDSC params
+    p.p_mdsc = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_RECRUIT_K");
+    p.mdsc_life_mean = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_LIFE_MEAN_SLICE");
+
+    // MAC params
+    p.p_mac = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_RECRUIT_K");
+    p.mac_life_mean = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_LIFE_MEAN");
+
+    // RNG seed from step counter
+    p.seed = static_cast<unsigned int>(FLAMEGPU->getStepCounter()) * 2654435761u + 1u;
+
+    // Launch kernel
+    dim3 block(8, 8, 8);
+    dim3 grid((nx + 7) / 8, (ny + 7) / 8, (nz + 7) / 8);
+
+    recruit_all_kernel<<<grid, block>>>(
+        g_pde_solver->get_device_recruitment_sources_ptr(),
+        d_occ_total, d_cancer_occ, d_mac_occ, d_mdsc_occ,
+        d_recruit_requests, d_recruit_count, p);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Stash stats for logging
+    g_recruit_stats.p_teff = p.p_teff;
+    g_recruit_stats.p_treg = p.p_treg;
+    g_recruit_stats.p_th   = p.p_th;
+    g_recruit_stats.qsp_teff = qsp_teff;
+    g_recruit_stats.qsp_treg = qsp_treg;
+    g_recruit_stats.qsp_th   = qsp_th;
+
+    // Count total T sources for stats
+    // (Skip the D2H copy of full source array — just read the count from the kernel output)
+    g_recruit_stats.t_sources = 0;  // No longer cheaply available; could add atomic counter to kernel if needed
+
+    nvtxRangePop();
+}
+
+// ============================================================================
+// Host Function: Read GPU recruitment results and create FLAMEGPU agents.
+// Thin loop — all heavy work (occupancy check, RNG) was done on GPU.
+// ============================================================================
+FLAMEGPU_HOST_FUNCTION(place_recruited_agents) {
+    nvtxRangePush("Place Recruited Agents");
+
+    // Read count from device
+    int count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, d_recruit_count, sizeof(int), cudaMemcpyDeviceToHost));
+    if (count > MAX_RECRUITS_PER_STEP) count = MAX_RECRUITS_PER_STEP;
+
+    if (count == 0) {
+        // Zero stats
+        g_recruit_stats.teff_rec = 0;
+        g_recruit_stats.treg_rec = 0;
+        g_recruit_stats.th_rec   = 0;
+        g_recruit_stats.mdsc_rec = 0;
+        g_recruit_stats.mac_rec  = 0;
+        nvtxRangePop();
+        return;
+    }
+
+    // D2H copy of compact request buffer
+    std::vector<RecruitRequest> requests(count);
+    CUDA_CHECK(cudaMemcpy(requests.data(), d_recruit_requests,
+        count * sizeof(RecruitRequest), cudaMemcpyDeviceToHost));
+
+    // Get agent APIs
     auto tcell_api = FLAMEGPU->agent(AGENT_TCELL);
-    auto treg_api = FLAMEGPU->agent(AGENT_TREG);
+    auto treg_api  = FLAMEGPU->agent(AGENT_TREG);
+    auto mdsc_api  = FLAMEGPU->agent(AGENT_MDSC);
+    auto mac_api   = FLAMEGPU->agent(AGENT_MACROPHAGE);
 
-    int teff_recruited = 0;
-    int treg_recruited = 0;
-    int th_recruited = 0;
+    int teff_recruited = 0, treg_recruited = 0, th_recruited = 0;
+    int mdsc_recruited = 0, mac_recruited = 0;
 
-    // Count total sources available
-    int total_t_sources = 0;
-    for (int idx = 0; idx < total_voxels; idx++) {
-        if ((h_sources[idx] & 1) != 0) total_t_sources++;
-    }
+    for (int i = 0; i < count; i++) {
+        const auto& r = requests[i];
 
-    // Scan for T source voxels (bit 0 set)
-    for (int idx = 0; idx < total_voxels; idx++) {
-        if ((h_sources[idx] & 1) == 0) continue;  // Not a T source
-
-        int z = idx / (nx * ny);
-        int y = (idx % (nx * ny)) / nx;
-        int x = idx % nx;
-
-        // Try to recruit Teff
-        if (FLAMEGPU->random.uniform<float>() < p_recruit_teff) {
-            // Find empty neighbor voxel for placement (Moore neighborhood)
-            bool placed = false;
-            for (int dz = -1; dz <= 1 && !placed; dz++) {
-                for (int dy = -1; dy <= 1 && !placed; dy++) {
-                    for (int dx = -1; dx <= 1 && !placed; dx++) {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-
-                        int nx_new = x + dx;
-                        int ny_new = y + dy;
-                        int nz_new = z + dz;
-
-                        if (nx_new >= 0 && nx_new < nx &&
-                            ny_new >= 0 && ny_new < ny &&
-                            nz_new >= 0 && nz_new < nz) {
-
-                            // Create new T cell (simplified initialization)
-                            auto new_agent = tcell_api.newAgent();
-                            new_agent.setVariable<int>("x", nx_new);
-                            new_agent.setVariable<int>("y", ny_new);
-                            new_agent.setVariable<int>("z", nz_new);
-                            new_agent.setVariable<int>("cell_state", 0);  // Effector state
-
-                            float lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_T_CELL_LIFE_MEAN_SLICE");
-                            float lifeSd   = FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_LIFESPAN_SD");
-
-                            new_agent.setVariable<int>("life", sample_normal_life(lifeMean, lifeSd));
-
-                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_INTERNAL"));
-                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCELL_DIV_LIMIT"));
-
-                            new_agent.setVariable<float>("IL2_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCELL_IL2_RELEASE_TIME"));
-
-                            new_agent.setVariable<int>("tumble", 1);
-
-                            teff_recruited++;
-                            placed = true;
-                        }
-                    }
-                }
-            }
+        if (r.cell_type == CELL_TYPE_T) {
+            auto a = tcell_api.newAgent();
+            a.setVariable<int>("x", r.x);
+            a.setVariable<int>("y", r.y);
+            a.setVariable<int>("z", r.z);
+            a.setVariable<int>("cell_state", r.cell_state);
+            a.setVariable<int>("life", r.life);
+            a.setVariable<int>("divide_cd", r.divide_cd);
+            a.setVariable<int>("divide_limit", r.divide_limit);
+            a.setVariable<float>("IL2_release_remain", r.IL2_release_remain);
+            a.setVariable<int>("tumble", 1);
+            teff_recruited++;
         }
-
-        // Try to recruit Treg
-        if (FLAMEGPU->random.uniform<float>() < p_recruit_treg) {
-            bool placed = false;
-            for (int dz = -1; dz <= 1 && !placed; dz++) {
-                for (int dy = -1; dy <= 1 && !placed; dy++) {
-                    for (int dx = -1; dx <= 1 && !placed; dx++) {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-
-                        int nx_new = x + dx;
-                        int ny_new = y + dy;
-                        int nz_new = z + dz;
-
-                        if (nx_new >= 0 && nx_new < nx &&
-                            ny_new >= 0 && ny_new < ny &&
-                            nz_new >= 0 && nz_new < nz) {
-
-                            auto new_agent = treg_api.newAgent();
-                            new_agent.setVariable<int>("x", nx_new);
-                            new_agent.setVariable<int>("y", ny_new);
-                            new_agent.setVariable<int>("z", nz_new);
-                            new_agent.setVariable<int>("cell_state", TCD4_TREG);
-
-                            float lifeMean_treg = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
-                            float lifeSd_treg   = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFESPAN_SD");
-
-                            new_agent.setVariable<int>("life", sample_normal_life(lifeMean_treg, lifeSd_treg));
-
-                            new_agent.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL"));
-                            new_agent.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT"));
-
-                            new_agent.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
-
-                            new_agent.setVariable<float>("CTLA4", FLAMEGPU->environment.getProperty<float>("PARAM_CTLA4_TREG"));
-
-                            new_agent.setVariable<int>("tumble", 1);
-
-                            treg_recruited++;
-                            placed = true;
-                        }
-                    }
-                }
-            }
+        else if (r.cell_type == CELL_TYPE_TREG) {
+            auto a = treg_api.newAgent();
+            a.setVariable<int>("x", r.x);
+            a.setVariable<int>("y", r.y);
+            a.setVariable<int>("z", r.z);
+            a.setVariable<int>("cell_state", r.cell_state);
+            a.setVariable<int>("life", r.life);
+            a.setVariable<int>("divide_cd", r.divide_cd);
+            a.setVariable<int>("divide_limit", r.divide_limit);
+            a.setVariable<float>("TGFB_release_remain", r.TGFB_release_remain);
+            a.setVariable<float>("CTLA4", r.CTLA4);
+            a.setVariable<int>("tumble", 1);
+            if (r.cell_state == TCD4_TREG) treg_recruited++;
+            else th_recruited++;
         }
-        // Try to recruit TH
-        if (FLAMEGPU->random.uniform<float>() < p_recruit_th) {
-            bool placed = false;
-            for (int dz = -1; dz <= 1 && !placed; dz++) {
-                for (int dy = -1; dy <= 1 && !placed; dy++) {
-                    for (int dx = -1; dx <= 1 && !placed; dx++) {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-
-                        int nx_new = x + dx;
-                        int ny_new = y + dy;
-                        int nz_new = z + dz;
-
-                        if (nx_new >= 0 && nx_new < nx &&
-                            ny_new >= 0 && ny_new < ny &&
-                            nz_new >= 0 && nz_new < nz) {
-
-                            auto new_agent_th = treg_api.newAgent();
-                            new_agent_th.setVariable<int>("x", nx_new);
-                            new_agent_th.setVariable<int>("y", ny_new);
-                            new_agent_th.setVariable<int>("z", nz_new);
-                            new_agent_th.setVariable<int>("cell_state", TCD4_TH);
-
-                            float lifeMean_th = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFE_MEAN_SLICE");
-                            float lifeSd_th   = FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_LIFESPAN_SD");
-
-                            new_agent_th.setVariable<int>("life", sample_normal_life(lifeMean_th, lifeSd_th));
-
-                            new_agent_th.setVariable<int>("divide_cd", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_INTERNAL"));
-                            new_agent_th.setVariable<int>("divide_limit", FLAMEGPU->environment.getProperty<int>("PARAM_TCD4_DIV_LIMIT"));
-
-                            new_agent_th.setVariable<float>("TGFB_release_remain", FLAMEGPU->environment.getProperty<float>("PARAM_TCD4_TGFB_RELEASE_TIME"));
-
-                            new_agent_th.setVariable<float>("CTLA4", 0.0f);
-
-                            new_agent_th.setVariable<int>("tumble", 1);
-
-                            th_recruited++;
-                            placed = true;
-                        }
-                    }
-                }
-            }
+        else if (r.cell_type == CELL_TYPE_MDSC) {
+            auto a = mdsc_api.newAgent();
+            a.setVariable<int>("x", r.x);
+            a.setVariable<int>("y", r.y);
+            a.setVariable<int>("z", r.z);
+            a.setVariable<int>("life", r.life);
+            a.setVariable<int>("tumble", 1);
+            mdsc_recruited++;
+        }
+        else if (r.cell_type == CELL_TYPE_MAC) {
+            auto a = mac_api.newAgent();
+            a.setVariable<int>("x", r.x);
+            a.setVariable<int>("y", r.y);
+            a.setVariable<int>("z", r.z);
+            a.setVariable<int>("cell_state", r.cell_state);
+            a.setVariable<int>("life", r.life);
+            a.setVariable<int>("tumble", 1);
+            mac_recruited++;
         }
     }
 
-    // Stash stats in global for main.cu to read after step()
-    g_recruit_stats.teff_rec  = teff_recruited;
-    g_recruit_stats.treg_rec  = treg_recruited;
-    g_recruit_stats.th_rec    = th_recruited;
-    g_recruit_stats.p_teff    = p_recruit_teff;
-    g_recruit_stats.p_treg    = p_recruit_treg;
-    g_recruit_stats.p_th      = p_recruit_th;
-    g_recruit_stats.t_sources = total_t_sources;
-    g_recruit_stats.qsp_teff  = FLAMEGPU->environment.getProperty<float>("qsp_teff_central");
-    g_recruit_stats.qsp_treg  = FLAMEGPU->environment.getProperty<float>("qsp_treg_central");
-    g_recruit_stats.qsp_th    = FLAMEGPU->environment.getProperty<float>("qsp_th_central");
+    // Update stats
+    g_recruit_stats.teff_rec = teff_recruited;
+    g_recruit_stats.treg_rec = treg_recruited;
+    g_recruit_stats.th_rec   = th_recruited;
+    g_recruit_stats.mdsc_rec = mdsc_recruited;
+    g_recruit_stats.mac_rec  = mac_recruited;
 
-    // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
+    // Update MacroProperty event counters
     auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
     counters[ABM_COUNT_TEFF_REC] += teff_recruited;
-    counters[ABM_COUNT_TH_REC] += th_recruited;
+    counters[ABM_COUNT_TH_REC]   += th_recruited;
     counters[ABM_COUNT_TREG_REC] += treg_recruited;
+    counters[ABM_COUNT_MDSC_REC] += mdsc_recruited;
+    counters[ABM_COUNT_MAC_REC]  += mac_recruited;
 
-    // Track events: T cell recruitment (CD8 effector) and TREG recruitment
+    // Track events: T cell recruitment for QSP bookkeeping
     uint64_t tcell_recruit_ptr = FLAMEGPU->environment.getProperty<uint64_t>("event_tcell_recruit_ptr");
     if (tcell_recruit_ptr != 0 && teff_recruited > 0) {
         unsigned int host_val;
@@ -629,8 +971,6 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
         host_val += teff_recruited;
         cudaMemcpy(reinterpret_cast<unsigned int*>(tcell_recruit_ptr), &host_val, sizeof(unsigned int), cudaMemcpyHostToDevice);
     }
-
-    // Track TREG recruitment (TREGs are recruited as TH cells, so count as TH recruitment)
     uint64_t th_recruit_ptr = FLAMEGPU->environment.getProperty<uint64_t>("event_th_recruit_ptr");
     if (th_recruit_ptr != 0 && treg_recruited > 0) {
         unsigned int host_val;
@@ -638,81 +978,7 @@ FLAMEGPU_HOST_FUNCTION(recruit_t_cells) {
         host_val += treg_recruited;
         cudaMemcpy(reinterpret_cast<unsigned int*>(th_recruit_ptr), &host_val, sizeof(unsigned int), cudaMemcpyHostToDevice);
     }
-    nvtxRangePop();
-}
 
-// Recruit MDSCs at marked MDSC source voxels
-FLAMEGPU_HOST_FUNCTION(recruit_mdscs) {
-    nvtxRangePush("Recruit MDSCs");
-    if (!g_pde_solver) { nvtxRangePop(); return; }
-
-    const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
-    const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    const int nz = FLAMEGPU->environment.getProperty<int>("grid_size_z");
-
-    // Calculate recruitment probability: p = min(concentration * k_recruit, 1.0)
-    float p_recruit_mdsc = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_RECRUIT_K");
-
-    int total_voxels = nx * ny * nz;
-    std::vector<int> h_sources(total_voxels);
-    int* d_sources = g_pde_solver->get_device_recruitment_sources_ptr();
-    cudaMemcpy(h_sources.data(), d_sources, total_voxels * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Get agent API for creating new agents
-    auto mdsc_api = FLAMEGPU->agent(AGENT_MDSC);
-    int mdsc_recruited = 0;
-
-    // Scan for MDSC source voxels (bit 1 set)
-    for (int idx = 0; idx < total_voxels; idx++) {
-        if ((h_sources[idx] & 2) == 0) continue;  // Not an MDSC source
-
-        if (FLAMEGPU->random.uniform<float>() < p_recruit_mdsc) {
-            int z = idx / (nx * ny);
-            int y = (idx % (nx * ny)) / nx;
-            int x = idx % nx;
-
-            // Find empty neighbor voxel
-            bool placed = false;
-            for (int dz = -1; dz <= 1 && !placed; dz++) {
-                for (int dy = -1; dy <= 1 && !placed; dy++) {
-                    for (int dx = -1; dx <= 1 && !placed; dx++) {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-
-                        int nx_new = x + dx;
-                        int ny_new = y + dy;
-                        int nz_new = z + dz;
-
-                        if (nx_new >= 0 && nx_new < nx &&
-                            ny_new >= 0 && ny_new < ny &&
-                            nz_new >= 0 && nz_new < nz) {
-
-                            auto new_agent = mdsc_api.newAgent();
-                            new_agent.setVariable<int>("x", nx_new);
-                            new_agent.setVariable<int>("y", ny_new);
-                            new_agent.setVariable<int>("z", nz_new);
-
-                            double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_MDSC_LIFE_MEAN_SLICE");
-                            float rnd = static_cast<float>(rand()) / RAND_MAX;
-                            int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
-                            if (life < 1) life = 1;
-
-                            new_agent.setVariable<int>("life", life);
-                            new_agent.setVariable<int>("tumble", 1);
-
-                            mdsc_recruited++;
-                            placed = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    g_recruit_stats.mdsc_rec = mdsc_recruited;
-
-    // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
-    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
-    counters[ABM_COUNT_MDSC_REC] += mdsc_recruited;
     nvtxRangePop();
 }
 
@@ -744,91 +1010,6 @@ FLAMEGPU_HOST_FUNCTION(mark_mac_sources) {
     nvtxRangePop();
 }
 
-// Recruit macrophages at marked macrophage source voxels
-FLAMEGPU_HOST_FUNCTION(recruit_macrophages) {
-    nvtxRangePush("Recruit MACs");
-    if (!g_pde_solver) { nvtxRangePop(); return; }
-
-    const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
-    const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    const int nz = FLAMEGPU->environment.getProperty<int>("grid_size_z");
-
-    // Calculate recruitment probability
-    float p_recruit_mac = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_RECRUIT_K");
-
-    int total_voxels = nx * ny * nz;
-    std::vector<int> h_sources(total_voxels);
-    int* d_sources = g_pde_solver->get_device_recruitment_sources_ptr();
-    cudaMemcpy(h_sources.data(), d_sources, total_voxels * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Get agent API for creating new agents
-    auto mac_api = FLAMEGPU->agent(AGENT_MACROPHAGE);
-    int mac_recruited = 0;
-
-    // Scan for macrophage source voxels (bit 2 set)
-    for (int idx = 0; idx < total_voxels; idx++) {
-        if ((h_sources[idx] & 4) == 0) continue;  // Not a macrophage source
-
-        if (FLAMEGPU->random.uniform<float>() < p_recruit_mac) {
-            int z = idx / (nx * ny);
-            int y = (idx % (nx * ny)) / nx;
-            int x = idx % nx;
-
-            // Find empty neighbor voxel
-            bool placed = false;
-            for (int dz = -1; dz <= 1 && !placed; dz++) {
-                for (int dy = -1; dy <= 1 && !placed; dy++) {
-                    for (int dx = -1; dx <= 1 && !placed; dx++) {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-
-                        int nx_new = x + dx;
-                        int ny_new = y + dy;
-                        int nz_new = z + dz;
-
-                        if (nx_new >= 0 && nx_new < nx &&
-                            ny_new >= 0 && ny_new < ny &&
-                            nz_new >= 0 && nz_new < nz) {
-
-                            auto new_agent = mac_api.newAgent();
-                            new_agent.setVariable<int>("x", nx_new);
-                            new_agent.setVariable<int>("y", ny_new);
-                            new_agent.setVariable<int>("z", nz_new);
-
-                            // Recruit as M1 state
-                            int cell_state = MAC_M1;
-
-                            // 30% chance to become M2
-                            if (FLAMEGPU->random.uniform<float>() < 0.3f) {
-                                cell_state = MAC_M2;
-                            }
-                            new_agent.setVariable<int>("cell_state", cell_state);
-
-                            // Set lifespan
-                            double lifeMean = FLAMEGPU->environment.getProperty<float>("PARAM_MAC_LIFE_MEAN");
-                            float rnd = static_cast<float>(rand()) / RAND_MAX;
-                            int life = static_cast<int>(lifeMean * std::log(1.0f / (rnd + 0.0001f)) + 0.5f);
-                            if (life < 1) life = 1;
-
-                            new_agent.setVariable<int>("life", life);
-                            new_agent.setVariable<int>("tumble", 1);
-
-                            mac_recruited++;
-                            placed = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    g_recruit_stats.mac_rec = mac_recruited;
-
-    // Update MacroProperty counters (will be copied to environment by copy_abm_counters_to_environment)
-    auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
-    counters[ABM_COUNT_MAC_REC] += mac_recruited;
-    nvtxRangePop();
-}
-
 // ============================================================================
 // Occupancy Grid: Zero the grid at the start of each step's division phase
 // ============================================================================
@@ -838,10 +1019,14 @@ FLAMEGPU_HOST_FUNCTION(zero_occupancy_grid) {
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
     occ.zero();
 
-    // Also reset the flat cancer occupancy array used by recruitment kernels
-    if (d_cancer_occ && g_pde_solver) {
+    // Also reset the flat cancer occupancy, vascular tip_id, and recruitment occ arrays
+    if (g_pde_solver) {
         int total_voxels = g_pde_solver->get_total_voxels();
-        cudaMemset(d_cancer_occ, 0, total_voxels * sizeof(unsigned int));
+        if (d_cancer_occ)      cudaMemset(d_cancer_occ,      0, total_voxels * sizeof(unsigned int));
+        if (d_vas_tip_id_grid) cudaMemset(d_vas_tip_id_grid, 0, total_voxels * sizeof(unsigned int));
+        if (d_occ_total)       cudaMemset(d_occ_total,       0, total_voxels * sizeof(unsigned int));
+        if (d_mac_occ)         cudaMemset(d_mac_occ,         0, total_voxels * sizeof(unsigned int));
+        if (d_mdsc_occ)        cudaMemset(d_mdsc_occ,        0, total_voxels * sizeof(unsigned int));
     }
     nvtxRangePop();
 }
@@ -876,17 +1061,24 @@ FLAMEGPU_HOST_FUNCTION(update_ecm_grid) {
     float ecm_baseline   = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_BASELINE");
     float ecm_saturation = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_SATURATION");
     float release_rate   = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_ECM_RELEASE_CAF");
-    float dt_sec         = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
-    float dt             = dt_sec / 86400.0f;  // seconds → days
+    float tgfb_ec50      = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
+    float dt             = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
+    // dt is in seconds; PARAM_FIB_ECM_DECAY_RATE is in [1/s] (QSP param converted by 1/86400)
+    // HCC formula: exp(-SEC_PER_TIME_SLICE [s] * k_ECM_deg [1/s])  →  exp(-dt * decay_rate)
     float voxel_vol_cm3  = voxel_size_cm * voxel_size_cm * voxel_size_cm;
+
+    // TGFB concentration pointer — read directly from PDE solver to avoid FLAMEGPU type issues
+    // (pde_concentration_ptr_* properties are stored as unsigned long long, not uint64_t)
+    const float* tgfb_ptr = g_pde_solver->get_device_concentration_ptr(CHEM_TGFB);
 
     dim3 block(8, 8, 8);
     dim3 grid((grid_x + 7) / 8, (grid_y + 7) / 8, (grid_z + 7) / 8);
     update_ecm_grid_kernel<<<grid, block>>>(
-        d_ecm_grid, d_fib_density_field,
+        d_ecm_grid, d_fib_density_field, tgfb_ptr,
         grid_x, grid_y, grid_z,
         voxel_vol_cm3, decay_rate, dt,
-        ecm_baseline, ecm_saturation, release_rate);
+        ecm_baseline, ecm_saturation, release_rate,
+        tgfb_ec50);
     cudaDeviceSynchronize();
 
     nvtxRangePop();
@@ -1270,6 +1462,18 @@ FLAMEGPU_HOST_FUNCTION(timing_after_division) {
     nvtxRangePush("Timing Checkpoint: division");
     record_checkpoint("division");
     nvtxRangePop();
+}
+
+// ── Wave-interleaved division control ──────────────────────────────────────
+// reset_divide_wave: called before the first wave each step (sets wave index to 0)
+FLAMEGPU_HOST_FUNCTION(reset_divide_wave) {
+    FLAMEGPU->environment.setProperty<int>("divide_current_wave", 0);
+}
+
+// increment_divide_wave: called after each wave's agent layers to advance to next wave
+FLAMEGPU_HOST_FUNCTION(increment_divide_wave) {
+    int w = FLAMEGPU->environment.getProperty<int>("divide_current_wave");
+    FLAMEGPU->environment.setProperty<int>("divide_current_wave", w + 1);
 }
 
 } // namespace PDAC

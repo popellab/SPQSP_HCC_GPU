@@ -61,6 +61,7 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
     cancer_cell.newVariable<int>("divideFlag", 1);
     cancer_cell.newVariable<int>("divideCountRemaining", 0);
     cancer_cell.newVariable<unsigned int>("stemID", 0);
+    cancer_cell.newVariable<int>("divide_wave", 0);   // Wave assignment for interleaved division
 
     // Molecular state (affects behavior)
     cancer_cell.newVariable<float>("PDL1_syn", 0.0f);
@@ -139,6 +140,7 @@ void defineTCellAgent(flamegpu::ModelDescription& model, bool include_state_divi
     tcell.newVariable<int>("divide_flag", 0);
     tcell.newVariable<int>("divide_cd", 0);
     tcell.newVariable<int>("divide_limit", 0);
+    tcell.newVariable<int>("divide_wave", 0);   // Wave assignment for interleaved division
 
     // Movement state for run-tumble chemotaxis
     tcell.newVariable<float>("move_direction_x", 0.0f);
@@ -231,6 +233,7 @@ void defineTRegAgent(flamegpu::ModelDescription& model, bool include_state_divid
     treg.newVariable<int>("divide_flag", 0);
     treg.newVariable<int>("divide_cd", 0);
     treg.newVariable<int>("divide_limit", 0);
+    treg.newVariable<int>("divide_wave", 0);   // Wave assignment for interleaved division
 
     // Movement state for run-tumble chemotaxis
     treg.newVariable<float>("move_direction_x", 0.0f);
@@ -513,8 +516,7 @@ void defineVascularCellAgent(flamegpu::ModelDescription& model) {
     agent.newFunction("mark_t_sources", vascular_mark_t_sources);
 
     // State transitions and division
-    agent.newFunction("state_step", vascular_state_step)
-        .setMessageInput(MSG_CELL_LOCATION);
+    agent.newFunction("state_step", vascular_state_step);
 
     // Single-phase divide using occupancy grid
     {
@@ -648,6 +650,9 @@ void defineEnvironment(flamegpu::ModelDescription& model,
 
     // Vasculature count (updated each step by update_vasculature_count host function)
     env.newProperty<int>("n_vasculature_total", 1);
+
+    // Wave-interleaved division: current wave index (0..N_DIVIDE_WAVES-1), managed by host fns
+    env.newProperty<int>("divide_current_wave", 0);
 
     // Occupancy grid: stores per-voxel cell counts indexed by AgentType enum value.
     // Dimensions are compile-time constants; only [0..grid_size-1] are used at runtime.

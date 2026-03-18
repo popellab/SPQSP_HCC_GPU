@@ -117,14 +117,18 @@ static void collect_pde_to_buf(std::vector<float>& buf, int grid_x, int grid_y, 
 // ============================================================================
 static std::vector<float>   g_pde_bufs[2];
 static std::vector<int32_t> g_abm_bufs[2];
+static std::vector<float>   g_ecm_bufs[2];
 static std::thread g_pde_io_thread;
 static std::thread g_abm_io_thread;
+static std::thread g_ecm_io_thread;
 static int g_pde_buf_idx = 0;
 static int g_abm_buf_idx = 0;
+static int g_ecm_buf_idx = 0;
 
 static void flush_async_io() {
     if (g_pde_io_thread.joinable()) g_pde_io_thread.join();
     if (g_abm_io_thread.joinable()) g_abm_io_thread.join();
+    if (g_ecm_io_thread.joinable()) g_ecm_io_thread.join();
 }
 
 // Called manually from main() after presim completes — captures true day-0 PDE state.
@@ -168,6 +172,92 @@ FLAMEGPU_STEP_FUNCTION(exportPDEData) {
         write_pde_npy_buf(path.c_str(), grid_x, grid_y, grid_z, g_pde_bufs[bi]);
     });
     g_pde_buf_idx = 1 - bi;
+}
+
+// ============================================================================
+// NPY Writer for ECM (stroma) Output
+// Writes ECM density and fibroblast density field as a single NPY file.
+// Shape: (2, grid_z, grid_y, grid_x), dtype float32, C-order.
+//   channel 0: ECM_density  (d_ecm_grid)
+//   channel 1: Fib_field    (d_fib_density_field)
+// Python: arr = np.load("ecm_step_000001.npy")  → shape (2, nz, ny, nx)
+// ============================================================================
+static void write_ecm_npy_buf(const char* path, int grid_x, int grid_y, int grid_z,
+                               const std::vector<float>& buf) {
+    char header_str[256];
+    int header_len = snprintf(header_str, sizeof(header_str),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (2, %d, %d, %d), }",
+        grid_z, grid_y, grid_x);
+
+    const int prefix_size = 10;
+    int padded_header_len = header_len + 1;
+    int block = ((prefix_size + padded_header_len + 63) / 64) * 64;
+    int pad_spaces = block - prefix_size - padded_header_len;
+
+    FILE* fp = fopen(path, "wb");
+    if (!fp) {
+        std::cerr << "[WARN] Could not open ECM NPY file for write: " << path << std::endl;
+        return;
+    }
+    const unsigned char magic[8] = {0x93, 'N', 'U', 'M', 'P', 'Y', 0x01, 0x00};
+    fwrite(magic, 1, 8, fp);
+    uint16_t hdr_total = static_cast<uint16_t>(padded_header_len + pad_spaces);
+    fwrite(&hdr_total, sizeof(uint16_t), 1, fp);
+    fwrite(header_str, 1, header_len, fp);
+    for (int i = 0; i < pad_spaces; i++) fputc(' ', fp);
+    fputc('\n', fp);
+    fwrite(buf.data(), sizeof(float), buf.size(), fp);
+    fclose(fp);
+}
+
+// Collect ECM + fib density from device into a host buffer.
+// buf layout: [ecm_grid (total_voxels floats), fib_field (total_voxels floats)]
+static void collect_ecm_to_buf(std::vector<float>& buf, int grid_x, int grid_y, int grid_z) {
+    const int total_voxels = grid_x * grid_y * grid_z;
+    buf.resize(static_cast<size_t>(2) * total_voxels);
+    float* d_ecm = PDAC::get_ecm_grid_device_ptr();
+    float* d_fib = PDAC::get_fib_density_field_device_ptr();
+    if (d_ecm) cudaMemcpy(buf.data(),                  d_ecm, total_voxels * sizeof(float), cudaMemcpyDeviceToHost);
+    if (d_fib) cudaMemcpy(buf.data() + total_voxels,   d_fib, total_voxels * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+void exportECMData_step0(int grid_x, int grid_y, int grid_z) {
+    try { std::filesystem::create_directories("outputs/ecm"); } catch (...) {}
+    if (g_ecm_io_thread.joinable()) g_ecm_io_thread.join();
+    int bi = g_ecm_buf_idx;
+    collect_ecm_to_buf(g_ecm_bufs[bi], grid_x, grid_y, grid_z);
+    std::string path = "outputs/ecm/ecm_step_000000.npy";
+    g_ecm_io_thread = std::thread([bi, path, grid_x, grid_y, grid_z]() {
+        write_ecm_npy_buf(path.c_str(), grid_x, grid_y, grid_z, g_ecm_bufs[bi]);
+    });
+    g_ecm_buf_idx = 1 - bi;
+}
+
+FLAMEGPU_STEP_FUNCTION(exportECMData) {
+    if (PDAC::is_presim_mode_active()) return;
+
+    const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
+    const int interval = FLAMEGPU->environment.getProperty<int>("interval_out");
+    if (main_step % interval != 0) return;
+
+    try { std::filesystem::create_directories("outputs/ecm"); } catch (...) {}
+
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    if (g_ecm_io_thread.joinable()) g_ecm_io_thread.join();
+    int bi = g_ecm_buf_idx;
+    collect_ecm_to_buf(g_ecm_bufs[bi], grid_x, grid_y, grid_z);
+
+    char path_buf[256];
+    snprintf(path_buf, sizeof(path_buf), "outputs/ecm/ecm_step_%06d.npy",
+             static_cast<int>(main_step + 1));
+    std::string path = path_buf;
+    g_ecm_io_thread = std::thread([bi, path, grid_x, grid_y, grid_z]() {
+        write_ecm_npy_buf(path.c_str(), grid_x, grid_y, grid_z, g_ecm_bufs[bi]);
+    });
+    g_ecm_buf_idx = 1 - bi;
 }
 
 // ============================================================================
@@ -370,6 +460,27 @@ void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescripti
     g_abm_buf_idx = 1 - bi;
 }
 
+// Diagnostic: dump cancer cell initial distributions to CSV for comparison with HCC.
+// Writes: cell_state, divideCD, divideCountRemaining, life (senescent cells only)
+static void write_cancer_init_diagnostic(flamegpu::CUDASimulation& sim,
+                                          flamegpu::ModelDescription& model) {
+    flamegpu::AgentVector p(model.Agent(PDAC::AGENT_CANCER_CELL));
+    sim.getPopulationData(p);
+
+    FILE* fp = fopen("outputs/abm/cancer_init_diagnostic.csv", "w");
+    if (!fp) { std::cerr << "[WARN] Cannot open cancer_init_diagnostic.csv\n"; return; }
+    fprintf(fp, "cell_state,divideCD,divideCountRemaining,life\n");
+    for (unsigned i = 0; i < p.size(); ++i) {
+        const int state = p[i].getVariable<int>("cell_state");
+        const int dcd   = p[i].getVariable<int>("divideCD");
+        const int dcr   = p[i].getVariable<int>("divideCountRemaining");
+        const int life  = p[i].getVariable<int>("life");
+        fprintf(fp, "%d,%d,%d,%d\n", state, dcd, dcr, life);
+    }
+    fclose(fp);
+    std::cout << "[DIAG] Wrote cancer_init_diagnostic.csv (" << p.size() << " cells)\n";
+}
+
 FLAMEGPU_STEP_FUNCTION(exportABMData) {
     if (PDAC::is_presim_mode_active()) return;
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
@@ -541,6 +652,7 @@ int main(int argc, const char** argv) {
     // ========== ADD STEP FUNCTIONS ==========
     if (config.pde_out) {
         model->addStepFunction(exportPDEData);
+        model->addStepFunction(exportECMData);
     }
     if (config.abm_out) {
         model->addStepFunction(exportABMData);
@@ -655,7 +767,9 @@ int main(int argc, const char** argv) {
 
     // ========== EXPORT DAY-0 STATE (after presim, before first treatment step) ==========
     if (config.pde_out) exportPDEData_step0(config.grid_x, config.grid_y, config.grid_z);
+    if (config.pde_out) exportECMData_step0(config.grid_x, config.grid_y, config.grid_z);
     if (config.abm_out) exportABMData_step0(simulation, *model);
+    write_cancer_init_diagnostic(simulation, *model);
     PDAC::exportQSPData_step0();
 
     // ========== RUN SIMULATION ==========

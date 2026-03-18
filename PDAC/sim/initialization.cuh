@@ -143,7 +143,9 @@ void initializeVascularCellsRandom(
     flamegpu::AgentVector& vascular_agents,
     int grid_x, int grid_y, int grid_z,
     int tumor_radius,
-    int num_segments);
+    int num_segments,
+    float branch_prob,
+    unsigned int seed);
 
 // Initialize Vascular Cells with manual test pattern
 void initializeVascularCellsTest(

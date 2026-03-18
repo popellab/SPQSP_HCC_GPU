@@ -83,11 +83,26 @@ constexpr int MAX_T_PER_VOXEL = 8;              // Max T cells in empty voxel
 constexpr int MAX_T_PER_VOXEL_WITH_CANCER = 1;  // Max T cells when cancer present
 constexpr int MAX_CANCER_PER_VOXEL = 1;         // Max cancer cells per voxel
 constexpr int MAX_MDSC_PER_VOXEL = 1;           // Max MDSC per voxel (exclusive)
+constexpr int N_DIVIDE_WAVES = 1;               // Wave-interleaved division rounds (cancer/tcell/treg)
 constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exclusive)
 constexpr int MAX_FIB_SLOTS      = 12000;       // Total slot capacity for chain MacroProperties (init + expansion)
 constexpr int MAX_FIB_INIT_SLOTS = 4347;        // Temporary: match HCC initial fibroblast count (~4933 at step 1)
 constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max cells per fibroblast chain (HEAD + N-1 followers); grows via division
 constexpr int ABM_EVENT_COUNTER_SIZE = 9;      // Array size for ABM→QSP event counters (deaths + recruitment)
+constexpr int MAX_RECRUITS_PER_STEP = 4096;    // Max recruitment requests per ABM step (GPU buffer size)
+
+// GPU recruitment request: filled by recruit_all_kernel, consumed by place_recruited_agents host fn.
+struct RecruitRequest {
+    int x, y, z;            // Placement voxel coordinates
+    int cell_type;          // CELL_TYPE_T, CELL_TYPE_TREG, CELL_TYPE_MAC, CELL_TYPE_MDSC
+    int cell_state;         // Sub-state within type (e.g., T_CELL_EFF, TCD4_TREG, MAC_M1)
+    int life;               // Pre-sampled lifespan (normal or exponential)
+    int divide_cd;          // Division cooldown (T/TReg only)
+    int divide_limit;       // Max divisions (T/TReg only)
+    float IL2_release_remain;   // T cells only
+    float TGFB_release_remain;  // TReg/TH only
+    float CTLA4;                // TReg only
+};
 
 // Action types for intent messages
 enum IntentAction : int {

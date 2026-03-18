@@ -173,6 +173,18 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_write_to_occ_grid, flamegpu::MessageNone, flamegpu:
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
     occ[x][y][z][CELL_TYPE_MDSC].exchange(1u);  // Exclusive (MAX_MDSC_PER_VOXEL = 1)
+
+    // Flat arrays for GPU recruitment kernel
+    const int gx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int gy = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int vidx = z * (gx * gy) + y * gx + x;
+    unsigned int* occ_total = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
+    atomicAdd(&occ_total[vidx], 1u);
+    unsigned int* mdsc_occ = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("mdsc_occ_ptr"));
+    atomicAdd(&mdsc_occ[vidx], 1u);
+
     return flamegpu::ALIVE;
 }
 

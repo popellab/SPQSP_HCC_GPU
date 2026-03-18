@@ -17,7 +17,7 @@ extern double g_last_pde_ms;
 // Accessor for last PDE solve time (milliseconds)
 double get_last_pde_ms();
 
-// Per-step recruitment stats — populated by recruit_t_cells / recruit_mdscs / recruit_macrophages
+// Per-step recruitment stats — populated by recruit_gpu / place_recruited_agents
 struct RecruitStats {
     int teff_rec = 0, treg_rec = 0, th_rec = 0;
     int mdsc_rec = 0, mac_rec = 0;
@@ -44,6 +44,17 @@ void initialize_pde_solver(int grid_x, int grid_y, int grid_z,
 // Set PDE solver pointers in FLAME GPU environment properties
 void set_pde_pointers_in_environment(flamegpu::ModelDescription& model);
 
+// Initialize ECM grid to saturation value (call after QSP is initialized, before simulation)
+// Matches HCC behavior: all voxels start at ECM_saturation, not 0/baseline.
+void initialize_ecm_to_saturation(float ecm_saturation);
+
+// Return device pointers for ECM and fibroblast density field (for output)
+float* get_ecm_grid_device_ptr();
+float* get_fib_density_field_device_ptr();
+
+// Return device pointer for vascular tip_id grid (for output/debug)
+unsigned int* get_vas_tip_id_grid_device_ptr();
+
 // Cleanup PDE solver (call at end)
 void cleanup_pde_solver();
 
@@ -53,10 +64,9 @@ void cleanup_pde_solver();
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER mark_mdsc_sources;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER mark_mac_sources;
 
-// Recruit new immune cells at marked sources
-extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_t_cells;
-extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_mdscs;
-extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_macrophages;
+// GPU recruitment: kernel decides placement, host fn creates agents
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER recruit_gpu;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER place_recruited_agents;
 
 // Reset recruitment sources (call at start of each step)
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_recruitment_sources;
@@ -82,6 +92,8 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER timing_after_gradients;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER timing_after_ecm;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER timing_after_movement;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER timing_after_division;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_divide_wave;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER increment_divide_wave;
 
 } // namespace PDAC
 

@@ -154,9 +154,15 @@ FLAMEGPU_AGENT_FUNCTION(cancer_write_to_occ_grid, flamegpu::MessageNone, flamegp
     // Also write to flat cancer occupancy array used by recruitment density checks.
     const int gx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int gy = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int vidx = z * (gx * gy) + y * gx + x;
     unsigned int* cancer_occ = reinterpret_cast<unsigned int*>(
         FLAMEGPU->environment.getProperty<uint64_t>("cancer_occ_ptr"));
-    atomicOr(&cancer_occ[z * (gx * gy) + y * gx + x], 1u);
+    atomicOr(&cancer_occ[vidx], 1u);
+
+    // Increment total occupancy counter (used by GPU recruitment kernel)
+    unsigned int* occ_total = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
+    atomicAdd(&occ_total[vidx], 1u);
 
     return flamegpu::ALIVE;
 }
@@ -172,6 +178,11 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
 
     if (FLAMEGPU->getVariable<int>("dead") == 1 ||
         divideFlag == 0 || divideCD > 0 || cell_state == CANCER_SENESCENT) {
+        return flamegpu::ALIVE;
+    }
+    // Wave gate: only execute in the assigned wave round
+    if (FLAMEGPU->getVariable<int>("divide_wave") !=
+        FLAMEGPU->environment.getProperty<int>("divide_current_wave")) {
         return flamegpu::ALIVE;
     }
 
@@ -195,9 +206,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
         if (!is_in_bounds(nx, ny, nz, size_x, size_y, size_z)) continue;
         // Empty for cancer AND not occupied by MDSC (matching execute_divide logic)
         if (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u &&
-            occ[nx][ny][nz][CELL_TYPE_FIB] == 0u && 
-            occ[nx][ny][nz][CELL_TYPE_T] <= 1u &&
-            occ[nx][ny][nz][CELL_TYPE_TREG] <= 1u) {
+            occ[nx][ny][nz][CELL_TYPE_FIB] == 0u) {
             cand_x[n_cands] = nx;
             cand_y[n_cands] = ny;
             cand_z[n_cands] = nz;
@@ -254,7 +263,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 FLAMEGPU->agent_out.setVariable<int>("y", target_y);
                 FLAMEGPU->agent_out.setVariable<int>("z", target_z);
                 FLAMEGPU->agent_out.setVariable<int>("cell_state", CANCER_STEM);
-                FLAMEGPU->agent_out.setVariable<int>("divideCD", static_cast<int>((div_int/cabo_prolif_factor) + 0.5f));
+                FLAMEGPU->agent_out.setVariable<int>("divideCD", static_cast<int>(div_int + 0.5f));
                 FLAMEGPU->agent_out.setVariable<int>("divideFlag", 1);
                 FLAMEGPU->agent_out.setVariable<int>("divideCountRemaining", 0);
                 FLAMEGPU->agent_out.setVariable<unsigned int>("stemID", stem_id);
@@ -264,6 +273,12 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 (FLAMEGPU->environment.getProperty<float>("PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE")/cabo_prolif_factor) + 0.5f));
 
         } else if (cell_state == CANCER_PROGENITOR) {
+            // HCC: all progenitors start hypoxic (O2=0 at init) so no division on step 0.
+            // Replicate by blocking progenitor division on the first ABM step.
+            if (FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step") == 0) {
+                occ[target_x][target_y][target_z][CELL_TYPE_CANCER].CAS(1u, 0u); // release claimed voxel
+                return flamegpu::ALIVE;
+            }
             int divideCountRemaining = FLAMEGPU->getVariable<int>("divideCountRemaining");
             divideCountRemaining--;
             FLAMEGPU->setVariable<int>("divideCountRemaining", divideCountRemaining);
@@ -450,6 +465,17 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         FLAMEGPU->setVariable<int>("divideCD", divideCD);
     }
 
+    // === WAVE ASSIGNMENT ===
+    // Assign a random wave each step the cell is ready to divide so contention with
+    // tcell/treg is interleaved rather than cancer always winning first pick.
+    {
+        const int divideFlag = FLAMEGPU->getVariable<int>("divideFlag");
+        if (divideFlag == 1 && divideCD <= 0 && cell_state != CANCER_SENESCENT) {
+            const int w = static_cast<int>(FLAMEGPU->random.uniform<float>() * N_DIVIDE_WAVES);
+            FLAMEGPU->setVariable<int>("divide_wave", w < N_DIVIDE_WAVES ? w : N_DIVIDE_WAVES - 1);
+        }
+    }
+
     // === PROGENITOR EXHAUSTION → SENESCENCE ===
     if (cell_state == CANCER_PROGENITOR) {
         const int divideCountRemaining = FLAMEGPU->getVariable<int>("divideCountRemaining");
@@ -554,8 +580,12 @@ FLAMEGPU_AGENT_FUNCTION(cancer_reset_moves, flamegpu::MessageNone, flamegpu::Mes
 FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNone) {
     if (FLAMEGPU->getVariable<int>("dead") == 1) return flamegpu::ALIVE;
 
-    if (FLAMEGPU->getVariable<int>("moves_remaining") <= 0) return flamegpu::ALIVE;
+    int moves_remaining = FLAMEGPU->getVariable<int>("moves_remaining");
+    if (moves_remaining <= 0) return flamegpu::ALIVE;
 
+    // Always consume the move attempt (matches HCC loop behavior where each
+    // iteration counts regardless of ECM block or no-candidate outcome)
+    FLAMEGPU->setVariable<int>("moves_remaining", moves_remaining - 1);
 
     const int x = FLAMEGPU->getVariable<int>("x");
     const int y = FLAMEGPU->getVariable<int>("y");
@@ -589,9 +619,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNon
         int ny = y + ddy;
         int nz = z + ddz;
         if (nx < 0 || nx >= size_x || ny < 0 || ny >= size_y || nz < 0 || nz >= size_z) continue;
-        if (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u && occ[nx][ny][nz][CELL_TYPE_FIB] == 0u &&
-            occ[nx][ny][nz][CELL_TYPE_T] <= 1u &&
-            occ[nx][ny][nz][CELL_TYPE_TREG] <= 1u) {
+        if (occ[nx][ny][nz][CELL_TYPE_CANCER] == 0u && occ[nx][ny][nz][CELL_TYPE_FIB] == 0u) {
             cands[n_cands++] = i;
         }
     }
@@ -621,7 +649,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_move, flamegpu::MessageNone, flamegpu::MessageNon
             break;
         }
     }
-    FLAMEGPU->setVariable<int>("moves_remaining", FLAMEGPU->getVariable<int>("moves_remaining") - 1);
 
     return flamegpu::ALIVE;
 }

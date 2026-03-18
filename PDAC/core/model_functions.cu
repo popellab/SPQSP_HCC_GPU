@@ -2,6 +2,7 @@
 #include "../core/common.cuh"
 #include "../qsp/LymphCentral_wrapper.h"
 #include "../qsp/ode/QSP_enum.h"
+#include "../pde/pde_integration.cuh"
 #include <nvtx3/nvToolsExt.h>
 #define QP(x) CancerVCT::ODE_system::get_class_param(x)
 
@@ -240,6 +241,9 @@ void set_internal_params(flamegpu::ModelDescription& model, const PDAC::LymphCen
     env.newProperty<float>("PARAM_FIB_ECM_BASELINE", QP(CancerVCT::P_ECM_base) * 1e3);
     env.newProperty<float>("PARAM_FIB_ECM_SATURATION", QP(CancerVCT::P_ECM_max) * 1e3);
     env.newProperty<float>("PARAM_FIB_ECM_MOT_EC50", QP(CancerVCT::P_ECM_50_T_mot) * 5e3);
+    // Initialize ECM grid to saturation (matches HCC: all voxels start fully saturated,
+    // so cancer movement is strongly restricted from step 0, not only after fibroblasts deposit ECM).
+    PDAC::initialize_ecm_to_saturation(static_cast<float>(QP(CancerVCT::P_ECM_max) * 1e3));
     // mean lifespan of fibroblast in timesteps (use avg of fib and CAF death rates)
     env.newProperty<float>("PARAM_FIB_LIFE_MEAN",
                     1.0f / ((QP(CancerVCT::P_k_fib_death) + QP(CancerVCT::P_k_CAF_death)) / 2.0)

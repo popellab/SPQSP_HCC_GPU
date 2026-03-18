@@ -31,19 +31,39 @@ FLAMEGPU_AGENT_FUNCTION(vascular_broadcast_location, flamegpu::MessageNone, flam
 }
 
 // Occupancy Grid
-// Only STALK and PHALANX cells contribute — tip cells divide in place and
-// the tip-divide check is whether any stalk/phalanx is already present.
+// STALK and PHALANX cells write to occ_grid (used for voxelIsOpen checks).
+// TIP cells skip occ_grid but still write to vas_tip_id_grid so the
+// nearby-vessel exclusion check (PHALANX sprouting) sees ALL vascular types,
+// matching HCC's for_each_neighbor_ag which includes TIP/STALK/PHALANX.
 FLAMEGPU_AGENT_FUNCTION(vascular_write_to_occ_grid, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
-    if (cell_state == VAS_TIP) {
-        return flamegpu::ALIVE;
-    }
     const int x = FLAMEGPU->getVariable<int>("x");
     const int y = FLAMEGPU->getVariable<int>("y");
     const int z = FLAMEGPU->getVariable<int>("z");
-    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
-        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
-    occ[x][y][z][CELL_TYPE_VASCULAR] += 1u;
+
+    // Only stalk/phalanx count toward occupancy (TIP division checks this).
+    if (cell_state != VAS_TIP) {
+        auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+            OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+        occ[x][y][z][CELL_TYPE_VASCULAR] += 1u;
+    }
+
+    // ALL vascular types write to tip_id grid for nearby-vessel exclusion.
+    const int nx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int ny = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int vidx = z * ny * nx + y * nx + x;
+    unsigned int* vas_tip_id = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("vas_tip_id_grid_ptr"));
+    const unsigned int my_tip_id = FLAMEGPU->getVariable<unsigned int>("tip_id");
+    vas_tip_id[vidx] = my_tip_id;
+
+    // Flat total occupancy for GPU recruitment kernel (stalk/phalanx only, matching occ_grid)
+    if (cell_state != VAS_TIP) {
+        unsigned int* occ_total = reinterpret_cast<unsigned int*>(
+            FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
+        atomicAdd(&occ_total[vidx], 1u);
+    }
+
     return flamegpu::ALIVE;
 }
 
@@ -166,7 +186,7 @@ FLAMEGPU_AGENT_FUNCTION(vascular_mark_t_sources, flamegpu::MessageNone, flamegpu
 }
 
 // State transitions and division decisions for vascular cells
-FLAMEGPU_AGENT_FUNCTION(vascular_state_step, flamegpu::MessageSpatial3D, flamegpu::MessageNone) {
+FLAMEGPU_AGENT_FUNCTION(vascular_state_step, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
     const int x = FLAMEGPU->getVariable<int>("x");
     const int y = FLAMEGPU->getVariable<int>("y");
@@ -176,24 +196,16 @@ FLAMEGPU_AGENT_FUNCTION(vascular_state_step, flamegpu::MessageSpatial3D, flamegp
 
     int divide_action = INTENT_NONE;
 
-    // VAS_TIP: simple division if voxel is not too crowded
-    // Tip cells do not appear to care about crowding, just going to let them divide
-    // The division only happens if the current location has no other cells though since it leaves behind a phalanx
-    // This theoretically is accounted for during the divide.
+    // VAS_TIP: divide only if voxel is open for vascular type.
+    // HCC Vas.cpp:248: if (_compartment->voxelIsOpen(getCoord(), getType()))
+    // voxelIsOpen checks stalk+phalanx count < PARAM_VAS_MAX_PER_VOXEL (=1).
+    // occ_grid[CELL_TYPE_VASCULAR] only counts stalk/phalanx (TIP skipped in write_to_occ_grid).
     if (cell_state == VAS_TIP) {
-        // int vascular_neighbor_count = 0;
-        // for (const auto& msg : FLAMEGPU->message_in(
-        //     static_cast<float>(x) * voxel_size,
-        //     static_cast<float>(y) * voxel_size,
-        //     static_cast<float>(z) * voxel_size)) {
-        //     if (msg.getVariable<int>("agent_type") == CELL_TYPE_VASCULAR) {
-        //         vascular_neighbor_count++;
-        //     }
-        // }
-        // if (vascular_neighbor_count < 3) {
-        //     divide_action = 1;  // INTENT_DIVIDE_TIP
-        // }
-        divide_action = 1;
+        auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+            OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+        if (occ[x][y][z][CELL_TYPE_VASCULAR] == 0u) {
+            divide_action = 1;  // INTENT_DIVIDE_TIP
+        }
     }
     // VAS_STALK: no transitions
     else if (cell_state == VAS_STALK) {
@@ -208,32 +220,43 @@ FLAMEGPU_AGENT_FUNCTION(vascular_state_step, flamegpu::MessageSpatial3D, flamegp
         const float vas_50 = FLAMEGPU->environment.getProperty<float>("PARAM_VAS_50");
         const float p_tip = local_VEGFA / (vas_50 + local_VEGFA);
 
-        const int branch_flag = FLAMEGPU->getVariable<int>("branch");
-        if (branch_flag == 1) FLAMEGPU->setVariable<int>("branch", 0);
-
-        if (branch_flag == 1 || FLAMEGPU->random.uniform<float>() < p_tip) {
-            const int min_neighbor_range = static_cast<int>(
+        if (FLAMEGPU->random.uniform<float>() < p_tip) {
+            // Check for nearby vessels using the tip_id grid (written by write_to_occ_grid).
+            // Direct array reads: O(range^3) lookups, no message overhead, correct tip_id filtering.
+            const int range = static_cast<int>(
                 FLAMEGPU->environment.getProperty<float>("PARAM_VAS_MIN_NEIGHBOR"));
-            bool nearby_vessel_exists = false;
+            const int nx_g = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+            const int ny_g = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+            const int nz_g = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+            unsigned int* vas_tip_id = reinterpret_cast<unsigned int*>(
+                FLAMEGPU->environment.getProperty<uint64_t>("vas_tip_id_grid_ptr"));
 
-            for (int dx = -min_neighbor_range; dx <= min_neighbor_range && !nearby_vessel_exists; dx++) {
-                for (int dy = -min_neighbor_range; dy <= min_neighbor_range && !nearby_vessel_exists; dy++) {
-                    for (int dz = -min_neighbor_range; dz <= min_neighbor_range && !nearby_vessel_exists; dz++) {
+            bool nearby_vessel_exists = false;
+            // HCC Vas.cpp:279 uses `i < num_neighbors` (exclusive), so range is [-15, 14].
+            for (int dx = -range; dx < range && !nearby_vessel_exists; dx++) {
+                for (int dy = -range; dy < range && !nearby_vessel_exists; dy++) {
+                    for (int dz = -range; dz < range && !nearby_vessel_exists; dz++) {
                         if (dx == 0 && dy == 0 && dz == 0) continue;
-                        for (const auto& msg : FLAMEGPU->message_in(
-                            static_cast<float>(x+dx) * voxel_size,
-                            static_cast<float>(y+dy) * voxel_size,
-                            static_cast<float>(z+dz) * voxel_size)) {
-                            if (msg.getVariable<int>("agent_type") == CELL_TYPE_VASCULAR &&
-                                msg.getVariable<unsigned int>("tip_id") != my_tip_id) {
-                                nearby_vessel_exists = true;
-                                break;
-                            }
+                        const int cx = x + dx;
+                        const int cy = y + dy;
+                        const int cz = z + dz;
+                        if (cx < 0 || cx >= nx_g || cy < 0 || cy >= ny_g || cz < 0 || cz >= nz_g) continue;
+                        const unsigned int cell_tip_id = vas_tip_id[cz * ny_g * nx_g + cy * nx_g + cx];
+                        if (cell_tip_id != 0u && cell_tip_id != my_tip_id) {
+                            nearby_vessel_exists = true;
                         }
                     }
                 }
             }
             if (!nearby_vessel_exists) {
+                // Atomically mark this voxel with a unique sentinel so other PHALANX
+                // cells in the same kernel see it during their nearby-vessel check.
+                // In HCC, the new TIP is immediately visible (sequential processing);
+                // this atomic write + threadfence emulates that on the GPU.
+                const unsigned int sprout_marker =
+                    static_cast<unsigned int>(FLAMEGPU->getID()) + 1000000u;
+                atomicExch(&vas_tip_id[z * ny_g * nx_g + y * nx_g + x], sprout_marker);
+                __threadfence();
                 divide_action = 2;  // INTENT_SPROUT_PHALANX
             }
         }
