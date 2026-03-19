@@ -38,12 +38,7 @@ DEFAULT_ARGS="-s 50 -g 50 -oa 1 -op 1"
 # Adjust these to match your cluster's module names
 module purge
 module load modtree/gpu
-echo "=== Loading modules ==="
-module load cmake && echo "  cmake loaded" || echo "  cmake FAILED"
-module load gcc && echo "  gcc loaded ($(gcc --version | head -1))" || echo "  gcc FAILED"
-module load cuda/12.8.0 && echo "  cuda loaded" || echo "  cuda/12.8.0 FAILED"
-module load boost/1.86.0 && echo "  boost loaded" || echo "  boost FAILED"
-module list
+module load cmake gcc cuda/12.8.0
 
 echo "================================================"
 echo "PDAC Job: ${SLURM_JOB_ID}"

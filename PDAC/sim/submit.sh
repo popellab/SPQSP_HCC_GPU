@@ -36,9 +36,9 @@ DEFAULT_ARGS="-s 500 -g 50 -oa 1 -op 1"
 
 # --- Load modules ---
 # Adjust these to match your cluster's module names
-module purge 2>/dev/null
-module load modtree/gpu 2>/dev/null
-module load cmake gcc cuda/12.8.0 boost/1.86.0 2>/dev/null
+module purge
+module load modtree/gpu
+module load cmake gcc cuda/12.8.0
 
 echo "================================================"
 echo "PDAC Job: ${SLURM_JOB_ID}"
