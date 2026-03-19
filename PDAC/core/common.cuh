@@ -88,7 +88,7 @@ constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exc
 constexpr int MAX_FIB_SLOTS      = 12000;       // Total slot capacity for chain MacroProperties (init + expansion)
 constexpr int MAX_FIB_INIT_SLOTS = 4347;        // Temporary: match HCC initial fibroblast count (~4933 at step 1)
 constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max cells per fibroblast chain (HEAD + N-1 followers); grows via division
-constexpr int ABM_EVENT_COUNTER_SIZE = 9;      // Array size for ABM→QSP event counters (deaths + recruitment)
+constexpr int ABM_EVENT_COUNTER_SIZE = 15;     // Array size for ABM→QSP event counters (deaths + recruitment + diagnostics)
 constexpr int MAX_RECRUITS_PER_STEP = 4096;    // Max recruitment requests per ABM step (GPU buffer size)
 
 // GPU recruitment request: filled by recruit_all_kernel, consumed by place_recruited_agents host fn.
@@ -121,7 +121,14 @@ enum ABMEventCounterIndex : int {
     ABM_COUNT_TH_REC = 5,             // T helper cells recruited to tumor
     ABM_COUNT_TREG_REC = 6,           // T regulatory cells recruited to tumor
     ABM_COUNT_MDSC_REC = 7,           // MDSCs recruited to tumor
-    ABM_COUNT_MAC_REC = 8             // Macrophages recruited to tumor
+    ABM_COUNT_MAC_REC = 8,            // Macrophages recruited to tumor
+    // Diagnostic counters (Phase 1 debug instrumentation)
+    ABM_COUNT_CC_DIVIDE_ATTEMPT = 9,  // Cancer cells that entered division candidate search
+    ABM_COUNT_CC_DIVIDE_NO_SPACE = 10,// Cancer cells that found no open neighbor (n_cands==0)
+    ABM_COUNT_CC_SENESCENCE = 11,     // Progenitors that transitioned to senescent this step
+    ABM_COUNT_CC_T_KILL_EVAL = 12,    // Cancer cells evaluated for T kill (had T neighbors)
+    ABM_COUNT_CC_P_KILL_SUM_INT = 13, // Sum of p_kill * 10000 (integer encoding for atomicAdd)
+    ABM_COUNT_CC_MAC_KILL_EVAL = 14   // Cancer cells evaluated for MAC kill (had M1 neighbors)
 };
 
 // ============================================================

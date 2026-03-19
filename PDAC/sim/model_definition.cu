@@ -84,6 +84,7 @@ void defineCancerCellAgent(flamegpu::ModelDescription& model, bool include_state
     cancer_cell.newVariable<int>("life", 0);
     cancer_cell.newVariable<int>("dead", 0);
     cancer_cell.newVariable<int>("death_reason", -1);  // 0=senescence, 1=T cell kill, 2=MAC kill, -1=alive
+    cancer_cell.newVariable<int>("newborn", 0);  // 1 on first active step (compensating kill check)
 
     // Intent variables for two-phase conflict resolution
     cancer_cell.newVariable<int>("intent_action", INTENT_NONE);
@@ -686,6 +687,13 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     env.newProperty<uint64_t>("event_cancer_mac_kill_ptr", 0u);  // Cancer killed by macrophage
     env.newProperty<uint64_t>("event_cancer_nat_death_ptr", 0u); // Cancer natural (senescent) death
     env.newProperty<uint64_t>("event_cancer_divide_ptr", 0u);    // Cancer successful division
+    // Diagnostic event counters
+    env.newProperty<uint64_t>("event_cancer_divide_attempt_ptr", 0u);  // Division attempts
+    env.newProperty<uint64_t>("event_cancer_divide_no_space_ptr", 0u); // No open voxel
+    env.newProperty<uint64_t>("event_cancer_senescence_ptr", 0u);      // Senescence transitions
+    env.newProperty<uint64_t>("event_cancer_t_kill_eval_ptr", 0u);     // T kill evaluations
+    env.newProperty<uint64_t>("event_cancer_p_kill_sum_ptr", 0u);      // p_kill sum (×10000)
+    env.newProperty<uint64_t>("event_cancer_mac_kill_eval_ptr", 0u);   // MAC kill evaluations
 
     // Populate ALL other parameters from XML
     params.populateFlameGPUEnvironment(env);

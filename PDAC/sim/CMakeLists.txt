@@ -35,37 +35,114 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
 endif()
 
-# Find SUNDIALS (CVODE) - optional for QSP coupling
-# Manual path-based discovery (SUNDIALS doesn't have CMake config files)
-set(SUNDIALS_DIR "$ENV{HOME}/lib/sundials-4.0.1" CACHE PATH "SUNDIALS installation directory")
-if(EXISTS "${SUNDIALS_DIR}/lib" AND EXISTS "${SUNDIALS_DIR}/include")
-    set(SUNDIALS_FOUND TRUE)
-    set(SUNDIALS_INCLUDE_DIR "${SUNDIALS_DIR}/include")
-    set(SUNDIALS_LIBRARIES
-        "${SUNDIALS_DIR}/lib/libsundials_cvode.so"
-        "${SUNDIALS_DIR}/lib/libsundials_nvecserial.so"
-    )
-    message(STATUS "SUNDIALS found at ${SUNDIALS_DIR}")
-else()
-    set(SUNDIALS_FOUND FALSE)
-    message(STATUS "SUNDIALS not found at ${SUNDIALS_DIR}")
-endif()
-
-# Find BOOST for optional QSP features
-# Manual path-based discovery
-set(BOOST_ROOT "$ENV{HOME}/lib/boost_1_70_0" CACHE PATH "Boost installation directory")
-if(EXISTS "${BOOST_ROOT}/lib" AND EXISTS "${BOOST_ROOT}/include")
-    set(Boost_FOUND TRUE)
-    set(Boost_INCLUDE_DIR "${BOOST_ROOT}/include")
-    set(Boost_LIBRARIES "${BOOST_ROOT}/lib/libboost_serialization.so")
-    message(STATUS "Boost found at ${BOOST_ROOT}")
-else()
-    set(Boost_FOUND FALSE)
-    message(STATUS "Boost not found at ${BOOST_ROOT}")
-endif()
-
-# Find FLAMEGPU2 via FetchContent
+# ============================================================================
+# Dependencies — all auto-fetched if not found on system
+# ============================================================================
 include(FetchContent)
+
+# --- SUNDIALS (CVODE solver for QSP) ---
+# Try: (1) SUNDIALS_DIR env var, (2) find_package, (3) FetchContent
+set(SUNDIALS_DIR "" CACHE PATH "SUNDIALS installation (leave empty for auto-detect)")
+if(NOT SUNDIALS_DIR AND DEFINED ENV{SUNDIALS_DIR})
+    set(SUNDIALS_DIR "$ENV{SUNDIALS_DIR}")
+endif()
+
+set(_SUNDIALS_READY FALSE)
+
+# Check explicit directory
+if(SUNDIALS_DIR)
+    if(EXISTS "${SUNDIALS_DIR}/include/cvode/cvode.h")
+        set(_SUNDIALS_READY TRUE)
+        # Find the lib directory (lib/ or lib64/)
+        if(EXISTS "${SUNDIALS_DIR}/lib64/libsundials_cvode.so" OR EXISTS "${SUNDIALS_DIR}/lib64/libsundials_cvode.a")
+            set(_SLIB "${SUNDIALS_DIR}/lib64")
+        else()
+            set(_SLIB "${SUNDIALS_DIR}/lib")
+        endif()
+        # Prefer shared, fall back to static
+        if(EXISTS "${_SLIB}/libsundials_cvode.so")
+            set(SUNDIALS_LIBRARIES "${_SLIB}/libsundials_cvode.so" "${_SLIB}/libsundials_nvecserial.so")
+        else()
+            set(SUNDIALS_LIBRARIES "${_SLIB}/libsundials_cvode.a" "${_SLIB}/libsundials_nvecserial.a")
+        endif()
+        set(SUNDIALS_INCLUDE_DIR "${SUNDIALS_DIR}/include")
+        message(STATUS "SUNDIALS: using ${SUNDIALS_DIR}")
+    else()
+        message(WARNING "SUNDIALS_DIR set to ${SUNDIALS_DIR} but cvode.h not found there")
+    endif()
+endif()
+
+# Try system install via find_package
+if(NOT _SUNDIALS_READY)
+    find_package(SUNDIALS QUIET COMPONENTS cvode nvecserial)
+    if(SUNDIALS_FOUND)
+        set(_SUNDIALS_READY TRUE)
+        set(SUNDIALS_LIBRARIES SUNDIALS::cvode SUNDIALS::nvecserial)
+        message(STATUS "SUNDIALS: found via find_package")
+    endif()
+endif()
+
+# Auto-fetch from source
+if(NOT _SUNDIALS_READY)
+    message(STATUS "SUNDIALS: not found — fetching v4.1.0 from GitHub...")
+    FetchContent_Declare(
+        sundials
+        GIT_REPOSITORY https://github.com/LLNL/sundials.git
+        GIT_TAG        v4.1.0
+        GIT_SHALLOW    TRUE
+    )
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(EXAMPLES_ENABLE_C OFF CACHE BOOL "" FORCE)
+    set(EXAMPLES_ENABLE_CXX OFF CACHE BOOL "" FORCE)
+    set(EXAMPLES_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BUILD_CVODE ON CACHE BOOL "" FORCE)
+    set(BUILD_ARKODE OFF CACHE BOOL "" FORCE)
+    set(BUILD_IDA OFF CACHE BOOL "" FORCE)
+    set(BUILD_IDAS OFF CACHE BOOL "" FORCE)
+    set(BUILD_KINSOL OFF CACHE BOOL "" FORCE)
+    set(BUILD_CVODES OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(sundials)
+    set(SUNDIALS_LIBRARIES sundials_cvode_static sundials_nvecserial_static)
+    # FetchContent places headers in the source and binary trees
+    set(SUNDIALS_INCLUDE_DIR
+        "${sundials_SOURCE_DIR}/include"
+        "${sundials_BINARY_DIR}/include"
+    )
+    set(_SUNDIALS_READY TRUE)
+endif()
+
+# --- Boost (property_tree XML + serialization) ---
+# Try: (1) BOOST_ROOT env var, (2) find_package, (3) FetchContent
+if(NOT BOOST_ROOT AND DEFINED ENV{BOOST_ROOT})
+    set(BOOST_ROOT "$ENV{BOOST_ROOT}")
+endif()
+
+set(_BOOST_READY FALSE)
+
+find_package(Boost 1.65 QUIET COMPONENTS serialization)
+if(Boost_FOUND)
+    set(_BOOST_READY TRUE)
+    message(STATUS "Boost: found via find_package (${Boost_VERSION})")
+endif()
+
+# Auto-fetch from source (header-only property_tree + compiled serialization)
+if(NOT _BOOST_READY)
+    message(STATUS "Boost: not found — fetching v1.82.0 from GitHub...")
+    FetchContent_Declare(
+        boost
+        URL https://github.com/boostorg/boost/releases/download/boost-1.82.0/boost-1.82.0.tar.gz
+        URL_HASH SHA256=fd397e69f16f28e0b4e4e5a6b6abe1a5fad1fa53594e6d700bfca80c2ffa59af
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    # Only build the libraries we need
+    set(BOOST_INCLUDE_LIBRARIES serialization property_tree CACHE STRING "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(boost)
+    set(_BOOST_READY TRUE)
+    # Boost CMake superproject provides targets like Boost::serialization
+endif()
+
+# --- FLAME GPU 2 ---
 
 if(NOT TARGET flamegpu)
     if(FLAMEGPU_ROOT AND EXISTS "${FLAMEGPU_ROOT}/CMakeLists.txt")
@@ -105,23 +182,29 @@ add_executable(pdac
 target_link_libraries(pdac PRIVATE flamegpu)
 target_compile_definitions(pdac PRIVATE FLAMEGPU_SEATBELTS=0)
 
-# Link against SUNDIALS if available (optional QSP support)
-if(SUNDIALS_FOUND)
-    message(STATUS "SUNDIALS found - QSP coupling enabled")
+# Link against SUNDIALS (CVODE)
+if(_SUNDIALS_READY)
     target_link_libraries(pdac PRIVATE ${SUNDIALS_LIBRARIES})
-    target_include_directories(pdac PRIVATE ${SUNDIALS_INCLUDE_DIR})
+    if(SUNDIALS_INCLUDE_DIR)
+        target_include_directories(pdac PRIVATE ${SUNDIALS_INCLUDE_DIR})
+    endif()
     target_compile_definitions(pdac PRIVATE QSP_CVODE_ENABLED=1)
 else()
-    message(WARNING "SUNDIALS not found - QSP coupling disabled. Set SUNDIALS_DIR to enable.")
+    message(FATAL_ERROR "SUNDIALS is required but could not be found or fetched.")
 endif()
 
-# Link against Boost if available
-if(Boost_FOUND)
-    message(STATUS "Boost found - QSP serialization enabled")
-    target_link_libraries(pdac PRIVATE ${Boost_LIBRARIES})
-    target_include_directories(pdac SYSTEM PRIVATE ${Boost_INCLUDE_DIR})
+# Link against Boost (serialization + property_tree)
+if(_BOOST_READY)
+    if(TARGET Boost::serialization)
+        # FetchContent or modern find_package — use CMake targets
+        target_link_libraries(pdac PRIVATE Boost::serialization Boost::property_tree)
+    else()
+        # Legacy find_package — use variables
+        target_link_libraries(pdac PRIVATE ${Boost_LIBRARIES})
+        target_include_directories(pdac SYSTEM PRIVATE ${Boost_INCLUDE_DIR})
+    endif()
 else()
-    message(WARNING "Boost not found - QSP serialization disabled. Set BOOST_ROOT to enable.")
+    message(FATAL_ERROR "Boost is required but could not be found or fetched.")
 endif()
 
 cmake_path(GET CMAKE_CURRENT_SOURCE_DIR PARENT_PATH MY_PARENT_DIR)

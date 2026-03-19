@@ -214,7 +214,15 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
         }
     }
 
-    if (n_cands == 0) return flamegpu::ALIVE;
+    // Track division attempt
+    atomicAdd(reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_divide_attempt_ptr")), 1u);
+
+    if (n_cands == 0) {
+        atomicAdd(reinterpret_cast<unsigned int*>(
+            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_divide_no_space_ptr")), 1u);
+        return flamegpu::ALIVE;
+    }
 
     // Fisher-Yates partial shuffle: try candidates in random order until CAS wins.
     const float asymmetric_div_prob = FLAMEGPU->environment.getProperty<float>("PARAM_ASYM_DIV_PROB");
@@ -255,6 +263,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 FLAMEGPU->agent_out.setVariable<int>("divideFlag", 1);
                 FLAMEGPU->agent_out.setVariable<int>("divideCountRemaining", divMax);
                 FLAMEGPU->agent_out.setVariable<unsigned int>("stemID", stem_id);
+                FLAMEGPU->agent_out.setVariable<int>("newborn", 1);
             } else {
                 // Symmetric: daughter is stem
                 const float div_int = FLAMEGPU->environment.getProperty<float>(
@@ -267,18 +276,13 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
                 FLAMEGPU->agent_out.setVariable<int>("divideFlag", 1);
                 FLAMEGPU->agent_out.setVariable<int>("divideCountRemaining", 0);
                 FLAMEGPU->agent_out.setVariable<unsigned int>("stemID", stem_id);
+                FLAMEGPU->agent_out.setVariable<int>("newborn", 1);
             }
             // Reset parent divideCD — matches HCC deterministic reset
             FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(
                 (FLAMEGPU->environment.getProperty<float>("PARAM_FLOAT_CANCER_CELL_STEM_DIV_INTERVAL_SLICE")/cabo_prolif_factor) + 0.5f));
 
         } else if (cell_state == CANCER_PROGENITOR) {
-            // HCC: all progenitors start hypoxic (O2=0 at init) so no division on step 0.
-            // Replicate by blocking progenitor division on the first ABM step.
-            if (FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step") == 0) {
-                occ[target_x][target_y][target_z][CELL_TYPE_CANCER].CAS(1u, 0u); // release claimed voxel
-                return flamegpu::ALIVE;
-            }
             int divideCountRemaining = FLAMEGPU->getVariable<int>("divideCountRemaining");
             divideCountRemaining--;
             FLAMEGPU->setVariable<int>("divideCountRemaining", divideCountRemaining);
@@ -294,20 +298,15 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
             // Daughter inherits parent's (decremented) count — matches HCC behavior
             FLAMEGPU->agent_out.setVariable<int>("divideCountRemaining", divideCountRemaining);
             FLAMEGPU->agent_out.setVariable<unsigned int>("stemID", stem_id);
+            FLAMEGPU->agent_out.setVariable<int>("newborn", 1);
 
-            if (divideCountRemaining <= 0) {
-                // Parent becomes senescent
-                FLAMEGPU->setVariable<int>("cell_state", CANCER_SENESCENT);
-                FLAMEGPU->setVariable<int>("divideCD", -1);
-                FLAMEGPU->setVariable<int>("divideFlag", 0);
-                const float mean_life = FLAMEGPU->environment.getProperty<float>("PARAM_CANCER_SENESCENT_MEAN_LIFE");
-                const float rand_val = FLAMEGPU->random.uniform<float>();
-                const int life = static_cast<int>(-mean_life * logf(rand_val + 0.0001f) + 0.5f);
-                FLAMEGPU->setVariable<int>("life", life > 0 ? life : 1);
-            } else {
-                // Reset parent divideCD — matches HCC deterministic reset
-                FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(div_int + 0.5f));
-            }
+            // H6 fix: Do NOT trigger senescence here. Match HCC behavior where
+            // senescence is caught on the NEXT step by cancer_cell_state_step's
+            // "PROGENITOR EXHAUSTION → SENESCENCE" check (lines ~480-491).
+            // This gives a 1-step delay matching HCC's sequential processing.
+            // Reset parent divideCD unconditionally — if divideCountRemaining <= 0,
+            // state_step will catch it next step before any further division.
+            FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(div_int + 0.5f));
         }
 
         // Count successful division
@@ -400,8 +399,15 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
 
         float p_kill = get_kill_probability_supp(supp, q,
             FLAMEGPU->environment.getProperty<float>("PARAM_ESCAPE_BASE"));
-        
+
         p_kill *= FLAMEGPU->environment.getProperty<float>("PARAM_TKILL_SCALAR") * (1 - supp);
+
+        // Diagnostic: track T-kill evaluations and p_kill distribution
+        atomicAdd(reinterpret_cast<unsigned int*>(
+            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_t_kill_eval_ptr")), 1u);
+        atomicAdd(reinterpret_cast<unsigned int*>(
+            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_p_kill_sum_ptr")),
+            static_cast<unsigned int>(p_kill * 10000.0f));
 
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
@@ -448,6 +454,10 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
                    * (1 - H_Mac_C) * (1 - H_IL10_phago);
         double p_kill = get_kill_probability(q, FLAMEGPU->environment.getProperty<float>("PARAM_ESCAPE_MAC_BASE"));
 
+        // Diagnostic: track MAC-kill evaluations
+        atomicAdd(reinterpret_cast<unsigned int*>(
+            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_mac_kill_eval_ptr")), 1u);
+
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 2);  // 2 = macrophage killing
@@ -477,6 +487,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
     }
 
     // === PROGENITOR EXHAUSTION → SENESCENCE ===
+    // Matches HCC: senescence triggered in state_step (1-step delay after last division)
     if (cell_state == CANCER_PROGENITOR) {
         const int divideCountRemaining = FLAMEGPU->getVariable<int>("divideCountRemaining");
         if (divideCountRemaining <= 0) {
@@ -487,6 +498,9 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             const float rand_val  = FLAMEGPU->random.uniform<float>();
             const int life = static_cast<int>(-mean_life * logf(rand_val + 0.0001f) + 0.5f);
             FLAMEGPU->setVariable<int>("life", life > 0 ? life : 1);
+            // Diagnostic: track senescence transitions
+            atomicAdd(reinterpret_cast<unsigned int*>(
+                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_senescence_ptr")), 1u);
         }
     }
 

@@ -573,7 +573,13 @@ int main(int argc, const char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
 
     // Check for -p flag (XML path override)
-    std::string param_file = "/home/chase/SPQSP/SPQSP_PDAC-main/PDAC/sim/resource/param_all_test.xml";
+    // Default: resource/param_all_test.xml relative to the executable location
+    std::string exe_dir;
+    {
+        std::filesystem::path exe_path = std::filesystem::canonical("/proc/self/exe");
+        exe_dir = exe_path.parent_path().parent_path().parent_path().string(); // bin/ -> build/ -> sim/
+    }
+    std::string param_file = exe_dir + "/resource/param_all_test.xml";
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-p" && i + 1 < argc) {
             param_file = argv[++i];
@@ -664,8 +670,8 @@ int main(int argc, const char** argv) {
     // ========== ALLOCATE GPU MEMORY FOR EVENT COUNTERS ==========
     // Do this BEFORE creating CUDASimulation so environment properties are synced
     unsigned int* device_event_counters = nullptr;
-    cudaMalloc(&device_event_counters, 9 * sizeof(unsigned int));
-    cudaMemset(device_event_counters, 0, 9 * sizeof(unsigned int));
+    cudaMalloc(&device_event_counters, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
+    cudaMemset(device_event_counters, 0, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
 
     // Store pointers to event counters in model environment (before CUDASimulation init)
     model->Environment().setProperty<uint64_t>("event_tcell_prolif_ptr",
@@ -686,6 +692,19 @@ int main(int argc, const char** argv) {
         reinterpret_cast<uint64_t>(device_event_counters + 7));
     model->Environment().setProperty<uint64_t>("event_cancer_divide_ptr",
         reinterpret_cast<uint64_t>(device_event_counters + 8));
+    // Diagnostic counters
+    model->Environment().setProperty<uint64_t>("event_cancer_divide_attempt_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 9));
+    model->Environment().setProperty<uint64_t>("event_cancer_divide_no_space_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 10));
+    model->Environment().setProperty<uint64_t>("event_cancer_senescence_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 11));
+    model->Environment().setProperty<uint64_t>("event_cancer_t_kill_eval_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 12));
+    model->Environment().setProperty<uint64_t>("event_cancer_p_kill_sum_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 13));
+    model->Environment().setProperty<uint64_t>("event_cancer_mac_kill_eval_ptr",
+        reinterpret_cast<uint64_t>(device_event_counters + 14));
 
     // ========== CREATE SIMULATION ==========
     // Increase CUDA per-thread stack size for complex kernels (default 1KB is too small
@@ -782,9 +801,11 @@ int main(int argc, const char** argv) {
                    << "teff_rec,treg_rec,th_rec,mdsc_rec,mac_rec,"
                    << "p_teff,p_treg,p_th,t_sources,"
                    << "qsp_teff,qsp_treg,qsp_th,"
-                   << "cancer_t_kill,cancer_mac_kill,cancer_nat_death,cancer_divide\n";
+                   << "cancer_t_kill,cancer_mac_kill,cancer_nat_death,cancer_divide,"
+                   << "cancer_divide_attempt,cancer_divide_no_space,cancer_senescence,"
+                   << "cancer_t_kill_eval,cancer_p_kill_sum_x10k,cancer_mac_kill_eval\n";
         // Step 0: initial condition — no events yet
-        event_file << "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
+        event_file << "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
     }
 
     // Open timing output file for per-step timing CSV
@@ -835,8 +856,8 @@ int main(int argc, const char** argv) {
 
         // Read event counts from GPU and output
         if (event_file.is_open()) {
-            unsigned int host_events[9];
-            cudaMemcpy(host_events, device_event_counters, 9 * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            unsigned int host_events[PDAC::ABM_EVENT_COUNTER_SIZE];
+            cudaMemcpy(host_events, device_event_counters, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
             PDAC::RecruitStats rs = PDAC::get_last_recruit_stats();
 
@@ -849,11 +870,13 @@ int main(int argc, const char** argv) {
                        << rs.p_teff << "," << rs.p_treg << "," << rs.p_th << "," << rs.t_sources << ","
                        << rs.qsp_teff << "," << rs.qsp_treg << "," << rs.qsp_th << ","
                        << host_events[5] << "," << host_events[6] << ","
-                       << host_events[7] << "," << host_events[8] << "\n";
+                       << host_events[7] << "," << host_events[8] << ","
+                       << host_events[9] << "," << host_events[10] << "," << host_events[11] << ","
+                       << host_events[12] << "," << host_events[13] << "," << host_events[14] << "\n";
             event_file.flush();
 
             // Reset counters for next step
-            cudaMemset(device_event_counters, 0, 9 * sizeof(unsigned int));
+            cudaMemset(device_event_counters, 0, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
         }
 
         if (!continue_sim) {
