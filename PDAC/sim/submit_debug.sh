@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=pdac
-#SBATCH --partition=gpu_debug
+#SBATCH --partition=gpu-debug
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
