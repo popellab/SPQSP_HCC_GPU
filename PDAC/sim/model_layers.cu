@@ -126,28 +126,24 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         const int mac_steps    = model.Environment().getProperty<int>("PARAM_MAC_MOVE_STEPS");
         const int fib_steps    = model.Environment().getProperty<int>("PARAM_FIB_MOVE_STEPS");
 
-        for (int i = 0; i < cancer_steps; i++) {
-            flamegpu::LayerDescription layer = model.newLayer("move_cancer_" + std::to_string(i));
-            layer.addAgentFunction(AGENT_CANCER_CELL, "move");
-        }
-        for (int i = 0; i < tcell_steps; i++) {
-            flamegpu::LayerDescription layer = model.newLayer("move_tcell_" + std::to_string(i));
-            layer.addAgentFunction(AGENT_TCELL, "move");
-        }
-        for (int i = 0; i < treg_steps; i++) {
-            flamegpu::LayerDescription layer = model.newLayer("move_treg_" + std::to_string(i));
-            layer.addAgentFunction(AGENT_TREG, "move");
-        }
-        for (int i = 0; i < mdsc_steps; i++) {
-            flamegpu::LayerDescription layer = model.newLayer("move_mdsc_" + std::to_string(i));
-            layer.addAgentFunction(AGENT_MDSC, "move");
-        }
-        for (int i = 0; i < mac_steps; i++) {
-            flamegpu::LayerDescription layer = model.newLayer("move_macrophage_" + std::to_string(i));
-            layer.addAgentFunction(AGENT_MACROPHAGE, "move");
+        // Interleaved movement: all mobile agent types compete for voxels in the
+        // same layer each substep, matching HCC's single-loop sequential processing
+        // where cancer and immune cells block each other's movement in real time.
+        // Cancer uses moves_remaining (stem=5, progenitor=1) and returns early when
+        // exhausted; immune agents run for their full step count.
+        const int max_steps = std::max({cancer_steps, tcell_steps, treg_steps, mdsc_steps, mac_steps});
+        for (int i = 0; i < max_steps; i++) {
+            flamegpu::LayerDescription layer = model.newLayer("move_interleaved_" + std::to_string(i));
+            if (i < cancer_steps) layer.addAgentFunction(AGENT_CANCER_CELL, "move");
+            if (i < tcell_steps)  layer.addAgentFunction(AGENT_TCELL, "move");
+            if (i < treg_steps)   layer.addAgentFunction(AGENT_TREG, "move");
+            if (i < mdsc_steps)   layer.addAgentFunction(AGENT_MDSC, "move");
+            if (i < mac_steps)    layer.addAgentFunction(AGENT_MACROPHAGE, "move");
         }
         // Fibroblast chain movement: write_pos snapshot, sensor (HEAD) chemotaxis, then
         // four follower-propagation passes to support chains up to 5 cells deep.
+        // Kept separate — chain movement is incompatible with single-step interleaving
+        // and fibroblasts don't compete with cancer for voxels (different occ slot).
         for (int i = 0; i < fib_steps; i++) {
             {
                 flamegpu::LayerDescription layer = model.newLayer("fib_write_pos_" + std::to_string(i));

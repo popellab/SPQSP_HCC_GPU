@@ -2,6 +2,8 @@
 #SBATCH --job-name=pdac
 #SBATCH --partition=gpu-debug
 #SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
 #SBATCH --output=pdac_%j.out
@@ -50,8 +52,16 @@ if [[ ! -x "${PDAC_BIN}" ]]; then
     echo ""
     echo "=== Binary not found — building on GPU node ==="
     cd "${PROJECT_DIR}"
-    SUNDIALS_DIR="${PROJECT_DIR}/../../external/sundials" \
-    ./build.sh --cuda-arch 80 --flamegpu "${PROJECT_DIR}/../../external/flamegpu2"
+    rm -rf build  # clear stale CMake cache
+    EXT_DIR="${PROJECT_DIR}/../../external"
+    echo "=== External deps check ==="
+    echo "  FLAMEGPU: $(ls ${EXT_DIR}/flamegpu2/CMakeLists.txt 2>/dev/null && echo OK || echo MISSING)"
+    echo "  SUNDIALS: $(ls ${EXT_DIR}/sundials/CMakeLists.txt 2>/dev/null && echo OK || echo MISSING)"
+    echo "  BOOST:    $(ls ${EXT_DIR}/boost/CMakeLists.txt 2>/dev/null && echo OK || echo MISSING)"
+    ls "${EXT_DIR}/" 2>/dev/null
+    SUNDIALS_DIR="${EXT_DIR}/sundials" \
+    BOOST_ROOT="${EXT_DIR}/boost" \
+    ./build.sh --cuda-arch 80 --flamegpu "${EXT_DIR}/flamegpu2"
     echo ""
 fi
 

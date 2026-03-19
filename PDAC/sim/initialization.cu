@@ -495,8 +495,9 @@ void initializeVascularCellsRandom(
     const int center_x = grid_x / 2;
     const int center_y = grid_y / 2;
     const int center_z = grid_z / 2;
-    // const double radius = tumor_radius;
-    const double radius = 0.5 * grid_x;
+    // Exclude vessels from within the tumor, not half the grid.
+    // HCC's vascular graph includes vessels near/inside the tumor edge.
+    const double radius = tumor_radius;
 
     // Random number generator
     std::srand(seed);

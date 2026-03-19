@@ -57,11 +57,12 @@ static float* d_ecm_grid = nullptr;
 static float* d_fib_density_field = nullptr;
 
 // Flat occupancy arrays for GPU recruitment kernel (populated by agent write_to_occ_grid).
-// d_occ_total: total agent count per voxel (all types increment via atomicAdd).
+// d_t_occ: T cell + TReg count per voxel (only CELL_TYPE_T and CELL_TYPE_TREG increment).
+//          Used with d_cancer_occ for combined cap check matching HCC isOpenToType logic.
 // d_mac_occ / d_mdsc_occ: per-type counts for exclusive placement checks (atomicCAS).
 // d_recruit_requests: compact output buffer for placement decisions (GPU→host).
 // d_recruit_count: atomic counter for number of valid requests in buffer.
-static unsigned int* d_occ_total = nullptr;
+static unsigned int* d_t_occ = nullptr;
 static unsigned int* d_mac_occ = nullptr;
 static unsigned int* d_mdsc_occ = nullptr;
 static RecruitRequest* d_recruit_requests = nullptr;
@@ -232,8 +233,8 @@ void initialize_pde_solver(int grid_x, int grid_y, int grid_z,
     CUDA_CHECK(cudaMemset(d_fib_density_field, 0, total_voxels * sizeof(float)));
 
     // Allocate flat occupancy arrays for GPU recruitment kernel
-    CUDA_CHECK(cudaMalloc(&d_occ_total, total_voxels * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMemset(d_occ_total, 0, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_t_occ, total_voxels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_t_occ, 0, total_voxels * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&d_mac_occ, total_voxels * sizeof(unsigned int)));
     CUDA_CHECK(cudaMemset(d_mac_occ, 0, total_voxels * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&d_mdsc_occ, total_voxels * sizeof(unsigned int)));
@@ -305,8 +306,8 @@ void set_pde_pointers_in_environment(flamegpu::ModelDescription& model) {
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_density_field)));
 
     // Store flat occupancy array pointers for GPU recruitment kernel
-    model.Environment().newProperty<unsigned long long>("occ_total_ptr",
-        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_occ_total)));
+    model.Environment().newProperty<unsigned long long>("t_occ_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_t_occ)));
     model.Environment().newProperty<unsigned long long>("mac_occ_ptr",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_mac_occ)));
     model.Environment().newProperty<unsigned long long>("mdsc_occ_ptr",
@@ -336,7 +337,7 @@ void cleanup_pde_solver() {
         cudaFree(d_vas_tip_id_grid);
         d_vas_tip_id_grid = nullptr;
     }
-    if (d_occ_total) { cudaFree(d_occ_total); d_occ_total = nullptr; }
+    if (d_t_occ) { cudaFree(d_t_occ); d_t_occ = nullptr; }
     if (d_mac_occ)   { cudaFree(d_mac_occ);   d_mac_occ = nullptr; }
     if (d_mdsc_occ)  { cudaFree(d_mdsc_occ);  d_mdsc_occ = nullptr; }
     if (d_recruit_requests) { cudaFree(d_recruit_requests); d_recruit_requests = nullptr; }
@@ -361,26 +362,26 @@ unsigned int* get_vas_tip_id_grid_device_ptr() { return d_vas_tip_id_grid; }
 // Recruitment System Implementation
 // ============================================================================
 
-// Helper: check if radius-3 sphere around (x,y,z) is completely filled with cancer.
-// Returns true if every in-bounds voxel within radius 3 has cancer present.
+// Helper: check if radius-3 BOX around (x,y,z) is completely filled with cancer.
+// Returns true if every in-bounds voxel within 7x7x7 cube has cancer present.
+// Matches HCC: 7x7x7 window_counts_inplace with local_cancer_ratio < 1 gate.
 __device__ bool is_tumor_dense_r3(
     const unsigned int* d_cancer_occ,
     int x, int y, int z,
     int nx, int ny, int nz)
 {
-    int sphere_total = 0, sphere_cancer = 0;
+    int box_total = 0, box_cancer = 0;
     for (int dz = -3; dz <= 3; dz++) {
         for (int dy = -3; dy <= 3; dy++) {
             for (int dx = -3; dx <= 3; dx++) {
-                if (dx*dx + dy*dy + dz*dz > 9) continue;
                 int cx = x + dx, cy = y + dy, cz = z + dz;
                 if (cx < 0 || cx >= nx || cy < 0 || cy >= ny || cz < 0 || cz >= nz) continue;
-                sphere_total++;
-                sphere_cancer += (d_cancer_occ[cz*(nx*ny) + cy*nx + cx] > 0u) ? 1 : 0;
+                box_total++;
+                box_cancer += (d_cancer_occ[cz*(nx*ny) + cy*nx + cx] > 0u) ? 1 : 0;
             }
         }
     }
-    return (sphere_total > 0 && sphere_cancer >= sphere_total);
+    return (box_total > 0 && box_cancer >= box_total);
 }
 
 // CUDA kernel to mark MDSC recruitment sources based on CCL2
@@ -550,14 +551,15 @@ __device__ __forceinline__ int sample_exp_life_gpu(float mean, unsigned int& rng
 
 // Device helper: try to place a cell at one of the 26 Moore neighbors of (sx, sy, sz).
 // Uses Fisher-Yates shuffle with thread-local RNG. Claims voxel via atomic ops on
-// d_occ_total (for T/TReg cap) and d_mac_occ/d_mdsc_occ (for exclusive placement).
+// d_t_occ + d_cancer_occ (for T/TReg cap, matching HCC isOpenToType) and
+// d_mac_occ/d_mdsc_occ (for exclusive placement).
 // Returns true + sets (out_x, out_y, out_z) on success.
 __device__ bool try_find_open_neighbor(
     int sx, int sy, int sz,
     int cell_type,
     int nx, int ny, int nz,
     int nr_t_voxel, int nr_t_voxel_c,
-    unsigned int* d_occ_total,
+    unsigned int* d_t_occ,
     const unsigned int* d_cancer_occ,
     unsigned int* d_mac_occ,
     unsigned int* d_mdsc_occ,
@@ -594,14 +596,16 @@ __device__ bool try_find_open_neighbor(
         int vidx = cz * (nx * ny) + cy * nx + cx;
 
         if (cell_type == CELL_TYPE_T || cell_type == CELL_TYPE_TREG) {
-            // Determine cap based on cancer presence
-            bool has_cancer = (d_cancer_occ[vidx] > 0u);
-            int cap = has_cancer ? nr_t_voxel_c : nr_t_voxel;
+            // HCC isOpenToType: cap check uses cancer + T count combined.
+            // With nr_t_voxel_c=1 and cancer present, count starts at >=1 → no T cells allowed.
+            // With no cancer, up to nr_t_voxel (8) T cells per voxel.
+            unsigned int cancer_count = d_cancer_occ[vidx];
+            int cap = (cancer_count > 0u) ? nr_t_voxel_c : nr_t_voxel;
 
-            // Atomic claim: increment total, check against cap
-            unsigned int old_total = atomicAdd(&d_occ_total[vidx], 1u);
-            if ((int)old_total >= cap) {
-                atomicSub(&d_occ_total[vidx], 1u);  // Undo
+            // Atomic claim: increment T count, check combined (cancer + T) against cap
+            unsigned int old_t = atomicAdd(&d_t_occ[vidx], 1u);
+            if ((int)(cancer_count + old_t) >= cap) {
+                atomicSub(&d_t_occ[vidx], 1u);  // Undo
                 continue;
             }
             out_x = cx; out_y = cy; out_z = cz;
@@ -611,8 +615,6 @@ __device__ bool try_find_open_neighbor(
             // Exclusive: atomicCAS, only place if slot == 0
             unsigned int old = atomicCAS(&d_mac_occ[vidx], 0u, 1u);
             if (old != 0u) continue;
-            // Also increment total count
-            atomicAdd(&d_occ_total[vidx], 1u);
             out_x = cx; out_y = cy; out_z = cz;
             return true;
         }
@@ -620,7 +622,6 @@ __device__ bool try_find_open_neighbor(
             // Exclusive: atomicCAS, only place if slot == 0
             unsigned int old = atomicCAS(&d_mdsc_occ[vidx], 0u, 1u);
             if (old != 0u) continue;
-            atomicAdd(&d_occ_total[vidx], 1u);
             out_x = cx; out_y = cy; out_z = cz;
             return true;
         }
@@ -634,7 +635,7 @@ __device__ bool try_find_open_neighbor(
 // ============================================================================
 __global__ void recruit_all_kernel(
     const int* __restrict__ d_recruitment_sources,
-    unsigned int* d_occ_total,
+    unsigned int* d_t_occ,
     const unsigned int* __restrict__ d_cancer_occ,
     unsigned int* d_mac_occ,
     unsigned int* d_mdsc_occ,
@@ -663,7 +664,7 @@ __global__ void recruit_all_kernel(
         // Try Teff
         if (rng_uniform(rng) < p.p_teff) {
             if (try_find_open_neighbor(x, y, z, CELL_TYPE_T, p.nx, p.ny, p.nz,
-                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_t_occ, d_cancer_occ,
                     d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
                 int slot = atomicAdd(d_request_count, 1);
                 if (slot < MAX_RECRUITS_PER_STEP) {
@@ -685,7 +686,7 @@ __global__ void recruit_all_kernel(
         // Try TReg
         if (rng_uniform(rng) < p.p_treg) {
             if (try_find_open_neighbor(x, y, z, CELL_TYPE_TREG, p.nx, p.ny, p.nz,
-                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_t_occ, d_cancer_occ,
                     d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
                 int slot = atomicAdd(d_request_count, 1);
                 if (slot < MAX_RECRUITS_PER_STEP) {
@@ -707,7 +708,7 @@ __global__ void recruit_all_kernel(
         // Try TH
         if (rng_uniform(rng) < p.p_th) {
             if (try_find_open_neighbor(x, y, z, CELL_TYPE_TREG, p.nx, p.ny, p.nz,
-                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_t_occ, d_cancer_occ,
                     d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
                 int slot = atomicAdd(d_request_count, 1);
                 if (slot < MAX_RECRUITS_PER_STEP) {
@@ -731,7 +732,7 @@ __global__ void recruit_all_kernel(
     if (flags & 2) {
         if (rng_uniform(rng) < p.p_mdsc) {
             if (try_find_open_neighbor(x, y, z, CELL_TYPE_MDSC, p.nx, p.ny, p.nz,
-                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_t_occ, d_cancer_occ,
                     d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
                 int slot = atomicAdd(d_request_count, 1);
                 if (slot < MAX_RECRUITS_PER_STEP) {
@@ -755,7 +756,7 @@ __global__ void recruit_all_kernel(
     if (flags & 4) {
         if (rng_uniform(rng) < p.p_mac) {
             if (try_find_open_neighbor(x, y, z, CELL_TYPE_MAC, p.nx, p.ny, p.nz,
-                    p.nr_t_voxel, p.nr_t_voxel_c, d_occ_total, d_cancer_occ,
+                    p.nr_t_voxel, p.nr_t_voxel_c, d_t_occ, d_cancer_occ,
                     d_mac_occ, d_mdsc_occ, rng, px, py, pz)) {
                 int slot = atomicAdd(d_request_count, 1);
                 if (slot < MAX_RECRUITS_PER_STEP) {
@@ -839,7 +840,7 @@ FLAMEGPU_HOST_FUNCTION(recruit_gpu) {
 
     recruit_all_kernel<<<grid, block>>>(
         g_pde_solver->get_device_recruitment_sources_ptr(),
-        d_occ_total, d_cancer_occ, d_mac_occ, d_mdsc_occ,
+        d_t_occ, d_cancer_occ, d_mac_occ, d_mdsc_occ,
         d_recruit_requests, d_recruit_count, p);
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1024,7 +1025,7 @@ FLAMEGPU_HOST_FUNCTION(zero_occupancy_grid) {
         int total_voxels = g_pde_solver->get_total_voxels();
         if (d_cancer_occ)      cudaMemset(d_cancer_occ,      0, total_voxels * sizeof(unsigned int));
         if (d_vas_tip_id_grid) cudaMemset(d_vas_tip_id_grid, 0, total_voxels * sizeof(unsigned int));
-        if (d_occ_total)       cudaMemset(d_occ_total,       0, total_voxels * sizeof(unsigned int));
+        if (d_t_occ)           cudaMemset(d_t_occ,           0, total_voxels * sizeof(unsigned int));
         if (d_mac_occ)         cudaMemset(d_mac_occ,         0, total_voxels * sizeof(unsigned int));
         if (d_mdsc_occ)        cudaMemset(d_mdsc_occ,        0, total_voxels * sizeof(unsigned int));
     }

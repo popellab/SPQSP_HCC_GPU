@@ -159,11 +159,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_write_to_occ_grid, flamegpu::MessageNone, flamegp
         FLAMEGPU->environment.getProperty<uint64_t>("cancer_occ_ptr"));
     atomicOr(&cancer_occ[vidx], 1u);
 
-    // Increment total occupancy counter (used by GPU recruitment kernel)
-    unsigned int* occ_total = reinterpret_cast<unsigned int*>(
-        FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
-    atomicAdd(&occ_total[vidx], 1u);
-
     return flamegpu::ALIVE;
 }
 
@@ -382,8 +377,8 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
                         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K2"),
                         FLAMEGPU->environment.getProperty<float>("PARAM_PDL1_K3"));
         float supp = hill_equation(bond,
-                        FLAMEGPU->environment.getProperty<float>("PARAM_N_PD1_PDL1"),
-                        FLAMEGPU->environment.getProperty<float>("PARAM_PD1_PDL1_HALF"));
+                        FLAMEGPU->environment.getProperty<float>("PARAM_PD1_PDL1_HALF"),
+                        FLAMEGPU->environment.getProperty<float>("PARAM_N_PD1_PDL1"));
 
         float NO   = PDE_READ(FLAMEGPU, PDE_CONC_NO, voxel);
         float ArgI = PDE_READ(FLAMEGPU, PDE_CONC_ARGI, voxel);

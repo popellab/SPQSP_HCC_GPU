@@ -57,13 +57,6 @@ FLAMEGPU_AGENT_FUNCTION(vascular_write_to_occ_grid, flamegpu::MessageNone, flame
     const unsigned int my_tip_id = FLAMEGPU->getVariable<unsigned int>("tip_id");
     vas_tip_id[vidx] = my_tip_id;
 
-    // Flat total occupancy for GPU recruitment kernel (stalk/phalanx only, matching occ_grid)
-    if (cell_state != VAS_TIP) {
-        unsigned int* occ_total = reinterpret_cast<unsigned int*>(
-            FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
-        atomicAdd(&occ_total[vidx], 1u);
-    }
-
     return flamegpu::ALIVE;
 }
 
@@ -149,22 +142,22 @@ FLAMEGPU_AGENT_FUNCTION(vascular_mark_t_sources, flamegpu::MessageNone, flamegpu
     const float local_IFNg = reinterpret_cast<const float*>(
         FLAMEGPU->environment.getProperty<uint64_t>(PDE_CONC_IFN))[voxel_ts];
 
-    // Check radius-3 sphere: skip marking if completely filled with cancer
+    // Check radius-3 BOX (7x7x7): skip marking if completely filled with cancer.
+    // Matches HCC: 7x7x7 window_counts_inplace with local_cancer_ratio < 1 gate.
     const unsigned int* cancer_occ = reinterpret_cast<const unsigned int*>(
         FLAMEGPU->environment.getProperty<uint64_t>("cancer_occ_ptr"));
-    int sphere_total = 0, sphere_cancer = 0;
+    int box_total = 0, box_cancer = 0;
     for (int dz = -3; dz <= 3; dz++) {
         for (int dy = -3; dy <= 3; dy++) {
             for (int dx = -3; dx <= 3; dx++) {
-                if (dx*dx + dy*dy + dz*dz > 9) continue;
                 int cx = x + dx, cy = y + dy, cz = z + dz;
                 if (cx < 0 || cx >= grid_x || cy < 0 || cy >= grid_y || cz < 0 || cz >= grid_z) continue;
-                sphere_total++;
-                sphere_cancer += (cancer_occ[cz*(grid_x*grid_y) + cy*grid_x + cx] > 0u) ? 1 : 0;
+                box_total++;
+                box_cancer += (cancer_occ[cz*(grid_x*grid_y) + cy*grid_x + cx] > 0u) ? 1 : 0;
             }
         }
     }
-    if (sphere_total > 0 && sphere_cancer >= sphere_total) return flamegpu::ALIVE;
+    if (box_total > 0 && box_cancer >= box_total) return flamegpu::ALIVE;
 
     const float ec50_ifng = FLAMEGPU->environment.getProperty<float>("PARAM_TEFF_IFN_EC50");
     const float H_IFNg = local_IFNg / (local_IFNg + ec50_ifng);

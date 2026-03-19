@@ -278,12 +278,12 @@ FLAMEGPU_AGENT_FUNCTION(tcell_write_to_occ_grid, flamegpu::MessageNone, flamegpu
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
     occ[x][y][z][CELL_TYPE_T] += 1u;
 
-    // Flat total occupancy for GPU recruitment kernel
+    // Flat T cell occupancy for GPU recruitment kernel (T + TReg only, matching HCC isOpenToType)
     const int gx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int gy = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    unsigned int* occ_total = reinterpret_cast<unsigned int*>(
-        FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
-    atomicAdd(&occ_total[z * (gx * gy) + y * gx + x], 1u);
+    unsigned int* t_occ = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("t_occ_ptr"));
+    atomicAdd(&t_occ[z * (gx * gy) + y * gx + x], 1u);
 
     return flamegpu::ALIVE;
 }

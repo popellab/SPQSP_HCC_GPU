@@ -46,13 +46,10 @@ FLAMEGPU_AGENT_FUNCTION(mac_write_to_occ_grid, flamegpu::MessageNone, flamegpu::
     // Macrophages are exclusive (1 per voxel)
     occ[x][y][z][CELL_TYPE_MAC].exchange(1u);
 
-    // Flat arrays for GPU recruitment kernel
+    // Flat arrays for GPU recruitment kernel (MAC exclusive placement)
     const int gx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int gy = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int vidx = z * (gx * gy) + y * gx + x;
-    unsigned int* occ_total = reinterpret_cast<unsigned int*>(
-        FLAMEGPU->environment.getProperty<uint64_t>("occ_total_ptr"));
-    atomicAdd(&occ_total[vidx], 1u);
     unsigned int* mac_occ = reinterpret_cast<unsigned int*>(
         FLAMEGPU->environment.getProperty<uint64_t>("mac_occ_ptr"));
     atomicAdd(&mac_occ[vidx], 1u);
