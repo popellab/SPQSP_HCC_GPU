@@ -159,7 +159,7 @@ if(NOT _BOOST_READY)
     FetchContent_Declare(
         boost
         URL https://github.com/boostorg/boost/releases/download/boost-1.82.0/boost-1.82.0.tar.gz
-        URL_HASH SHA256=fd397e69f16f28e0b4e4e5a6b6abe1a5fad1fa53594e6d700bfca80c2ffa59af
+        URL_HASH SHA256=b62bd839ea6c28265af9a1f68393eda37fab3611425d3b28882d8e424535ec9d
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     # Only build the libraries we need

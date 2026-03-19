@@ -38,13 +38,15 @@ DEFAULT_ARGS="-s 50 -g 50 -oa 1 -op 1"
 # Adjust these to match your cluster's module names
 module purge 2>/dev/null
 module load modtree/gpu 2>/dev/null
-module load cmake gcc cuda boost/1.86.0 2>/dev/null
+module avail cuda 2>&1 | head -20
+module load cmake gcc cuda/12.8.0 boost/1.86.0 2>/dev/null
 
 echo "================================================"
 echo "PDAC Job: ${SLURM_JOB_ID}"
 echo "  Node:       $(hostname)"
 echo "  GPU:        $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
 echo "  nvcc:       $(nvcc --version 2>/dev/null | grep release || echo 'not found')"
+echo "  cmake:      $(cmake --version 2>/dev/null | head -1 || echo 'not found')"
 echo "================================================"
 
 # --- Build if needed (CUDA only available on GPU nodes) ---

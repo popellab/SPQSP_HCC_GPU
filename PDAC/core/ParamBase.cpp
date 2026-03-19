@@ -1,7 +1,6 @@
 #include "ParamBase.h"
 
 #include <boost/property_tree/xml_parser.hpp>
-#include <boost/foreach.hpp>
 #include <iostream>
 
 namespace SP_QSP_IO{
