@@ -11,6 +11,7 @@
 # SPQSP PDAC — SLURM submission script for Anvil
 #
 # Source lives on /anvil/projects/, outputs go to /anvil/scratch/.
+# Automatically builds if no binary exists (CUDA is only available on GPU nodes).
 #
 # Usage:
 #   sbatch submit.sh                          # defaults: 500 steps, 50^3 grid
@@ -19,11 +20,10 @@
 # ============================================================================
 
 # --- Configuration ---
-# Project directory (where the repo lives — auto-detected from this script's location)
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PDAC_BIN="${PROJECT_DIR}/build/bin/pdac"
 
-# Scratch directory for outputs (override with SCRATCH_DIR env var)
+# Scratch directory for outputs
 SCRATCH_BASE="${SCRATCH_DIR:-/anvil/scratch/${USER}}"
 RUN_DIR="${SCRATCH_BASE}/pdac_runs/${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
 
@@ -31,27 +31,40 @@ RUN_DIR="${SCRATCH_BASE}/pdac_runs/${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
 DEFAULT_ARGS="-s 500 -g 50 -oa 1 -op 1"
 
 # --- Load modules ---
-module purge
-module load cuda cmake gcc
-# Uncomment if available on your cluster (avoids FetchContent rebuild):
-# module load boost sundials
+# Adjust these to match your cluster's module names
+module purge 2>/dev/null
+module load cmake gcc 2>/dev/null
+# CUDA is typically available on GPU nodes without a module; load if needed:
+# module load cuda
+
+echo "================================================"
+echo "PDAC Job: ${SLURM_JOB_ID}"
+echo "  Node:       $(hostname)"
+echo "  GPU:        $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
+echo "  nvcc:       $(nvcc --version 2>/dev/null | grep release || echo 'not found')"
+echo "================================================"
+
+# --- Build if needed (CUDA only available on GPU nodes) ---
+if [[ ! -x "${PDAC_BIN}" ]]; then
+    echo ""
+    echo "=== Binary not found — building on GPU node ==="
+    cd "${PROJECT_DIR}"
+    ./build.sh --cuda-arch 80
+    echo ""
+fi
 
 # --- Setup scratch output directory ---
 mkdir -p "${RUN_DIR}"
 echo "================================================"
-echo "PDAC Run: ${SLURM_JOB_ID}"
-echo "  Binary:     ${PDAC_BIN}"
+echo "  Binary:      ${PDAC_BIN}"
 echo "  Working dir: ${RUN_DIR}"
-echo "  GPU:        $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
-echo "  Args:       ${@:-${DEFAULT_ARGS}}"
+echo "  Args:        ${@:-${DEFAULT_ARGS}}"
 echo "================================================"
 
 # --- Run from scratch directory ---
-# The executable writes to relative ./outputs/, so cd to scratch first
 cd "${RUN_DIR}"
 
-# Symlink the param file so -p flag isn't needed (already resolved via /proc/self/exe)
-# But copy it here for reproducibility logging
+# Copy param file for reproducibility
 cp "${PROJECT_DIR}/resource/param_all_test.xml" "${RUN_DIR}/param_snapshot.xml"
 
 # Run simulation
