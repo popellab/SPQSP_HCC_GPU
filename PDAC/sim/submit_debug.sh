@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=pdac
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_debug
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --time=4:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=pdac_%j.out
 #SBATCH --error=pdac_%j.err
 
@@ -30,7 +30,7 @@ SCRATCH_BASE="${SCRATCH_DIR:-/anvil/scratch/${USER}}"
 RUN_DIR="${SCRATCH_BASE}/pdac_runs/${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 # Default simulation arguments (overridden by anything passed after sbatch submit.sh)
-DEFAULT_ARGS="-s 500 -g 50 -oa 1 -op 1"
+DEFAULT_ARGS="-s 50 -g 50 -oa 1 -op 1"
 
 # --- Load modules ---
 # Adjust these to match your cluster's module names
