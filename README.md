@@ -87,22 +87,21 @@ Outputs are written to `./outputs/` relative to the **current working directory*
 
 ## Anvil HPC Workflow
 
-The repo lives on `/anvil/projects/`, but simulation outputs go to `/anvil/scratch/` for I/O performance. The included `submit.sh` handles this automatically.
+The repo lives on `/anvil/projects/`, but simulation outputs go to `/anvil/scratch/` for I/O performance. CUDA is only available on GPU nodes (not login nodes), so building and running both happen via SLURM. The included `submit.sh` handles everything.
 
 ### One-Time Setup
 
 ```bash
 cd /anvil/projects/$USER
 git clone <repo-url> PDAC
-cd PDAC/sim
-module load cuda cmake gcc
-./build.sh --cuda-arch 80    # A100 GPUs on Anvil
 ```
 
 ### Submitting Jobs
 
 ```bash
-# Default run (500 steps, 50^3 grid)
+cd /anvil/projects/$USER/PDAC/sim
+
+# First submission builds automatically, then runs (500 steps, 50^3 grid)
 sbatch submit.sh
 
 # Custom parameters — pass any pdac flags after the script
@@ -111,15 +110,29 @@ sbatch submit.sh -s 1000 -g 101
 # Outputs land in /anvil/scratch/$USER/pdac_runs/<job_id>/outputs/
 ```
 
-`submit.sh` does the following:
-1. Creates a run directory on scratch: `/anvil/scratch/$USER/pdac_runs/<job_id>/`
-2. Copies the XML parameter file there for reproducibility
-3. `cd`s to scratch and runs the binary (so `./outputs/` writes to scratch)
-4. Prints the output path when done
+On first submission, `submit.sh` detects no binary exists and runs `build.sh` on the GPU node (~8 min). Subsequent submissions skip the build and run immediately.
 
-### General HPC Notes
+### What `submit.sh` Does
+
+1. Builds the binary on the GPU node if it doesn't exist (A100, `--cuda-arch 80`)
+2. Creates a run directory on scratch: `/anvil/scratch/$USER/pdac_runs/<job_id>/`
+3. Copies the XML parameter file there for reproducibility
+4. `cd`s to scratch and runs the binary (so `./outputs/` writes to scratch)
+5. Prints the output path when done
+
+### Rebuilding
+
+To force a rebuild (e.g., after code changes):
+
+```bash
+cd /anvil/projects/$USER/PDAC/sim
+./build.sh --clean          # removes old build (can run from login node)
+sbatch submit.sh            # next submission rebuilds on GPU node
+```
+
+### Notes
 
 - **First run** after build takes 5-10 minutes for CUDA JIT warmup (not a hang).
 - **Memory**: Grid 50^3 uses ~2 GB VRAM; 320^3 uses ~8 GB.
-- Set `--cuda-arch` to your exact GPU to skip JIT at runtime.
+- SLURM logs go to `pdac_<job_id>.out` / `.err` in the directory you submit from.
 - The param XML is resolved relative to the executable, so it works from any working directory.
