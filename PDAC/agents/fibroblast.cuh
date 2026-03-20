@@ -37,10 +37,11 @@ FLAMEGPU_AGENT_FUNCTION(fib_broadcast_location, flamegpu::MessageNone, flamegpu:
     FLAMEGPU->message_out.setVariable<int>("z", z);
     FLAMEGPU->message_out.setLocation(fx, fy, fz);
 
-    // Count this agent into per-state population snapshot
-    const int fib_cs = FLAMEGPU->getVariable<int>("cell_state");
+    // Count chain segments (not just agents) into per-state population snapshot
+    const int fib_cs  = FLAMEGPU->getVariable<int>("cell_state");
+    const int clen    = FLAMEGPU->getVariable<int>("chain_len");
     auto* sc_fib = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
-    atomicAdd(&sc_fib[fib_cs == FIB_NORMAL ? SC_FIB_NORM : SC_FIB_CAF], 1u);
+    atomicAdd(&sc_fib[fib_cs == FIB_NORMAL ? SC_FIB_NORM : SC_FIB_CAF], static_cast<unsigned int>(clen));
 
     return flamegpu::ALIVE;
 }

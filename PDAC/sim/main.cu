@@ -848,6 +848,73 @@ int main(int argc, const char** argv) {
         }
     }
 
+    // ── Compute step-0 state counts from host AgentVectors (before first broadcast) ──
+    unsigned int init_states[PDAC::ABM_STATE_COUNTER_SIZE] = {};
+    {
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_CANCER_CELL));
+            simulation.getPopulationData(p);
+            for (unsigned i = 0; i < p.size(); ++i) {
+                int s = p[i].getVariable<int>("cell_state");
+                if      (s == PDAC::CANCER_STEM)       init_states[PDAC::SC_CANCER_STEM]++;
+                else if (s == PDAC::CANCER_PROGENITOR) init_states[PDAC::SC_CANCER_PROG]++;
+                else                                   init_states[PDAC::SC_CANCER_SEN]++;
+            }
+        }
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_TCELL));
+            simulation.getPopulationData(p);
+            for (unsigned i = 0; i < p.size(); ++i) {
+                int s = p[i].getVariable<int>("cell_state");
+                if      (s == PDAC::T_CELL_EFF) init_states[PDAC::SC_CD8_EFF]++;
+                else if (s == PDAC::T_CELL_CYT) init_states[PDAC::SC_CD8_CYT]++;
+                else                            init_states[PDAC::SC_CD8_SUP]++;
+            }
+        }
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_TREG));
+            simulation.getPopulationData(p);
+            for (unsigned i = 0; i < p.size(); ++i) {
+                int s = p[i].getVariable<int>("cell_state");
+                if (s == PDAC::TCD4_TH) init_states[PDAC::SC_TH]++;
+                else                    init_states[PDAC::SC_TREG]++;
+            }
+        }
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_MDSC));
+            simulation.getPopulationData(p);
+            init_states[PDAC::SC_MDSC] = p.size();
+        }
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_MACROPHAGE));
+            simulation.getPopulationData(p);
+            for (unsigned i = 0; i < p.size(); ++i) {
+                int s = p[i].getVariable<int>("cell_state");
+                if (s == PDAC::MAC_M1) init_states[PDAC::SC_MAC_M1]++;
+                else                   init_states[PDAC::SC_MAC_M2]++;
+            }
+        }
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_FIBROBLAST));
+            simulation.getPopulationData(p);
+            for (unsigned i = 0; i < p.size(); ++i) {
+                int s    = p[i].getVariable<int>("cell_state");
+                int clen = p[i].getVariable<int>("chain_len");
+                if (s == PDAC::FIB_NORMAL) init_states[PDAC::SC_FIB_NORM] += clen;
+                else                       init_states[PDAC::SC_FIB_CAF]  += clen;
+            }
+        }
+        {
+            flamegpu::AgentVector p(model->Agent(PDAC::AGENT_VASCULAR));
+            simulation.getPopulationData(p);
+            for (unsigned i = 0; i < p.size(); ++i) {
+                int s = p[i].getVariable<int>("cell_state");
+                if (s == PDAC::VAS_TIP) init_states[PDAC::SC_VAS_TIP]++;
+                else                    init_states[PDAC::SC_VAS_PHALANX]++;
+            }
+        }
+    }
+
     // Open stats output file (always written, seed-stamped)
     std::ofstream stats_file(stats_path);
     if (stats_file.is_open()) {
@@ -881,11 +948,20 @@ int main(int argc, const char** argv) {
             << "death.VAS.tip,death.VAS.phalanx,"
             // PDL1 fraction
             << "PDL1_frac\n";
-        // Step 0: initial counts (all events zero)
-        // (State counts not available yet before first broadcast — write zeros)
-        stats_file << "0";
-        for (int c = 0; c < 15 + 6 + 15 + 15 + 1; c++) stats_file << ",0";
-        stats_file << "\n";
+        // Step 0: real initial state counts, all event columns zero
+        stats_file << "0,"
+            << init_states[PDAC::SC_CANCER_STEM] << "," << init_states[PDAC::SC_CANCER_PROG] << "," << init_states[PDAC::SC_CANCER_SEN] << ","
+            << init_states[PDAC::SC_CD8_EFF]     << "," << init_states[PDAC::SC_CD8_CYT]     << "," << init_states[PDAC::SC_CD8_SUP]   << ","
+            << init_states[PDAC::SC_TH]          << "," << init_states[PDAC::SC_TREG]         << ","
+            << init_states[PDAC::SC_MDSC]        << ","
+            << init_states[PDAC::SC_MAC_M1]      << "," << init_states[PDAC::SC_MAC_M2]       << ","
+            << init_states[PDAC::SC_FIB_NORM]    << "," << init_states[PDAC::SC_FIB_CAF]      << ","
+            << init_states[PDAC::SC_VAS_TIP]     << "," << init_states[PDAC::SC_VAS_PHALANX]  << ","
+            // All event columns (recruit/prolif/death/PDL1) are zero at step 0
+            << "0,0,0,0,0,0," // recruit (6)
+            << "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0," // prolif (15)
+            << "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0," // death (15)
+            << "0.0000\n";    // PDL1_frac
         stats_file.flush();
     }
 
