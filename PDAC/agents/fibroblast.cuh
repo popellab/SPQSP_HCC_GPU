@@ -2,12 +2,13 @@
 // States: FIB_NORMAL (quiescent fibroblast), FIB_CAF (activated CAF)
 // Activation: TGFB-driven NORMAL->CAF transition
 //
-// Movement: Follower-leader chain model
-//   - Cells form chains (HEAD → MIDDLE → ... → TAIL)
-//   - HEAD (leader_slot == -1): runs TGFB run-tumble chemotaxis
-//   - Followers: move to where their leader WAS last step (caterpillar motion)
-//   - MacroProperty arrays fib_pos_x/y/z store snapshot positions
-//   - MacroProperty array fib_moved flags which cells moved this step
+// Multi-voxel chain model: one agent occupies 3 voxels (NORMAL) or 5 (CAF).
+//   seg_x/y/z[0] = head (chemotaxis via TGF-β run-tumble)
+//   seg_x/y/z[chain_len-1] = tail
+// Movement: head moves, segments shift (each takes previous position), tail releases.
+//   All done atomically within a single agent function — no multi-pass synchronization.
+// Activation: NORMAL→CAF extends chain from 3→5 by finding 2 free Von Neumann
+//   neighbors off the tail. Both must be found or activation is skipped.
 
 #ifndef FIBROBLAST_CUH
 #define FIBROBLAST_CUH
@@ -18,7 +19,7 @@
 namespace PDAC {
 
 // ============================================================================
-// Fibroblast: Broadcast location (spatial messaging)
+// Fibroblast: Broadcast location (spatial messaging) — broadcasts head position
 // ============================================================================
 FLAMEGPU_AGENT_FUNCTION(fib_broadcast_location, flamegpu::MessageNone, flamegpu::MessageSpatial3D) {
     const float voxel_size = FLAMEGPU->environment.getProperty<float>("voxel_size");
@@ -35,76 +36,54 @@ FLAMEGPU_AGENT_FUNCTION(fib_broadcast_location, flamegpu::MessageNone, flamegpu:
     FLAMEGPU->message_out.setVariable<int>("y", y);
     FLAMEGPU->message_out.setVariable<int>("z", z);
     FLAMEGPU->message_out.setLocation(fx, fy, fz);
+
+    // Count this agent into per-state population snapshot
+    const int fib_cs = FLAMEGPU->getVariable<int>("cell_state");
+    auto* sc_fib = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    atomicAdd(&sc_fib[fib_cs == FIB_NORMAL ? SC_FIB_NORM : SC_FIB_CAF], 1u);
+
     return flamegpu::ALIVE;
 }
 
 // ============================================================================
-// Fibroblast: Write to occupancy grid (exclusive per voxel)
+// Fibroblast: Write all chain segments to occupancy grid
 // ============================================================================
 FLAMEGPU_AGENT_FUNCTION(fib_write_to_occ_grid, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int x = FLAMEGPU->getVariable<int>("x");
-    const int y = FLAMEGPU->getVariable<int>("y");
-    const int z = FLAMEGPU->getVariable<int>("z");
-
+    const int chain_len = FLAMEGPU->getVariable<int>("chain_len");
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
-    occ[x][y][z][CELL_TYPE_FIB].exchange(1u);
+    for (int i = 0; i < chain_len; i++) {
+        const int sx = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", i);
+        const int sy = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", i);
+        const int sz = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", i);
+        occ[sx][sy][sz][CELL_TYPE_FIB].exchange(1u);
+    }
 
     return flamegpu::ALIVE;
 }
 
 // ============================================================================
-// Fibroblast: Compute chemical sources
-// (Fibroblasts do not secrete chemicals directly — matching HCC implementation)
+// Fibroblast: Compute chemical sources (no-op — fibroblasts don't secrete)
 // ============================================================================
 FLAMEGPU_AGENT_FUNCTION(fib_compute_chemical_sources, flamegpu::MessageNone, flamegpu::MessageNone) {
     return flamegpu::ALIVE;
 }
 
 // ============================================================================
-// Fibroblast: Write position snapshot to MacroProperty
-// Resets fib_moved[my_slot] = 0 for this step
-// Must run BEFORE sensor_move and follow_move each step
+// Fibroblast: Unified movement — head does TGF-β chemotaxis, chain shifts
+// Head (seg 0) moves via run-tumble. On success: tail releases, segments shift,
+// head claims new voxel. All in one pass — no cross-agent synchronization.
 // ============================================================================
-FLAMEGPU_AGENT_FUNCTION(fib_write_pos, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int my_slot = FLAMEGPU->getVariable<int>("my_slot");
-    if (my_slot < 0) return flamegpu::ALIVE;  // Uninitialized, skip
-
-    const int x = FLAMEGPU->getVariable<int>("x");
-    const int y = FLAMEGPU->getVariable<int>("y");
-    const int z = FLAMEGPU->getVariable<int>("z");
-
-    auto fib_pos_x = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_x");
-    auto fib_pos_y = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_y");
-    auto fib_pos_z = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_z");
-    auto fib_moved = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_moved");
-
-    fib_pos_x[my_slot].exchange(x);
-    fib_pos_y[my_slot].exchange(y);
-    fib_pos_z[my_slot].exchange(z);
-    fib_moved[my_slot].exchange(0);
-
-    return flamegpu::ALIVE;
-}
-
-// ============================================================================
-// Fibroblast: HEAD/sensor movement — TGFB run-tumble chemotaxis
-// Only runs for cells where leader_slot == -1 (they are the chain front)
-// Uses CAS on occ_grid for exclusivity
-// ============================================================================
-FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int leader_slot = FLAMEGPU->getVariable<int>("leader_slot");
-    if (leader_slot != -1) return flamegpu::ALIVE;  // Not a sensor (HEAD), skip
-
-    const int x = FLAMEGPU->getVariable<int>("x");
+FLAMEGPU_AGENT_FUNCTION(fib_move, flamegpu::MessageNone, flamegpu::MessageNone) {
+    const int chain_len = FLAMEGPU->getVariable<int>("chain_len");
+    const int x = FLAMEGPU->getVariable<int>("x");  // head position
     const int y = FLAMEGPU->getVariable<int>("y");
     const int z = FLAMEGPU->getVariable<int>("z");
     const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
     const int tumble = FLAMEGPU->getVariable<int>("tumble");
-    const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
 
     // ECM based movement probability: higher ECM → more likely to be blocked
     {
@@ -120,10 +99,8 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
     const float move_dir_y = FLAMEGPU->getVariable<float>("move_direction_y");
     const float move_dir_z = FLAMEGPU->getVariable<float>("move_direction_z");
 
-    // Use TGFB gradient for chemotaxis — read directly from PDE
-    const int nx_mv = FLAMEGPU->environment.getProperty<int>("grid_size_x");
-    const int ny_mv = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    const int voxel_mv = z * ny_mv*nx_mv + y * nx_mv + x;
+    // TGF-β gradient for chemotaxis
+    const int voxel_mv = z * (grid_y * grid_x) + y * grid_x + x;
     const float grad_x = reinterpret_cast<const float*>(
         FLAMEGPU->environment.getProperty<uint64_t>(PDE_GRAD_TGFB_X))[voxel_mv];
     const float grad_y = reinterpret_cast<const float*>(
@@ -134,26 +111,21 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
 
-    const float EC50_grad = 1.0;
+    const float EC50_grad = 1.0f;
     const float dt = FLAMEGPU->environment.getProperty<float>("PARAM_SEC_PER_SLICE");
 
-    int target_x = x;
-    int target_y = y;
-    int target_z = z;
+    int new_hx = -1, new_hy = -1, new_hz = -1;  // candidate head position
 
     // === RUN PHASE (tumble == 0) ===
     if (tumble == 0) {
-
         float v_x = move_dir_x / dt;
         float v_y = move_dir_y / dt;
         float v_z = move_dir_z / dt;
 
         float dot_product = v_x * grad_x + v_y * grad_y + v_z * grad_z;
 
-        float lambda = 0.0000168;
-        if (cell_state == FIB_CAF) {
-            float lambda = 0.000168;
-        }
+        // Lambda: same for NORMAL and CAF (shadowed-lambda bug from HCC preserved intentionally)
+        float lambda = 0.0000168f;
         float norm_v = std::sqrt(v_x * v_x + v_y * v_y + v_z * v_z);
         float norm_gradient = std::sqrt(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
 
@@ -162,8 +134,8 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
         float H_grad = norm_gradient / (norm_gradient + EC50_grad);
         if (cos_theta < 0) H_grad = -H_grad;
 
-        float p_tumble = (lambda/2) * (1.0f-cos_theta) * (1-H_grad) * dt;
-        p_tumble = 1 - std::exp(-p_tumble);
+        float p_tumble = (lambda / 2.0f) * (1.0f - cos_theta) * (1.0f - H_grad) * dt;
+        p_tumble = 1.0f - std::exp(-p_tumble);
 
         if (FLAMEGPU->random.uniform<float>() < p_tumble) {
             FLAMEGPU->setVariable<int>("tumble", 1);
@@ -175,117 +147,77 @@ FLAMEGPU_AGENT_FUNCTION(fib_sensor_move, flamegpu::MessageNone, flamegpu::Messag
         int tz = z + static_cast<int>(std::round(move_dir_z));
 
         if (tx < 0 || tx >= grid_x || ty < 0 || ty >= grid_y || tz < 0 || tz >= grid_z) {
-            // FLAMEGPU->setVariable<int>("tumble", 1);
             return flamegpu::ALIVE;
         }
 
+        // Try CAS claim on head's target voxel
         if (occ[tx][ty][tz][CELL_TYPE_CANCER] == 0u &&
             occ[tx][ty][tz][CELL_TYPE_FIB].CAS(0u, 1u) == 0u) {
-            occ[x][y][z][CELL_TYPE_FIB].exchange(0u);
-            FLAMEGPU->setVariable<int>("x", tx);
-            FLAMEGPU->setVariable<int>("y", ty);
-            FLAMEGPU->setVariable<int>("z", tz);
-            const int my_slot = FLAMEGPU->getVariable<int>("my_slot");
-            if (my_slot >= 0) {
-                auto fib_moved = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_moved");
-                fib_moved[my_slot].exchange(1);
-            }
-        } else {
-            // FLAMEGPU->setVariable<int>("tumble", 1);
+            new_hx = tx; new_hy = ty; new_hz = tz;
         }
-        return flamegpu::ALIVE;
     }
     // === TUMBLE PHASE (tumble == 1) ===
-    // Collect all free Moore neighbors, shuffle, try each until CAS wins.
     else {
         int cand_x[26], cand_y[26], cand_z[26];
         int n_cands = 0;
         for (int di = -1; di <= 1; di++) for (int dj = -1; dj <= 1; dj++) for (int dk = -1; dk <= 1; dk++) {
-            if (di==0 && dj==0 && dk==0) continue;
-            int nx = x+di, ny = y+dj, nz = z+dk;
-            if (nx<0||nx>=grid_x||ny<0||ny>=grid_y||nz<0||nz>=grid_z) continue;
+            if (di == 0 && dj == 0 && dk == 0) continue;
+            int nx = x + di, ny = y + dj, nz = z + dk;
+            if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
             if (occ[nx][ny][nz][CELL_TYPE_CANCER] != 0u) continue;
             if (occ[nx][ny][nz][CELL_TYPE_FIB] != 0u) continue;
             cand_x[n_cands] = nx; cand_y[n_cands] = ny; cand_z[n_cands] = nz;
             n_cands++;
         }
         if (n_cands == 0) return flamegpu::ALIVE;
-        for (int i = n_cands-1; i > 0; i--) {
-            int j = static_cast<int>(FLAMEGPU->random.uniform<float>() * (i+1));
+        // Fisher-Yates shuffle
+        for (int i = n_cands - 1; i > 0; i--) {
+            int j = static_cast<int>(FLAMEGPU->random.uniform<float>() * (i + 1));
             if (j > i) j = i;
-            int tx=cand_x[i]; cand_x[i]=cand_x[j]; cand_x[j]=tx;
-            int ty=cand_y[i]; cand_y[i]=cand_y[j]; cand_y[j]=ty;
-            int tz=cand_z[i]; cand_z[i]=cand_z[j]; cand_z[j]=tz;
+            int tx = cand_x[i]; cand_x[i] = cand_x[j]; cand_x[j] = tx;
+            int ty = cand_y[i]; cand_y[i] = cand_y[j]; cand_y[j] = ty;
+            int tz = cand_z[i]; cand_z[i] = cand_z[j]; cand_z[j] = tz;
         }
         for (int i = 0; i < n_cands; i++) {
             if (occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_FIB].CAS(0u, 1u) == 0u) {
-                occ[x][y][z][CELL_TYPE_FIB].exchange(0u);
-                FLAMEGPU->setVariable<int>("x", cand_x[i]);
-                FLAMEGPU->setVariable<int>("y", cand_y[i]);
-                FLAMEGPU->setVariable<int>("z", cand_z[i]);
-                FLAMEGPU->setVariable<float>("move_direction_x", static_cast<float>(cand_x[i]-x));
-                FLAMEGPU->setVariable<float>("move_direction_y", static_cast<float>(cand_y[i]-y));
-                FLAMEGPU->setVariable<float>("move_direction_z", static_cast<float>(cand_z[i]-z));
+                new_hx = cand_x[i]; new_hy = cand_y[i]; new_hz = cand_z[i];
+                FLAMEGPU->setVariable<float>("move_direction_x", static_cast<float>(new_hx - x));
+                FLAMEGPU->setVariable<float>("move_direction_y", static_cast<float>(new_hy - y));
+                FLAMEGPU->setVariable<float>("move_direction_z", static_cast<float>(new_hz - z));
                 FLAMEGPU->setVariable<int>("tumble", 0);
-                const int my_slot = FLAMEGPU->getVariable<int>("my_slot");
-                if (my_slot >= 0) {
-                    auto fib_moved = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_moved");
-                    fib_moved[my_slot].exchange(1);
-                }
                 break;
             }
         }
     }
 
-    return flamegpu::ALIVE;
-}
+    // === CHAIN SHIFT (if head successfully claimed a new voxel) ===
+    if (new_hx >= 0) {
+        // Release tail voxel
+        const int tail_idx = chain_len - 1;
+        const int tail_x = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", tail_idx);
+        const int tail_y = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", tail_idx);
+        const int tail_z = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", tail_idx);
+        occ[tail_x][tail_y][tail_z][CELL_TYPE_FIB].exchange(0u);
 
-// ============================================================================
-// Fibroblast: Follower movement — moves to leader's snapshot position if leader moved
-// Runs in separate layers to propagate movement through chain
-// Layer 0: cells whose leader is the HEAD move (1 step from HEAD)
-// Layer 1: cells whose leader moved in layer 0 move (2 steps from HEAD)
-// Uses CAS on occ_grid for correctness with cross-chain conflicts
-// ============================================================================
-FLAMEGPU_AGENT_FUNCTION(fib_follow_move, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int leader_slot = FLAMEGPU->getVariable<int>("leader_slot");
-    if (leader_slot == -1) return flamegpu::ALIVE;  // HEAD/sensor, handled by fib_sensor_move
+        // Shift segments: each takes the position of the one ahead of it
+        for (int i = tail_idx; i >= 1; i--) {
+            FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", i,
+                FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", i - 1));
+            FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", i,
+                FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", i - 1));
+            FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", i,
+                FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", i - 1));
+        }
 
-    const int my_slot = FLAMEGPU->getVariable<int>("my_slot");
-    if (my_slot < 0) return flamegpu::ALIVE;
+        // Set new head position
+        FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", 0, new_hx);
+        FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", 0, new_hy);
+        FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", 0, new_hz);
 
-    // Check if our leader moved this step
-    auto fib_moved = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_moved");
-    if (static_cast<int>(fib_moved[leader_slot]) == 0) return flamegpu::ALIVE;  // Leader didn't move
-
-    // Get leader's snapshot position (from fib_write_pos at start of step)
-    auto fib_pos_x = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_x");
-    auto fib_pos_y = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_y");
-    auto fib_pos_z = FLAMEGPU->environment.getMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_z");
-
-    const int target_x = static_cast<int>(fib_pos_x[leader_slot]);
-    const int target_y = static_cast<int>(fib_pos_y[leader_slot]);
-    const int target_z = static_cast<int>(fib_pos_z[leader_slot]);
-
-    const int x = FLAMEGPU->getVariable<int>("x");
-    const int y = FLAMEGPU->getVariable<int>("y");
-    const int z = FLAMEGPU->getVariable<int>("z");
-
-    if (target_x == x && target_y == y && target_z == z) return flamegpu::ALIVE;  // Already there
-
-    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
-        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
-
-    // CAS to claim the target voxel (leader should have vacated it)
-    if (occ[target_x][target_y][target_z][CELL_TYPE_FIB].CAS(0u, 1u) == 0u) {
-        // Claimed successfully: release old voxel, update position
-        occ[x][y][z][CELL_TYPE_FIB].exchange(0u);
-        FLAMEGPU->setVariable<int>("x", target_x);
-        FLAMEGPU->setVariable<int>("y", target_y);
-        FLAMEGPU->setVariable<int>("z", target_z);
-
-        // Signal to our followers that we moved
-        fib_moved[my_slot].exchange(1);
+        // Update head aliases
+        FLAMEGPU->setVariable<int>("x", new_hx);
+        FLAMEGPU->setVariable<int>("y", new_hy);
+        FLAMEGPU->setVariable<int>("z", new_hz);
     }
 
     return flamegpu::ALIVE;
@@ -293,31 +225,24 @@ FLAMEGPU_AGENT_FUNCTION(fib_follow_move, flamegpu::MessageNone, flamegpu::Messag
 
 // ============================================================================
 // Fibroblast: State step — TGFB-driven activation (NORMAL -> CAF) and lifespan
+// Sets divide_flag for fib_activate to consume.
 // ============================================================================
 FLAMEGPU_AGENT_FUNCTION(fib_state_step, flamegpu::MessageNone, flamegpu::MessageNone) {
-
-    const int cell_state   = FLAMEGPU->getVariable<int>("cell_state");
-    const int my_slot     = FLAMEGPU->getVariable<int>("my_slot");
-
-    // Allow ALL normal cells with valid slots to evaluate TGFB-driven activation.
-    // This includes isolated sensors (leader_slot==-1) and chain-back cells (leader_slot>=0).
-    // fib_execute_divide (host) filters for true back-of-chain cells before expanding.
-    if (my_slot < 0 || cell_state != FIB_NORMAL) {
-        return flamegpu::ALIVE;
-    }
+    const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
+    if (cell_state != FIB_NORMAL) return flamegpu::ALIVE;
 
     const int nx_ss = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int ny_ss = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int ax_ss = FLAMEGPU->getVariable<int>("x");
     const int ay_ss = FLAMEGPU->getVariable<int>("y");
     const int az_ss = FLAMEGPU->getVariable<int>("z");
-    const int voxel_ss = az_ss * ny_ss*nx_ss + ay_ss * nx_ss + ax_ss;
+    const int voxel_ss = az_ss * ny_ss * nx_ss + ay_ss * nx_ss + ax_ss;
     const float TGFB = reinterpret_cast<const float*>(
         FLAMEGPU->environment.getProperty<uint64_t>(PDE_CONC_TGFB))[voxel_ss];
-    const float ec50     = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
-    const float caf_act  = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_ACTIVATION");
-    const float activation = caf_act * 5 * (1 + TGFB / (TGFB + ec50));
-    const float p_div  = 1.0f - expf(-activation);
+    const float ec50 = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_EC50");
+    const float caf_act = FLAMEGPU->environment.getProperty<float>("PARAM_FIB_CAF_ACTIVATION");
+    const float activation = caf_act * 5.0f * (1.0f + TGFB / (TGFB + ec50));
+    const float p_div = 1.0f - expf(-activation);
 
     if (FLAMEGPU->random.uniform<float>() < p_div) {
         FLAMEGPU->setVariable<int>("divide_flag", 1);
@@ -327,47 +252,122 @@ FLAMEGPU_AGENT_FUNCTION(fib_state_step, flamegpu::MessageNone, flamegpu::Message
 }
 
 // ============================================================================
+// Fibroblast: Activation — extend chain from 3→5, set state to CAF
+// Finds 2 sequential free Von Neumann neighbors off the tail.
+// Both must be found or activation is skipped entirely.
+// ============================================================================
+FLAMEGPU_AGENT_FUNCTION(fib_activate, flamegpu::MessageNone, flamegpu::MessageNone) {
+    if (FLAMEGPU->getVariable<int>("divide_flag") == 0) return flamegpu::ALIVE;
+    if (FLAMEGPU->getVariable<int>("cell_state") != FIB_NORMAL) {
+        FLAMEGPU->setVariable<int>("divide_flag", 0);
+        return flamegpu::ALIVE;
+    }
+
+    // Clear flag regardless of outcome
+    FLAMEGPU->setVariable<int>("divide_flag", 0);
+
+    const int chain_len = FLAMEGPU->getVariable<int>("chain_len");
+    if (chain_len >= MAX_FIB_CHAIN_LENGTH) return flamegpu::ALIVE;  // already max
+
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
+        OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
+
+    // Current tail position
+    const int tail_x = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", chain_len - 1);
+    const int tail_y = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", chain_len - 1);
+    const int tail_z = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", chain_len - 1);
+
+    // Von Neumann (6 face neighbors)
+    const int dx6[6] = {1, -1, 0, 0, 0, 0};
+    const int dy6[6] = {0, 0, 1, -1, 0, 0};
+    const int dz6[6] = {0, 0, 0, 0, 1, -1};
+
+    // Find first new segment adjacent to tail
+    int n1x = -1, n1y = -1, n1z = -1;
+    for (int d = 0; d < 6; d++) {
+        int nx = tail_x + dx6[d], ny = tail_y + dy6[d], nz = tail_z + dz6[d];
+        if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+        if (occ[nx][ny][nz][CELL_TYPE_CANCER] != 0u) continue;
+        if (occ[nx][ny][nz][CELL_TYPE_FIB].CAS(0u, 1u) != 0u) continue;  // already occupied
+        n1x = nx; n1y = ny; n1z = nz;
+        break;
+    }
+    if (n1x < 0) return flamegpu::ALIVE;  // no space for first segment
+
+    // Find second new segment adjacent to first new (not tail)
+    int n2x = -1, n2y = -1, n2z = -1;
+    for (int d = 0; d < 6; d++) {
+        int nx = n1x + dx6[d], ny = n1y + dy6[d], nz = n1z + dz6[d];
+        if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+        // Skip the tail voxel itself
+        if (nx == tail_x && ny == tail_y && nz == tail_z) continue;
+        if (occ[nx][ny][nz][CELL_TYPE_CANCER] != 0u) continue;
+        if (occ[nx][ny][nz][CELL_TYPE_FIB].CAS(0u, 1u) != 0u) continue;
+        n2x = nx; n2y = ny; n2z = nz;
+        break;
+    }
+    if (n2x < 0) {
+        // Failed to find second — release first and abort
+        occ[n1x][n1y][n1z][CELL_TYPE_FIB].exchange(0u);
+        return flamegpu::ALIVE;
+    }
+
+    // Success: extend chain
+    FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", chain_len, n1x);
+    FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", chain_len, n1y);
+    FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", chain_len, n1z);
+    FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", chain_len + 1, n2x);
+    FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", chain_len + 1, n2y);
+    FLAMEGPU->setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", chain_len + 1, n2z);
+    FLAMEGPU->setVariable<int>("chain_len", chain_len + 2);
+    FLAMEGPU->setVariable<int>("cell_state", FIB_CAF);
+
+    return flamegpu::ALIVE;
+}
+
+// ============================================================================
 // Fibroblast: Build Gaussian density field for ECM deposition
-// Each fibroblast scatters a 3D Gaussian kernel (radius=10, sigma=3) to the
-// fib_density_field MacroProperty. CAFs contribute with scale=1.0, normals 0.5.
-// TGFB amplification is pre-multiplied at the fibroblast's voxel.
-// update_ecm_grid host fn then uses this field to deposit ECM.
+// Iterates over all chain_len segments, scattering a Gaussian kernel per segment.
 // ============================================================================
 FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu::MessageNone) {
-    const int cx = FLAMEGPU->getVariable<int>("x");
-    const int cy = FLAMEGPU->getVariable<int>("y");
-    const int cz = FLAMEGPU->getVariable<int>("z");
+    const int chain_len = FLAMEGPU->getVariable<int>("chain_len");
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
 
     const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
 
-    // Matching HCC: pure Gaussian scatter with CAF/normal scale only.
-    // TGFB amplification is applied per-voxel in update_ecm_grid_kernel, not here.
     const float scale = (cell_state == FIB_CAF) ? 1.0f : 0.5f;
 
-    // Gaussian parameters matching HCC (radius=10, sigma=3)
     const int radius = 10;
     const float variance = 9.0f;  // sigma^2 = 3^2
-    // normalizer = 1 / (sigma^3 * sqrt(2*pi)) = 1 / (27 * 2.5066) ≈ 0.014784
     const float normalizer = 0.014784f;
 
     float* field_ptr = reinterpret_cast<float*>(
         FLAMEGPU->environment.getProperty<uint64_t>("fib_density_field_ptr"));
 
-    for (int dx = -radius; dx <= radius; dx++) {
-        const int nx = cx + dx;
-        if (nx < 0 || nx >= grid_x) continue;
-        for (int dy = -radius; dy <= radius; dy++) {
-            const int ny = cy + dy;
-            if (ny < 0 || ny >= grid_y) continue;
-            for (int dz = -radius; dz <= radius; dz++) {
-                const int nz = cz + dz;
-                if (nz < 0 || nz >= grid_z) continue;
-                float dist_sq = static_cast<float>(dx*dx + dy*dy + dz*dz);
-                float kernel_val = scale * normalizer * expf(-dist_sq / (2.0f * variance));
-                atomicAdd(&field_ptr[nz * (grid_x * grid_y) + ny * grid_x + nx], kernel_val);
+    for (int seg = 0; seg < chain_len; seg++) {
+        const int cx = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", seg);
+        const int cy = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", seg);
+        const int cz = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", seg);
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            const int nx = cx + dx;
+            if (nx < 0 || nx >= grid_x) continue;
+            for (int dy = -radius; dy <= radius; dy++) {
+                const int ny = cy + dy;
+                if (ny < 0 || ny >= grid_y) continue;
+                for (int dz = -radius; dz <= radius; dz++) {
+                    const int nz = cz + dz;
+                    if (nz < 0 || nz >= grid_z) continue;
+                    float dist_sq = static_cast<float>(dx * dx + dy * dy + dz * dz);
+                    float kernel_val = scale * normalizer * expf(-dist_sq / (2.0f * variance));
+                    atomicAdd(&field_ptr[nz * (grid_x * grid_y) + ny * grid_x + nx], kernel_val);
+                }
             }
         }
     }

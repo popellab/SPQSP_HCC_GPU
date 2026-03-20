@@ -27,6 +27,10 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_broadcast_location, flamegpu::MessageNone, flamegpu
         (z + 0.5f) * voxel_size
     );
 
+    // Count this agent into per-state population snapshot
+    auto* sc_mdsc = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    atomicAdd(&sc_mdsc[SC_MDSC], 1u);
+
     return flamegpu::ALIVE;
 }
 
@@ -131,6 +135,8 @@ FLAMEGPU_AGENT_FUNCTION(mdsc_state_step, flamegpu::MessageNone, flamegpu::Messag
     life--;
     if (life <= 0) {
         FLAMEGPU->setVariable<int>("dead", 1);
+        auto* evts_md = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+        atomicAdd(&evts_md[EVT_DEATH_MDSC], 1u);
         return flamegpu::DEAD;
     }
     FLAMEGPU->setVariable<int>("life", life);

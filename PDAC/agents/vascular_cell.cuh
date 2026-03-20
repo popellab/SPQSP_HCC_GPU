@@ -15,7 +15,8 @@ FLAMEGPU_AGENT_FUNCTION(vascular_broadcast_location, flamegpu::MessageNone, flam
 
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_VASCULAR);
     FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getID());
-    FLAMEGPU->message_out.setVariable<int>("cell_state", FLAMEGPU->getVariable<int>("cell_state"));
+    const int vas_cs = FLAMEGPU->getVariable<int>("cell_state");
+    FLAMEGPU->message_out.setVariable<int>("cell_state", vas_cs);
     FLAMEGPU->message_out.setVariable<int>("voxel_x", x);
     FLAMEGPU->message_out.setVariable<int>("voxel_y", y);
     FLAMEGPU->message_out.setVariable<int>("voxel_z", z);
@@ -26,6 +27,10 @@ FLAMEGPU_AGENT_FUNCTION(vascular_broadcast_location, flamegpu::MessageNone, flam
         static_cast<float>(y) * voxel_size,
         static_cast<float>(z) * voxel_size
     );
+
+    // Count this agent into per-state population snapshot
+    auto* sc_vas = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    atomicAdd(&sc_vas[vas_cs == VAS_TIP ? SC_VAS_TIP : SC_VAS_PHALANX], 1u);
 
     return flamegpu::ALIVE;
 }
@@ -343,6 +348,10 @@ FLAMEGPU_AGENT_FUNCTION(vascular_divide, flamegpu::MessageNone, flamegpu::Messag
         // Parent phalanx stays phalanx; clear branch flag
         FLAMEGPU->setVariable<int>("branch", 0);
     }
+
+    // Count new vascular cell (one per division, TIP→PHALANX or PHALANX→TIP)
+    auto* evts_vas = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+    atomicAdd(&evts_vas[EVT_PROLIF_VAS_TIP], 1u);
 
     FLAMEGPU->setVariable<int>("intent_action", INTENT_NONE);
     return flamegpu::ALIVE;

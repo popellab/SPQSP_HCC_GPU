@@ -85,10 +85,67 @@ constexpr int MAX_CANCER_PER_VOXEL = 1;         // Max cancer cells per voxel
 constexpr int MAX_MDSC_PER_VOXEL = 1;           // Max MDSC per voxel (exclusive)
 constexpr int N_DIVIDE_WAVES = 1;               // Wave-interleaved division rounds (cancer/tcell/treg)
 constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exclusive)
-constexpr int MAX_FIB_SLOTS      = 12000;       // Total slot capacity for chain MacroProperties (init + expansion)
-constexpr int MAX_FIB_INIT_SLOTS = 4347;        // Temporary: match HCC initial fibroblast count (~4933 at step 1)
-constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max cells per fibroblast chain (HEAD + N-1 followers); grows via division
-constexpr int ABM_EVENT_COUNTER_SIZE = 15;     // Array size for ABM→QSP event counters (deaths + recruitment + diagnostics)
+constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max segments per fibroblast chain (3 normal, 5 CAF)
+// ── Per-step event counters (device_event_counters[], env prop "event_counters_ptr") ──────────────
+// Reset each step. Written by agent device functions via atomicAdd.
+enum EventCounterIdx : int {
+    // Proliferation (daughter cell created by division)
+    EVT_PROLIF_CD8_EFF = 0,
+    EVT_PROLIF_CD8_CYT,
+    EVT_PROLIF_CD8_SUP,
+    EVT_PROLIF_TH,
+    EVT_PROLIF_TREG,
+    EVT_PROLIF_MDSC,          // 0 — division not implemented
+    EVT_PROLIF_CANCER_STEM,
+    EVT_PROLIF_CANCER_PROG,
+    EVT_PROLIF_CANCER_SEN,    // 0 — senescent cells don't divide
+    EVT_PROLIF_MAC_M1,        // 0 — division not implemented
+    EVT_PROLIF_MAC_M2,        // 0
+    EVT_PROLIF_FIB_NORM,      // 0 — division disabled
+    EVT_PROLIF_FIB_CAF,       // 0
+    EVT_PROLIF_VAS_TIP,
+    EVT_PROLIF_VAS_PHALANX,   // 0
+    // Deaths (all causes combined, by cell type/state)
+    EVT_DEATH_CD8_EFF,
+    EVT_DEATH_CD8_CYT,
+    EVT_DEATH_CD8_SUP,
+    EVT_DEATH_TH,
+    EVT_DEATH_TREG,
+    EVT_DEATH_MDSC,
+    EVT_DEATH_CANCER_STEM,
+    EVT_DEATH_CANCER_PROG,
+    EVT_DEATH_CANCER_SEN,
+    EVT_DEATH_MAC_M1,
+    EVT_DEATH_MAC_M2,
+    EVT_DEATH_FIB_NORM,
+    EVT_DEATH_FIB_CAF,
+    EVT_DEATH_VAS_TIP,
+    EVT_DEATH_VAS_PHALANX,
+    // PDL1 expression numerator (divide by total cancer for PDL1_frac)
+    EVT_PDL1_COUNT,
+    ABM_EVENT_COUNTER_SIZE    // = 31
+};
+
+// ── Per-step population counts by state (device_state_counters[], env prop "state_counters_ptr") ─
+// Accumulated during final_broadcast_* functions (start-of-step snapshot). Reset each step.
+enum StateCounterIdx : int {
+    SC_CANCER_STEM = 0,
+    SC_CANCER_PROG,
+    SC_CANCER_SEN,
+    SC_CD8_EFF,
+    SC_CD8_CYT,
+    SC_CD8_SUP,
+    SC_TH,
+    SC_TREG,
+    SC_MDSC,
+    SC_MAC_M1,
+    SC_MAC_M2,
+    SC_FIB_NORM,
+    SC_FIB_CAF,
+    SC_VAS_TIP,
+    SC_VAS_PHALANX,
+    ABM_STATE_COUNTER_SIZE    // = 15
+};
 constexpr int MAX_RECRUITS_PER_STEP = 4096;    // Max recruitment requests per ABM step (GPU buffer size)
 
 // GPU recruitment request: filled by recruit_all_kernel, consumed by place_recruited_agents host fn.

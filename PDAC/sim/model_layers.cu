@@ -12,7 +12,7 @@ extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_pde_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_agent_counts;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_qsp_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_fib_density_field;
-extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER fib_execute_divide;
+// fib_execute_divide removed: activation is now device-side (fib_activate)
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER aggregate_abm_events;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER copy_abm_counters_to_environment;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_abm_event_counters;
@@ -140,24 +140,12 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
             if (i < mdsc_steps)   layer.addAgentFunction(AGENT_MDSC, "move");
             if (i < mac_steps)    layer.addAgentFunction(AGENT_MACROPHAGE, "move");
         }
-        // Fibroblast chain movement: write_pos snapshot, sensor (HEAD) chemotaxis, then
-        // four follower-propagation passes to support chains up to 5 cells deep.
-        // Kept separate — chain movement is incompatible with single-step interleaving
-        // and fibroblasts don't compete with cancer for voxels (different occ slot).
+        // Fibroblast movement: single agent = single chain, head moves + segments shift atomically.
+        // No multi-pass synchronization needed. Separate from interleaved movement since
+        // fibroblasts use their own occ slot and don't compete with cancer/immune cells.
         for (int i = 0; i < fib_steps; i++) {
-            {
-                flamegpu::LayerDescription layer = model.newLayer("fib_write_pos_" + std::to_string(i));
-                layer.addAgentFunction(AGENT_FIBROBLAST, "write_pos");
-            }
-            {
-                flamegpu::LayerDescription layer = model.newLayer("fib_sensor_move_" + std::to_string(i));
-                layer.addAgentFunction(AGENT_FIBROBLAST, "sensor_move");
-            }
-            for (int pass = 0; pass < 4; pass++) {
-                flamegpu::LayerDescription layer = model.newLayer(
-                    "fib_follow_move_" + std::to_string(pass) + "_" + std::to_string(i));
-                layer.addAgentFunction(AGENT_FIBROBLAST, "follow_move");
-            }
+            flamegpu::LayerDescription layer = model.newLayer("fib_move_" + std::to_string(i));
+            layer.addAgentFunction(AGENT_FIBROBLAST, "move");
         }
         {
             flamegpu::LayerDescription layer = model.newLayer("move_vascular");
@@ -283,8 +271,8 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addAgentFunction(AGENT_VASCULAR, "vascular_divide");
     }
     {
-        flamegpu::LayerDescription layer = model.newLayer("fib_execute_divide");
-        layer.addHostFunction(fib_execute_divide);
+        flamegpu::LayerDescription layer = model.newLayer("fib_activate");
+        layer.addAgentFunction(AGENT_FIBROBLAST, "activate");
     }
 
     // ── Timing checkpoint: after division ──

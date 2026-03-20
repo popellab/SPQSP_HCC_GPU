@@ -7,9 +7,9 @@
 #include <chrono>
 #include <nvtx3/nvToolsExt.h>
 
-// File stream for QSP CSV output — file-scope (not in PDAC namespace) so the
-// exportQSPData step function (also at file scope) can access it directly.
+// File-scope variables (accessible to exportQSPData step function outside PDAC namespace)
 static std::ofstream g_qsp_csv;
+static std::string g_qsp_output_path = "outputs/qsp.csv";
 
 namespace PDAC{
 
@@ -31,6 +31,10 @@ LymphCentralWrapper* get_lymph_pointer() {
     return g_lymph;
 }
 
+void set_qsp_output_path(const std::string& path) {
+    g_qsp_output_path = path;
+}
+
 // Export step-0 QSP state (initial condition, before any simulation steps).
 // Called from main.cu after presim completes and before the main loop.
 void exportQSPData_step0() {
@@ -40,7 +44,7 @@ void exportQSPData_step0() {
 
     if (!g_qsp_csv.is_open()) {
         std::filesystem::create_directories("outputs");
-        g_qsp_csv.open("outputs/qsp.csv");
+        g_qsp_csv.open(g_qsp_output_path);
         g_qsp_csv << "step" << CancerVCT::ODE_system::getHeader() << "\n";
     }
     g_qsp_csv << 0 << *ode << "\n";
@@ -171,7 +175,7 @@ FLAMEGPU_STEP_FUNCTION(exportQSPData) {
     // Open file and write header on first (main-sim) call
     if (!g_qsp_csv.is_open()) {
         std::filesystem::create_directories("outputs");
-        g_qsp_csv.open("outputs/qsp.csv");
+        g_qsp_csv.open(g_qsp_output_path);
         g_qsp_csv << "step" << CancerVCT::ODE_system::getHeader() << "\n";
     }
 

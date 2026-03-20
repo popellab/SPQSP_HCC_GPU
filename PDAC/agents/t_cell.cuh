@@ -15,7 +15,8 @@ FLAMEGPU_AGENT_FUNCTION(tcell_broadcast_location, flamegpu::MessageNone, flamegp
 
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_T);
     FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getID());
-    FLAMEGPU->message_out.setVariable<int>("cell_state", FLAMEGPU->getVariable<int>("cell_state"));
+    const int tcell_cs = FLAMEGPU->getVariable<int>("cell_state");
+    FLAMEGPU->message_out.setVariable<int>("cell_state", tcell_cs);
     FLAMEGPU->message_out.setVariable<float>("PDL1", 0.0f);  // T cells don't have PDL1
     FLAMEGPU->message_out.setVariable<int>("voxel_x", x);
     FLAMEGPU->message_out.setVariable<int>("voxel_y", y);
@@ -26,6 +27,12 @@ FLAMEGPU_AGENT_FUNCTION(tcell_broadcast_location, flamegpu::MessageNone, flamegp
         (y + 0.5f) * voxel_size,
         (z + 0.5f) * voxel_size
     );
+
+    // Count this agent into per-state population snapshot
+    auto* sc = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    const int sc_slot = (tcell_cs == T_CELL_EFF) ? SC_CD8_EFF :
+                        (tcell_cs == T_CELL_CYT)  ? SC_CD8_CYT : SC_CD8_SUP;
+    atomicAdd(&sc[sc_slot], 1u);
 
     return flamegpu::ALIVE;
 }
@@ -153,6 +160,10 @@ FLAMEGPU_AGENT_FUNCTION(tcell_state_step, flamegpu::MessageNone, flamegpu::Messa
     life--;
     if (life <= 0) {
         FLAMEGPU->setVariable<int>("dead", 1);
+        auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+        const int ds = (cell_state == T_CELL_EFF) ? EVT_DEATH_CD8_EFF :
+                       (cell_state == T_CELL_CYT)  ? EVT_DEATH_CD8_CYT : EVT_DEATH_CD8_SUP;
+        atomicAdd(&evts[ds], 1u);
         return flamegpu::DEAD;
     }
     FLAMEGPU->setVariable<int>("life", life);
@@ -385,7 +396,13 @@ FLAMEGPU_AGENT_FUNCTION(tcell_divide, flamegpu::MessageNone, flamegpu::MessageNo
         FLAMEGPU->setVariable<int>("divide_cd", div_interval);
 
         // Track T cell proliferation event
-        atomicAdd(&reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_tcell_prolif_ptr"))[0], 1u);
+        {
+            auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+            const int cs_div = FLAMEGPU->getVariable<int>("cell_state");
+            const int ps = (cs_div == T_CELL_EFF) ? EVT_PROLIF_CD8_EFF :
+                           (cs_div == T_CELL_CYT)  ? EVT_PROLIF_CD8_CYT : EVT_PROLIF_CD8_SUP;
+            atomicAdd(&evts[ps], 1u);
+        }
 
         break;  // Division done
     }

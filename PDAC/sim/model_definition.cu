@@ -417,40 +417,32 @@ void defineMacrophageAgent(flamegpu::ModelDescription& model, bool include_state
 void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state) {
     flamegpu::AgentDescription fib = model.newAgent(AGENT_FIBROBLAST);
 
-    // Position
+    // Head position (segment 0 alias — used by broadcast_location and neighbor messaging)
     fib.newVariable<int>("x");
     fib.newVariable<int>("y");
     fib.newVariable<int>("z");
 
+    // Multi-voxel chain: one agent occupies chain_len voxels (3=NORMAL, 5=CAF)
+    // Segment 0 = head (chemotaxis), segment chain_len-1 = tail
+    fib.newVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", {0, 0, 0, 0, 0});
+    fib.newVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", {0, 0, 0, 0, 0});
+    fib.newVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", {0, 0, 0, 0, 0});
+    fib.newVariable<int>("chain_len", 3);
+
     // Fibroblast state (0=NORMAL, 1=CAF)
     fib.newVariable<int>("cell_state", FIB_NORMAL);
 
-    // Movement state for run-tumble chemotaxis
+    // Movement state for run-tumble chemotaxis (head segment)
     fib.newVariable<float>("move_direction_x", 0.0f);
     fib.newVariable<float>("move_direction_y", 0.0f);
     fib.newVariable<float>("move_direction_z", 0.0f);
-    fib.newVariable<int>("tumble", 1);  // 0=running, 1=tumbling (default: tumble to pick initial direction)
-
-    // Chain-based follower-leader movement variables
-    // Chain: HEAD (divides, future) → MIDDLE → TAIL (senses gradient, chemotaxis)
-    // leader_slot: slot of cell toward TAIL end; -1 = this cell IS the TAIL (mover)
-    // my_slot: this cell's unique slot index in MacroProperty arrays fib_pos_x/y/z and fib_moved
-    fib.newVariable<int>("leader_slot", -1);  // -1 = TAIL (does chemotaxis)
-    fib.newVariable<int>("my_slot", -1);       // assigned during initialization
+    fib.newVariable<int>("tumble", 1);
 
     // Lifecycle
     fib.newVariable<int>("life", 0);
 
-    // Division flag (set by state_step, used by fib_execute_divide)
+    // Activation flag (set by state_step, consumed by fib_activate)
     fib.newVariable<int>("divide_flag", 0);
-
-    // MacroProperty arrays for chain movement:
-    // fib_pos_x/y/z: snapshot positions written at start of each step
-    // fib_moved: 1 if this slot's cell moved this step, 0 otherwise
-    model.Environment().newMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_x");
-    model.Environment().newMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_y");
-    model.Environment().newMacroProperty<int, MAX_FIB_SLOTS>("fib_pos_z");
-    model.Environment().newMacroProperty<int, MAX_FIB_SLOTS>("fib_moved");
 
     // Define agent functions
     fib.newFunction("broadcast_location", fib_broadcast_location)
@@ -460,11 +452,10 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
 
     if (include_state) {
         fib.newFunction("write_to_occ_grid", fib_write_to_occ_grid);
-        fib.newFunction("write_pos", fib_write_pos);
-        fib.newFunction("sensor_move", fib_sensor_move);
-        fib.newFunction("follow_move", fib_follow_move);
+        fib.newFunction("move", fib_move);
         fib.newFunction("state_step", fib_state_step)
             .setAllowAgentDeath(true);
+        fib.newFunction("activate", fib_activate);
         fib.newFunction("build_density_field", fib_build_density_field);
     }
 }
@@ -670,30 +661,11 @@ void defineEnvironment(flamegpu::ModelDescription& model,
     // Values: cancer deaths (by cause), immune cell recruitment counts.
     env.newMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
 
-    // Event tracking for comparison with HCC (cumulative counts per step)
-    env.newProperty<unsigned int>("event_tcell_prolif", 0u);  // T cell (CD8 cytotoxic) proliferation
-    env.newProperty<unsigned int>("event_tcell_recruit", 0u); // T cell (CD8) recruitment
-    env.newProperty<unsigned int>("event_th_prolif", 0u);     // T helper (TH) proliferation
-    env.newProperty<unsigned int>("event_treg_prolif", 0u);   // T regulatory (TReg) proliferation
-
-    // GPU pointers for event counter arrays (set by main.cu after CUDA init)
-    env.newProperty<uint64_t>("event_tcell_prolif_ptr", 0u);  // Pointer to GPU counter
-    env.newProperty<uint64_t>("event_tcell_recruit_ptr", 0u); // Pointer to GPU counter
-    env.newProperty<uint64_t>("event_th_prolif_ptr", 0u);     // Pointer to GPU counter
-    env.newProperty<uint64_t>("event_th_recruit_ptr", 0u);    // Pointer to GPU counter
-    env.newProperty<uint64_t>("event_treg_prolif_ptr", 0u);   // Pointer to GPU counter
-    // Cancer event counters
-    env.newProperty<uint64_t>("event_cancer_t_kill_ptr", 0u);    // Cancer killed by T cell
-    env.newProperty<uint64_t>("event_cancer_mac_kill_ptr", 0u);  // Cancer killed by macrophage
-    env.newProperty<uint64_t>("event_cancer_nat_death_ptr", 0u); // Cancer natural (senescent) death
-    env.newProperty<uint64_t>("event_cancer_divide_ptr", 0u);    // Cancer successful division
-    // Diagnostic event counters
-    env.newProperty<uint64_t>("event_cancer_divide_attempt_ptr", 0u);  // Division attempts
-    env.newProperty<uint64_t>("event_cancer_divide_no_space_ptr", 0u); // No open voxel
-    env.newProperty<uint64_t>("event_cancer_senescence_ptr", 0u);      // Senescence transitions
-    env.newProperty<uint64_t>("event_cancer_t_kill_eval_ptr", 0u);     // T kill evaluations
-    env.newProperty<uint64_t>("event_cancer_p_kill_sum_ptr", 0u);      // p_kill sum (×10000)
-    env.newProperty<uint64_t>("event_cancer_mac_kill_eval_ptr", 0u);   // MAC kill evaluations
+    // Single base-pointer props for per-step stats arrays (set by main.cu after CUDA alloc)
+    // event_counters_ptr → device_event_counters[ABM_EVENT_COUNTER_SIZE]  (prolif + death + PDL1)
+    // state_counters_ptr → device_state_counters[ABM_STATE_COUNTER_SIZE]  (per-state agent counts)
+    env.newProperty<uint64_t>("event_counters_ptr", 0u);
+    env.newProperty<uint64_t>("state_counters_ptr", 0u);
 
     // Populate ALL other parameters from XML
     params.populateFlameGPUEnvironment(env);

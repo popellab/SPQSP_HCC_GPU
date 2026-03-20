@@ -23,12 +23,16 @@ FLAMEGPU_AGENT_FUNCTION(mac_broadcast_location, flamegpu::MessageNone, flamegpu:
     FLAMEGPU->message_out.setVariable<int>("voxel_x", x);
     FLAMEGPU->message_out.setVariable<int>("voxel_y", y);
     FLAMEGPU->message_out.setVariable<int>("voxel_z", z);
-    FLAMEGPU->message_out.setVariable<int>("cell_state", FLAMEGPU->getVariable<int>("cell_state"));
+    const int mac_cs = FLAMEGPU->getVariable<int>("cell_state");
+    FLAMEGPU->message_out.setVariable<int>("cell_state", mac_cs);
     FLAMEGPU->message_out.setLocation(
         (x + 0.5f) * voxel_size,
         (y + 0.5f) * voxel_size,
         (z + 0.5f) * voxel_size
     );
+    // Count this agent into per-state population snapshot
+    auto* sc_mac = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    atomicAdd(&sc_mac[mac_cs == MAC_M1 ? SC_MAC_M1 : SC_MAC_M2], 1u);
     return flamegpu::ALIVE;
 }
 
@@ -304,6 +308,8 @@ FLAMEGPU_AGENT_FUNCTION(mac_state_step, flamegpu::MessageNone, flamegpu::Message
     // Decrement lifespan
     life--;
     if (life <= 0) {
+        auto* evts_mac = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+        atomicAdd(&evts_mac[cell_state == MAC_M1 ? EVT_DEATH_MAC_M1 : EVT_DEATH_MAC_M2], 1u);
         return flamegpu::DEAD;
     }
     FLAMEGPU->setVariable<int>("life", life);

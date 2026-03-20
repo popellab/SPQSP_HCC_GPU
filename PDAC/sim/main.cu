@@ -29,7 +29,10 @@ extern RecruitStats get_last_recruit_stats();
 // QSP CSV export step function (defined in qsp_integration.cu)
 extern flamegpu::FLAMEGPU_STEP_FUNCTION_POINTER exportQSPData;
 // QSP step-0 export (initial condition, called before main loop)
-namespace PDAC { extern void exportQSPData_step0(); }
+namespace PDAC {
+    extern void exportQSPData_step0();
+    extern void set_qsp_output_path(const std::string& path);
+}
 
 namespace PDAC {
     std::unique_ptr<flamegpu::ModelDescription> buildModel(
@@ -371,10 +374,17 @@ static void collect_abm_step0(flamegpu::CUDASimulation& sim,
     {
         flamegpu::AgentVector p(model.Agent(PDAC::AGENT_FIBROBLAST));
         sim.getPopulationData(p);
-        for (unsigned i = 0; i < p.size(); ++i)
-            abm_push(buf, ABM_TYPE_FIB, (int32_t)p[i].getID(),
-                p[i].getVariable<int>("x"), p[i].getVariable<int>("y"), p[i].getVariable<int>("z"),
-                p[i].getVariable<int>("cell_state"), p[i].getVariable<int>("life"), 0);
+        for (unsigned i = 0; i < p.size(); ++i) {
+            const int32_t id    = (int32_t)p[i].getID();
+            const int     state = p[i].getVariable<int>("cell_state");
+            const int     life  = p[i].getVariable<int>("life");
+            const int     clen  = p[i].getVariable<int>("chain_len");
+            const auto    sx    = p[i].getVariable<int, PDAC::MAX_FIB_CHAIN_LENGTH>("seg_x");
+            const auto    sy    = p[i].getVariable<int, PDAC::MAX_FIB_CHAIN_LENGTH>("seg_y");
+            const auto    sz    = p[i].getVariable<int, PDAC::MAX_FIB_CHAIN_LENGTH>("seg_z");
+            for (int s = 0; s < clen; ++s)
+                abm_push(buf, ABM_TYPE_FIB, id, sx[s], sy[s], sz[s], state, life, 0);
+        }
     }
     {
         flamegpu::AgentVector p(model.Agent(PDAC::AGENT_VASCULAR));
@@ -430,10 +440,18 @@ static void collect_abm_step(flamegpu::HostAPI* FLAMEGPU, std::vector<int32_t>& 
     }
     {
         flamegpu::DeviceAgentVector p = FLAMEGPU->agent(PDAC::AGENT_FIBROBLAST).getPopulationData();
-        for (unsigned i = 0; i < p.size(); ++i)
-            abm_push(buf, ABM_TYPE_FIB, (int32_t)p[i].getID(),
-                p[i].getVariable<int>("x"), p[i].getVariable<int>("y"), p[i].getVariable<int>("z"),
-                p[i].getVariable<int>("cell_state"), p[i].getVariable<int>("life"), 0);
+        for (unsigned i = 0; i < p.size(); ++i) {
+            const int32_t id    = (int32_t)p[i].getID();
+            const int     state = p[i].getVariable<int>("cell_state");
+            const int     life  = p[i].getVariable<int>("life");
+            const int     clen  = p[i].getVariable<int>("chain_len");
+            for (int s = 0; s < clen; ++s)
+                abm_push(buf, ABM_TYPE_FIB, id,
+                    p[i].getVariable<int, PDAC::MAX_FIB_CHAIN_LENGTH>("seg_x", s),
+                    p[i].getVariable<int, PDAC::MAX_FIB_CHAIN_LENGTH>("seg_y", s),
+                    p[i].getVariable<int, PDAC::MAX_FIB_CHAIN_LENGTH>("seg_z", s),
+                    state, life, 0);
+        }
     }
     {
         flamegpu::DeviceAgentVector p = FLAMEGPU->agent(PDAC::AGENT_VASCULAR).getPopulationData();
@@ -656,55 +674,31 @@ int main(int argc, const char** argv) {
     init_lap("init_qsp");
 
     // ========== ADD STEP FUNCTIONS ==========
-    if (config.pde_out) {
+    if (config.grid_out & 2) {
         model->addStepFunction(exportPDEData);
         model->addStepFunction(exportECMData);
     }
-    if (config.abm_out) {
+    if (config.grid_out & 1) {
         model->addStepFunction(exportABMData);
     }
     model->addStepFunction(exportQSPData);
     model->addStepFunction(stepCounter);
     model->addExitCondition(checkSimulationEnd);
 
-    // ========== ALLOCATE GPU MEMORY FOR EVENT COUNTERS ==========
+    // ========== ALLOCATE GPU MEMORY FOR EVENT/STATE COUNTERS ==========
     // Do this BEFORE creating CUDASimulation so environment properties are synced
     unsigned int* device_event_counters = nullptr;
+    unsigned int* device_state_counters = nullptr;
     cudaMalloc(&device_event_counters, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
+    cudaMalloc(&device_state_counters, PDAC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int));
     cudaMemset(device_event_counters, 0, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
+    cudaMemset(device_state_counters, 0, PDAC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int));
 
-    // Store pointers to event counters in model environment (before CUDASimulation init)
-    model->Environment().setProperty<uint64_t>("event_tcell_prolif_ptr",
+    // Store base pointers in model environment (before CUDASimulation init)
+    model->Environment().setProperty<uint64_t>("event_counters_ptr",
         reinterpret_cast<uint64_t>(device_event_counters));
-    model->Environment().setProperty<uint64_t>("event_tcell_recruit_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 1));
-    model->Environment().setProperty<uint64_t>("event_th_prolif_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 2));
-    model->Environment().setProperty<uint64_t>("event_th_recruit_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 3));
-    model->Environment().setProperty<uint64_t>("event_treg_prolif_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 4));
-    model->Environment().setProperty<uint64_t>("event_cancer_t_kill_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 5));
-    model->Environment().setProperty<uint64_t>("event_cancer_mac_kill_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 6));
-    model->Environment().setProperty<uint64_t>("event_cancer_nat_death_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 7));
-    model->Environment().setProperty<uint64_t>("event_cancer_divide_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 8));
-    // Diagnostic counters
-    model->Environment().setProperty<uint64_t>("event_cancer_divide_attempt_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 9));
-    model->Environment().setProperty<uint64_t>("event_cancer_divide_no_space_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 10));
-    model->Environment().setProperty<uint64_t>("event_cancer_senescence_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 11));
-    model->Environment().setProperty<uint64_t>("event_cancer_t_kill_eval_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 12));
-    model->Environment().setProperty<uint64_t>("event_cancer_p_kill_sum_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 13));
-    model->Environment().setProperty<uint64_t>("event_cancer_mac_kill_eval_ptr",
-        reinterpret_cast<uint64_t>(device_event_counters + 14));
+    model->Environment().setProperty<uint64_t>("state_counters_ptr",
+        reinterpret_cast<uint64_t>(device_state_counters));
 
     // ========== CREATE SIMULATION ==========
     // Increase CUDA per-thread stack size for complex kernels (default 1KB is too small
@@ -784,32 +778,119 @@ int main(int argc, const char** argv) {
     }
     init_file.close();
 
+    // ========== BUILD SEED-STAMPED FILE NAMES ==========
+    char stats_path[256], timing_path[256], qsp_seed_path[256];
+    snprintf(stats_path,    sizeof(stats_path),    "outputs/stats_%u.csv",  config.random_seed);
+    snprintf(timing_path,   sizeof(timing_path),   "outputs/timing_%u.csv", config.random_seed);
+    snprintf(qsp_seed_path, sizeof(qsp_seed_path), "outputs/qsp_%u.csv",    config.random_seed);
+    PDAC::set_qsp_output_path(qsp_seed_path);
+
     // ========== EXPORT DAY-0 STATE (after presim, before first treatment step) ==========
-    if (config.pde_out) exportPDEData_step0(config.grid_x, config.grid_y, config.grid_z);
-    if (config.pde_out) exportECMData_step0(config.grid_x, config.grid_y, config.grid_z);
-    if (config.abm_out) exportABMData_step0(simulation, *model);
+    if (config.grid_out & 2) exportPDEData_step0(config.grid_x, config.grid_y, config.grid_z);
+    if (config.grid_out & 2) exportECMData_step0(config.grid_x, config.grid_y, config.grid_z);
+    if (config.grid_out & 1) exportABMData_step0(simulation, *model);
     write_cancer_init_diagnostic(simulation, *model);
     PDAC::exportQSPData_step0();
 
     // ========== RUN SIMULATION ==========
     std::cout << "\n=== Starting Simulation ===" << std::endl;
 
-    // Open event output file for per-step event tracking
-    std::ofstream event_file("outputs/event.csv");
-    if (event_file.is_open()) {
-        event_file << "Step,prolif.CD8.cytotoxic,recruit.CD8.effector,prolif.Th.default,recruit.Th.default,prolif.Treg.default,"
-                   << "teff_rec,treg_rec,th_rec,mdsc_rec,mac_rec,"
-                   << "p_teff,p_treg,p_th,t_sources,"
-                   << "qsp_teff,qsp_treg,qsp_th,"
-                   << "cancer_t_kill,cancer_mac_kill,cancer_nat_death,cancer_divide,"
-                   << "cancer_divide_attempt,cancer_divide_no_space,cancer_senescence,"
-                   << "cancer_t_kill_eval,cancer_p_kill_sum_x10k,cancer_mac_kill_eval\n";
-        // Step 0: initial condition — no events yet
-        event_file << "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
+    // Write NPY definition text files once at init
+    {
+        std::filesystem::create_directories("outputs");
+        {
+            std::ofstream f("outputs/abm_npy_def.txt");
+            f << "ABM snapshot NPY definition\n"
+              << "dtype: int32, shape: (N_agents, 8)\n"
+              << "Columns: [type_id, agent_id, x, y, z, cell_state, life, extra]\n"
+              << "  type_id:    0=CANCER 1=TCELL 2=TREG 3=MDSC 4=MAC 5=FIB 6=VAS\n"
+              << "  cell_state: state enum per type\n"
+              << "    CANCER: STEM=0, PROGENITOR=1, SENESCENT=2\n"
+              << "    TCELL:  EFFECTOR=0, CYTOTOXIC=1, SUPPRESSED=2\n"
+              << "    TREG:   TH=0, TREG=1\n"
+              << "    MDSC:   (single state=0)\n"
+              << "    MAC:    M1=0, M2=1\n"
+              << "    FIB:    NORMAL=0, CAF=1  (one row per segment in chain)\n"
+              << "    VAS:    TIP=0, PHALANX=2\n"
+              << "  life:  age counter (steps alive)\n"
+              << "  extra: divideCD for CANCER, 0 otherwise\n"
+              << "Loading: arr=np.load('agents_step_000001.npy')\n"
+              << "         df=pd.DataFrame(arr, columns=['type','id','x','y','z','state','life','extra'])\n";
+        }
+        {
+            std::ofstream f("outputs/pde_npy_def.txt");
+            f << "PDE concentration NPY definition\n"
+              << "dtype: float32, shape: (NUM_SUBSTRATES, grid_z, grid_y, grid_x)\n"
+              << "NUM_SUBSTRATES = 10\n"
+              << "Channel index -> chemical:\n"
+              << "  0: O2\n"
+              << "  1: IFNg\n"
+              << "  2: IL2\n"
+              << "  3: IL10\n"
+              << "  4: TGFB\n"
+              << "  5: CCL2\n"
+              << "  6: ArgI\n"
+              << "  7: NO\n"
+              << "  8: IL12\n"
+              << "  9: VEGFA\n"
+              << "Loading: arr=np.load('pde_step_000001.npy')  # shape (10,nz,ny,nx)\n"
+              << "         o2=arr[0]  # shape (nz,ny,nx)\n";
+        }
+        {
+            std::ofstream f("outputs/ecm_npy_def.txt");
+            f << "ECM snapshot NPY definition\n"
+              << "dtype: float32, shape: (2, grid_z, grid_y, grid_x)\n"
+              << "Channel index -> field:\n"
+              << "  0: ECM_density   (d_ecm_grid, smoothed ECM density [0..1])\n"
+              << "  1: Fib_field     (d_fib_density_field, raw Gaussian fib density)\n"
+              << "Loading: arr=np.load('ecm_step_000001.npy')  # shape (2,nz,ny,nx)\n"
+              << "         ecm=arr[0]; fib=arr[1]\n";
+        }
+    }
+
+    // Open stats output file (always written, seed-stamped)
+    std::ofstream stats_file(stats_path);
+    if (stats_file.is_open()) {
+        stats_file << "step,"
+            // Agent counts by state
+            << "agentCount.cancer.stem,agentCount.cancer.prog,agentCount.cancer.sen,"
+            << "agentCount.CD8.effector,agentCount.CD8.cytotoxic,agentCount.CD8.suppressed,"
+            << "agentCount.Th.default,agentCount.Treg.default,"
+            << "agentCount.MDSC.default,"
+            << "agentCount.MAC.M1,agentCount.MAC.M2,"
+            << "agentCount.FIB.normal,agentCount.FIB.CAF,"
+            << "agentCount.VAS.tip,agentCount.VAS.default,"
+            // Recruitment
+            << "recruit.CD8.effector,recruit.Th.default,recruit.Treg.default,"
+            << "recruit.MDSC.default,recruit.MAC.M1,recruit.MAC.M2,"
+            // Proliferation by state
+            << "prolif.CD8.effector,prolif.CD8.cytotoxic,prolif.CD8.suppressed,"
+            << "prolif.Th.default,prolif.Treg.default,"
+            << "prolif.MDSC.default,"
+            << "prolif.cancer.stem,prolif.cancer.prog,prolif.cancer.sen,"
+            << "prolif.MAC.M1,prolif.MAC.M2,"
+            << "prolif.FIB.normal,prolif.FIB.CAF,"
+            << "prolif.VAS.tip,prolif.VAS.phalanx,"
+            // Death by state
+            << "death.CD8.effector,death.CD8.cytotoxic,death.CD8.suppressed,"
+            << "death.Th.default,death.Treg.default,"
+            << "death.MDSC.default,"
+            << "death.cancer.stem,death.cancer.prog,death.cancer.sen,"
+            << "death.MAC.M1,death.MAC.M2,"
+            << "death.FIB.normal,death.FIB.CAF,"
+            << "death.VAS.tip,death.VAS.phalanx,"
+            // PDL1 fraction
+            << "PDL1_frac\n";
+        // Step 0: initial counts (all events zero)
+        // (State counts not available yet before first broadcast — write zeros)
+        stats_file << "0";
+        for (int c = 0; c < 15 + 6 + 15 + 15 + 1; c++) stats_file << ",0";
+        stats_file << "\n";
+        stats_file.flush();
     }
 
     // Open timing output file for per-step timing CSV
-    std::ofstream timing_file("outputs/timing.csv");
+    std::ofstream timing_file(timing_path);
     timing_file << "step,total_ms,pde_ms,qsp_ms,abm_ms\n";
 
     // Open per-layer timing CSV (long format: step, layer_name, time_ms)
@@ -854,29 +935,60 @@ int main(int argc, const char** argv) {
             layer_file.flush();
         }
 
-        // Read event counts from GPU and output
-        if (event_file.is_open()) {
+        // Read event/state counts from GPU and write stats row
+        if (stats_file.is_open()) {
             unsigned int host_events[PDAC::ABM_EVENT_COUNTER_SIZE];
-            cudaMemcpy(host_events, device_event_counters, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            unsigned int host_states[PDAC::ABM_STATE_COUNTER_SIZE];
+            cudaMemcpy(host_events, device_event_counters,
+                PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(host_states, device_state_counters,
+                PDAC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
             PDAC::RecruitStats rs = PDAC::get_last_recruit_stats();
 
-            // Output: step index matches agents_step_{i+1}.csv (events that occurred during step i+1)
-            event_file << (i + 1) << ","
-                       << host_events[0] << "," << host_events[1] << ","
-                       << host_events[2] << "," << host_events[3] << "," << host_events[4] << ","
-                       << rs.teff_rec << "," << rs.treg_rec << "," << rs.th_rec << ","
-                       << rs.mdsc_rec << "," << rs.mac_rec << ","
-                       << rs.p_teff << "," << rs.p_treg << "," << rs.p_th << "," << rs.t_sources << ","
-                       << rs.qsp_teff << "," << rs.qsp_treg << "," << rs.qsp_th << ","
-                       << host_events[5] << "," << host_events[6] << ","
-                       << host_events[7] << "," << host_events[8] << ","
-                       << host_events[9] << "," << host_events[10] << "," << host_events[11] << ","
-                       << host_events[12] << "," << host_events[13] << "," << host_events[14] << "\n";
-            event_file.flush();
+            // Compute PDL1 fraction
+            unsigned int total_cancer = host_states[PDAC::SC_CANCER_STEM]
+                                      + host_states[PDAC::SC_CANCER_PROG]
+                                      + host_states[PDAC::SC_CANCER_SEN];
+            float pdl1_frac = (total_cancer > 0)
+                ? static_cast<float>(host_events[PDAC::EVT_PDL1_COUNT]) / total_cancer
+                : 0.0f;
 
-            // Reset counters for next step
+            stats_file << (i + 1) << ","
+                // agentCount (15 states, from broadcast at start of this step)
+                << host_states[PDAC::SC_CANCER_STEM] << "," << host_states[PDAC::SC_CANCER_PROG] << "," << host_states[PDAC::SC_CANCER_SEN] << ","
+                << host_states[PDAC::SC_CD8_EFF] << "," << host_states[PDAC::SC_CD8_CYT] << "," << host_states[PDAC::SC_CD8_SUP] << ","
+                << host_states[PDAC::SC_TH] << "," << host_states[PDAC::SC_TREG] << ","
+                << host_states[PDAC::SC_MDSC] << ","
+                << host_states[PDAC::SC_MAC_M1] << "," << host_states[PDAC::SC_MAC_M2] << ","
+                << host_states[PDAC::SC_FIB_NORM] << "," << host_states[PDAC::SC_FIB_CAF] << ","
+                << host_states[PDAC::SC_VAS_TIP] << "," << host_states[PDAC::SC_VAS_PHALANX] << ","
+                // recruit (6 cols)
+                << rs.teff_rec << "," << rs.th_rec << "," << rs.treg_rec << ","
+                << rs.mdsc_rec << "," << rs.mac_m1_rec << "," << rs.mac_m2_rec << ","
+                // prolif by state (15 cols)
+                << host_events[PDAC::EVT_PROLIF_CD8_EFF] << "," << host_events[PDAC::EVT_PROLIF_CD8_CYT] << "," << host_events[PDAC::EVT_PROLIF_CD8_SUP] << ","
+                << host_events[PDAC::EVT_PROLIF_TH] << "," << host_events[PDAC::EVT_PROLIF_TREG] << ","
+                << host_events[PDAC::EVT_PROLIF_MDSC] << ","
+                << host_events[PDAC::EVT_PROLIF_CANCER_STEM] << "," << host_events[PDAC::EVT_PROLIF_CANCER_PROG] << "," << host_events[PDAC::EVT_PROLIF_CANCER_SEN] << ","
+                << host_events[PDAC::EVT_PROLIF_MAC_M1] << "," << host_events[PDAC::EVT_PROLIF_MAC_M2] << ","
+                << host_events[PDAC::EVT_PROLIF_FIB_NORM] << "," << host_events[PDAC::EVT_PROLIF_FIB_CAF] << ","
+                << host_events[PDAC::EVT_PROLIF_VAS_TIP] << "," << host_events[PDAC::EVT_PROLIF_VAS_PHALANX] << ","
+                // death by state (15 cols)
+                << host_events[PDAC::EVT_DEATH_CD8_EFF] << "," << host_events[PDAC::EVT_DEATH_CD8_CYT] << "," << host_events[PDAC::EVT_DEATH_CD8_SUP] << ","
+                << host_events[PDAC::EVT_DEATH_TH] << "," << host_events[PDAC::EVT_DEATH_TREG] << ","
+                << host_events[PDAC::EVT_DEATH_MDSC] << ","
+                << host_events[PDAC::EVT_DEATH_CANCER_STEM] << "," << host_events[PDAC::EVT_DEATH_CANCER_PROG] << "," << host_events[PDAC::EVT_DEATH_CANCER_SEN] << ","
+                << host_events[PDAC::EVT_DEATH_MAC_M1] << "," << host_events[PDAC::EVT_DEATH_MAC_M2] << ","
+                << host_events[PDAC::EVT_DEATH_FIB_NORM] << "," << host_events[PDAC::EVT_DEATH_FIB_CAF] << ","
+                << host_events[PDAC::EVT_DEATH_VAS_TIP] << "," << host_events[PDAC::EVT_DEATH_VAS_PHALANX] << ","
+                // PDL1 fraction
+                << std::fixed << std::setprecision(4) << pdl1_frac << "\n";
+            stats_file.flush();
+
+            // Reset event counters for next step (state counters reset before next step)
             cudaMemset(device_event_counters, 0, PDAC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
+            cudaMemset(device_state_counters, 0, PDAC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int));
         }
 
         if (!continue_sim) {
@@ -885,14 +997,14 @@ int main(int argc, const char** argv) {
         }
     }
 
-    if (event_file.is_open()) {
-        event_file.close();
-        std::cout << "Created: outputs/event.csv" << std::endl;
+    if (stats_file.is_open()) {
+        stats_file.close();
+        std::cout << "Created: " << stats_path << std::endl;
     }
 
     if (timing_file.is_open()) {
         timing_file.close();
-        std::cout << "Created: outputs/timing.csv" << std::endl;
+        std::cout << "Created: " << timing_path << std::endl;
     }
 
     if (layer_file.is_open()) {

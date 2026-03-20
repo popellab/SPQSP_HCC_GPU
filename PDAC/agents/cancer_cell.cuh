@@ -27,6 +27,13 @@ FLAMEGPU_AGENT_FUNCTION(cancer_broadcast_location, flamegpu::MessageNone, flameg
         (z + 0.5f) * voxel_size
     );
 
+    // Count this agent into per-state population snapshot
+    auto* sc = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    const int cs = FLAMEGPU->getVariable<int>("cell_state");
+    const int sc_slot = (cs == CANCER_STEM) ? SC_CANCER_STEM :
+                        (cs == CANCER_PROGENITOR) ? SC_CANCER_PROG : SC_CANCER_SEN;
+    atomicAdd(&sc[sc_slot], 1u);
+
     return flamegpu::ALIVE;
 }
 
@@ -209,13 +216,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
         }
     }
 
-    // Track division attempt
-    atomicAdd(reinterpret_cast<unsigned int*>(
-        FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_divide_attempt_ptr")), 1u);
-
     if (n_cands == 0) {
-        atomicAdd(reinterpret_cast<unsigned int*>(
-            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_divide_no_space_ptr")), 1u);
         return flamegpu::ALIVE;
     }
 
@@ -304,10 +305,9 @@ FLAMEGPU_AGENT_FUNCTION(cancer_divide, flamegpu::MessageNone, flamegpu::MessageN
             FLAMEGPU->setVariable<int>("divideCD", static_cast<int>(div_int + 0.5f));
         }
 
-        // Count successful division
-        unsigned int* div_ctr = reinterpret_cast<unsigned int*>(
-            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_divide_ptr"));
-        atomicAdd(div_ctr, 1u);
+        // Count successful division by parent state
+        auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+        atomicAdd(&evts[cell_state == CANCER_STEM ? EVT_PROLIF_CANCER_STEM : EVT_PROLIF_CANCER_PROG], 1u);
 
         break;  // Division done; stop trying candidates
     }
@@ -337,9 +337,8 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
         if (life <= 0) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 0);  // 0 = natural senescence
-            unsigned int* ctr = reinterpret_cast<unsigned int*>(
-                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_nat_death_ptr"));
-            atomicAdd(ctr, 1u);
+            auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+            atomicAdd(&evts[EVT_DEATH_CANCER_SEN], 1u);
             return flamegpu::DEAD;
         }
         FLAMEGPU->setVariable<int>("life", life);
@@ -364,6 +363,12 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
          FLAMEGPU->getVariable<float>("PDL1_syn"));
 
     FLAMEGPU->setVariable<float>("PDL1_syn", PDL1);
+
+    // Count PDL1-high cells (PDL1_syn > 0.5) for PDL1_frac computation
+    if (PDL1 > 0.5f) {
+        auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+        atomicAdd(&evts[EVT_PDL1_COUNT], 1u);
+    }
 
     // === T CELL KILLING ===
     int neighbor_Teff = FLAMEGPU->getVariable<int>("neighbor_Teff_count");
@@ -397,19 +402,13 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
 
         p_kill *= FLAMEGPU->environment.getProperty<float>("PARAM_TKILL_SCALAR") * (1 - supp);
 
-        // Diagnostic: track T-kill evaluations and p_kill distribution
-        atomicAdd(reinterpret_cast<unsigned int*>(
-            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_t_kill_eval_ptr")), 1u);
-        atomicAdd(reinterpret_cast<unsigned int*>(
-            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_p_kill_sum_ptr")),
-            static_cast<unsigned int>(p_kill * 10000.0f));
-
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 1);  // 1 = T cell killing
-            unsigned int* ctr = reinterpret_cast<unsigned int*>(
-                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_t_kill_ptr"));
-            atomicAdd(ctr, 1u);
+            auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+            const int death_slot = (cell_state == CANCER_STEM) ? EVT_DEATH_CANCER_STEM :
+                                   (cell_state == CANCER_PROGENITOR) ? EVT_DEATH_CANCER_PROG : EVT_DEATH_CANCER_SEN;
+            atomicAdd(&evts[death_slot], 1u);
             return flamegpu::DEAD;
         }
     }
@@ -449,16 +448,14 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
                    * (1 - H_Mac_C) * (1 - H_IL10_phago);
         double p_kill = get_kill_probability(q, FLAMEGPU->environment.getProperty<float>("PARAM_ESCAPE_MAC_BASE"));
 
-        // Diagnostic: track MAC-kill evaluations
-        atomicAdd(reinterpret_cast<unsigned int*>(
-            FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_mac_kill_eval_ptr")), 1u);
 
         if (FLAMEGPU->random.uniform<float>() < p_kill) {
             FLAMEGPU->setVariable<int>("dead", 1);
             FLAMEGPU->setVariable<int>("death_reason", 2);  // 2 = macrophage killing
-            unsigned int* ctr = reinterpret_cast<unsigned int*>(
-                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_mac_kill_ptr"));
-            atomicAdd(ctr, 1u);
+            auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+            const int death_slot = (cell_state == CANCER_STEM) ? EVT_DEATH_CANCER_STEM :
+                                   (cell_state == CANCER_PROGENITOR) ? EVT_DEATH_CANCER_PROG : EVT_DEATH_CANCER_SEN;
+            atomicAdd(&evts[death_slot], 1u);
             return flamegpu::DEAD;
         }
     }
@@ -493,9 +490,6 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             const float rand_val  = FLAMEGPU->random.uniform<float>();
             const int life = static_cast<int>(-mean_life * logf(rand_val + 0.0001f) + 0.5f);
             FLAMEGPU->setVariable<int>("life", life > 0 ? life : 1);
-            // Diagnostic: track senescence transitions
-            atomicAdd(reinterpret_cast<unsigned int*>(
-                FLAMEGPU->environment.getProperty<uint64_t>("event_cancer_senescence_ptr")), 1u);
         }
     }
 

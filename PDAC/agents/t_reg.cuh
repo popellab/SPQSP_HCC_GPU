@@ -15,7 +15,8 @@ FLAMEGPU_AGENT_FUNCTION(treg_broadcast_location, flamegpu::MessageNone, flamegpu
 
     FLAMEGPU->message_out.setVariable<int>("agent_type", CELL_TYPE_TREG);
     FLAMEGPU->message_out.setVariable<int>("agent_id", FLAMEGPU->getID());
-    FLAMEGPU->message_out.setVariable<int>("cell_state", FLAMEGPU->getVariable<int>("cell_state"));
+    const int treg_cs = FLAMEGPU->getVariable<int>("cell_state");
+    FLAMEGPU->message_out.setVariable<int>("cell_state", treg_cs);
     FLAMEGPU->message_out.setVariable<float>("PDL1", 0.0f); // TCD4 cells don't express PDL1
     FLAMEGPU->message_out.setVariable<int>("voxel_x", x);
     FLAMEGPU->message_out.setVariable<int>("voxel_y", y);
@@ -26,6 +27,10 @@ FLAMEGPU_AGENT_FUNCTION(treg_broadcast_location, flamegpu::MessageNone, flamegpu
         (y + 0.5f) * voxel_size,
         (z + 0.5f) * voxel_size
     );
+
+    // Count this agent into per-state population snapshot
+    auto* sc_treg = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("state_counters_ptr"));
+    atomicAdd(&sc_treg[treg_cs == TCD4_TH ? SC_TH : SC_TREG], 1u);
 
     return flamegpu::ALIVE;
 }
@@ -177,6 +182,9 @@ FLAMEGPU_AGENT_FUNCTION(treg_state_step, flamegpu::MessageNone, flamegpu::Messag
     life--;
     if (life <= 0) {
         FLAMEGPU->setVariable<int>("dead", 1);
+        auto* evts_tr = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+        const int cs_tr = FLAMEGPU->getVariable<int>("cell_state");
+        atomicAdd(&evts_tr[cs_tr == TCD4_TH ? EVT_DEATH_TH : EVT_DEATH_TREG], 1u);
         return flamegpu::DEAD;
     }
     FLAMEGPU->setVariable<int>("life", life);
@@ -291,14 +299,7 @@ FLAMEGPU_AGENT_FUNCTION(treg_write_to_occ_grid, flamegpu::MessageNone, flamegpu:
     const int z = FLAMEGPU->getVariable<int>("z");
     auto occ = FLAMEGPU->environment.getMacroProperty<unsigned int,
         OCC_GRID_MAX, OCC_GRID_MAX, OCC_GRID_MAX, NUM_OCC_TYPES>("occ_grid");
-    occ[x][y][z][CELL_TYPE_T] += 1u;
-
-    // Flat T cell occupancy for GPU recruitment kernel (T + TReg only, matching HCC isOpenToType)
-    const int gx = FLAMEGPU->environment.getProperty<int>("grid_size_x");
-    const int gy = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    unsigned int* t_occ = reinterpret_cast<unsigned int*>(
-        FLAMEGPU->environment.getProperty<uint64_t>("t_occ_ptr"));
-    atomicAdd(&t_occ[z * (gx * gy) + y * gx + x], 1u);
+    occ[x][y][z][CELL_TYPE_TREG] += 1u;
 
     return flamegpu::ALIVE;
 }
@@ -341,6 +342,7 @@ FLAMEGPU_AGENT_FUNCTION(treg_divide, flamegpu::MessageNone, flamegpu::MessageNon
         bool has_cancer = (occ[nx][ny][nz][CELL_TYPE_CANCER] > 0u);
         max_cap[n_cands] = static_cast<unsigned int>(has_cancer ? MAX_T_PER_VOXEL_WITH_CANCER : MAX_T_PER_VOXEL);
 
+        // TRegs check T cell count for capacity (HCC: TRegs invisible to T cap)
         if (occ[nx][ny][nz][CELL_TYPE_T] < max_cap[n_cands]) {
             cand_x[n_cands] = nx;
             cand_y[n_cands] = ny;
@@ -363,9 +365,10 @@ FLAMEGPU_AGENT_FUNCTION(treg_divide, flamegpu::MessageNone, flamegpu::MessageNon
         unsigned int max_curr = max_cap[i]; max_cap[i] = max_cap[j]; max_cap[j] = max_curr;
 
         // operator+ performs atomicAdd and returns the OLD value
-        const unsigned int old_count = occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_T] + 1u;
+        // Claim TREG slot (not T slot) — TRegs are invisible to T cell cap checks
+        const unsigned int old_count = occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_TREG] + 1u;
         if (old_count >= max_curr) {
-            occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_T] -= 1u;  // undo
+            occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_TREG] -= 1u;  // undo
             continue;
         }
 
@@ -390,11 +393,9 @@ FLAMEGPU_AGENT_FUNCTION(treg_divide, flamegpu::MessageNone, flamegpu::MessageNon
         FLAMEGPU->setVariable<int>("divide_cd", div_interval);
 
         // Track TH or TReg proliferation event
-        if (cell_state == TCD4_TH) {
-            atomicAdd(&reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_th_prolif_ptr"))[0], 1u);
-        } else {
-            // cell_state == TCD4_TREG
-            atomicAdd(&reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_treg_prolif_ptr"))[0], 1u);
+        {
+            auto* evts_div = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+            atomicAdd(&evts_div[cell_state == TCD4_TH ? EVT_PROLIF_TH : EVT_PROLIF_TREG], 1u);
         }
 
         break;
@@ -544,21 +545,22 @@ FLAMEGPU_AGENT_FUNCTION(treg_move, flamegpu::MessageNone, flamegpu::MessageNone)
             return flamegpu::ALIVE;
         }
 
+        // TRegs check T cell count for capacity but claim TREG slot
         unsigned int max_t = (occ[tx][ty][tz][CELL_TYPE_CANCER] > 0u)
             ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
             : static_cast<unsigned int>(MAX_T_PER_VOXEL);
 
-        // AtomicAdd to target: + 1u returns OLD count (pre-add)
-        const unsigned int old_count = occ[tx][ty][tz][CELL_TYPE_T] + 1u;
-        if (old_count >= max_t) {
-            occ[tx][ty][tz][CELL_TYPE_T] -= 1u;  // undo — voxel was full
-            // FLAMEGPU->setVariable<int>("tumble", 1);
-        } else {
-            occ[x][y][z][CELL_TYPE_T] -= 1u;
-            FLAMEGPU->setVariable<int>("x", tx);
-            FLAMEGPU->setVariable<int>("y", ty);
-            FLAMEGPU->setVariable<int>("z", tz);
+        // Check T cell count against cap (TReg uses T cell conditions)
+        if (occ[tx][ty][tz][CELL_TYPE_T] >= max_t) {
+            return flamegpu::ALIVE;
         }
+
+        // Claim TREG slot (not T slot) — just for tracking, no cap on TREGs
+        occ[tx][ty][tz][CELL_TYPE_TREG] += 1u;
+        occ[x][y][z][CELL_TYPE_TREG] -= 1u;
+        FLAMEGPU->setVariable<int>("x", tx);
+        FLAMEGPU->setVariable<int>("y", ty);
+        FLAMEGPU->setVariable<int>("z", tz);
     }
     // === TUMBLE PHASE (tumble == 1) ===
     // Collect candidate neighbors, shuffle, then atomically claim the first available.
@@ -585,15 +587,15 @@ FLAMEGPU_AGENT_FUNCTION(treg_move, flamegpu::MessageNone, flamegpu::MessageNone)
             int tz=cand_z[i]; cand_z[i]=cand_z[j]; cand_z[j]=tz;
         }
         for (int i = 0; i < n_cands; i++) {
+            // Re-check T cell cap (may have changed since pre-filter)
             unsigned int max_t = (occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_CANCER] > 0u)
                 ? static_cast<unsigned int>(MAX_T_PER_VOXEL_WITH_CANCER)
                 : static_cast<unsigned int>(MAX_T_PER_VOXEL);
-            const unsigned int old_count = occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_T] + 1u;
-            if (old_count >= max_t) {
-                occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_T] -= 1u;  // undo — voxel was full
-                continue;
-            }
-            occ[x][y][z][CELL_TYPE_T] -= 1u;
+            if (occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_T] >= max_t) continue;
+
+            // Claim TREG slot (not T slot)
+            occ[cand_x[i]][cand_y[i]][cand_z[i]][CELL_TYPE_TREG] += 1u;
+            occ[x][y][z][CELL_TYPE_TREG] -= 1u;
             FLAMEGPU->setVariable<int>("x", cand_x[i]);
             FLAMEGPU->setVariable<int>("y", cand_y[i]);
             FLAMEGPU->setVariable<int>("z", cand_z[i]);

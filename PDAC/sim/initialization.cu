@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <array>
 
 namespace PDAC {
 
@@ -24,8 +25,7 @@ SimulationConfig::SimulationConfig()
     , num_fibroblasts(10)
     , vascular_mode("random")
     , vascular_xml_file("")
-    , abm_out(true)
-    , pde_out(true)
+    , grid_out(3)
     , interval_out(1)
 {
 }
@@ -52,10 +52,8 @@ void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC:
             grid_z = size;
         } else if ((arg == "--steps" || arg == "-s") && i + 1 < argc) {
             steps = std::atoi(argv[++i]);
-        } else if ((arg == "--out_abm" || arg == "-oa") && i + 1 < argc) {
-            abm_out =  std::atoi(argv[++i]);
-        } else if ((arg == "--out_pde" || arg == "-op") && i + 1 < argc) {
-            pde_out =  std::atoi(argv[++i]);
+        } else if ((arg == "--grid-output" || arg == "-G") && i + 1 < argc) {
+            grid_out = std::atoi(argv[++i]);
         } else if ((arg == "--out_int" || arg == "-oi") && i + 1 < argc) {
             interval_out =  std::atoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
@@ -71,8 +69,7 @@ void SimulationConfig::parseCommandLine(int argc, const char** argv, const PDAC:
                       << "  -i, --initialization N   initialization type: 0=random, 1=QSP-seeded [default: 1]\n"
                       << "  -g, --grid-size N        Grid dimensions NxNxN [default: from XML]\n"
                       << "  -s, --steps N            Number of simulation steps [default: 200]\n"
-                      << "  -oa, --out_abm Bool      Output ABM at interval frequency [default: true]\n"
-                      << "  -op, --out_pde Bool      Output PDE at interval frequency [default: true]\n"
+                      << "  -G, --grid-output N      Grid output: 0=none, 1=ABM only, 2=PDE+ECM only, 3=both [default: 3]\n"
                       << "  -oi, --out_int N         Output interval frequency [default: 1]\n"
                       << "  --seed N                 Random seed [default: 12345]\n"
                       << "  -vm, --vascular-mode STR Vasculature initialization: random, xml, test [default: random]\n"
@@ -1028,16 +1025,25 @@ void initializeFibroblasts(
     int tumor_radius, int num_fibroblasts,
     float fib_life_mean)
 {
-    const int cx = grid_x / 2;
-    const int cy = grid_y / 2;
-    const int cz = grid_z / 2;
+    const int center_x = grid_x / 2;
+    const int center_y = grid_y / 2;
+    const int center_z = grid_z / 2;
 
     const float inner_radius = tumor_radius + 1;
     const float outer_radius = tumor_radius + 5;
 
+    // Track occupied voxels for chain placement
+    const int total_voxels = grid_x * grid_y * grid_z;
+    std::vector<bool> occupied(total_voxels, false);
+
+    // Von Neumann offsets for chain extension
+    const int dx6[6] = {1, -1, 0, 0, 0, 0};
+    const int dy6[6] = {0, 0, 1, -1, 0, 0};
+    const int dz6[6] = {0, 0, 0, 0, 1, -1};
+
     int placed = 0;
     int attempts = 0;
-    const int max_attempts = num_fibroblasts * 100;
+    const int max_attempts = num_fibroblasts * 200;
 
     while (placed < num_fibroblasts && attempts < max_attempts) {
         attempts++;
@@ -1046,11 +1052,50 @@ void initializeFibroblasts(
         float phi = std::acos(2.0f * static_cast<float>(rand()) / RAND_MAX - 1.0f);
         float r = inner_radius + static_cast<float>(rand()) / RAND_MAX * (outer_radius - inner_radius);
 
-        int x = cx + static_cast<int>(r * std::sin(phi) * std::cos(theta));
-        int y = cy + static_cast<int>(r * std::sin(phi) * std::sin(theta));
-        int z = cz + static_cast<int>(r * std::cos(phi));
+        int hx = center_x + static_cast<int>(r * std::sin(phi) * std::cos(theta));
+        int hy = center_y + static_cast<int>(r * std::sin(phi) * std::sin(theta));
+        int hz = center_z + static_cast<int>(r * std::cos(phi));
 
-        if (x < 0 || x >= grid_x || y < 0 || y >= grid_y || z < 0 || z >= grid_z) {
+        if (hx < 0 || hx >= grid_x || hy < 0 || hy >= grid_y || hz < 0 || hz >= grid_z) continue;
+        int idx0 = hx + hy * grid_x + hz * grid_x * grid_y;
+        if (occupied[idx0]) continue;
+
+        // Try to build a 3-segment chain: head, mid, tail via Von Neumann neighbors
+        int sx[MAX_FIB_CHAIN_LENGTH] = {hx, 0, 0, 0, 0};
+        int sy[MAX_FIB_CHAIN_LENGTH] = {hy, 0, 0, 0, 0};
+        int sz[MAX_FIB_CHAIN_LENGTH] = {hz, 0, 0, 0, 0};
+        occupied[idx0] = true;
+
+        bool chain_ok = true;
+        for (int c = 1; c < 3; c++) {
+            bool found = false;
+            // Shuffle directions
+            int order[6] = {0, 1, 2, 3, 4, 5};
+            for (int i = 5; i > 0; i--) {
+                int j = rand() % (i + 1);
+                std::swap(order[i], order[j]);
+            }
+            for (int di = 0; di < 6; di++) {
+                int d = order[di];
+                int nx = sx[c-1] + dx6[d], ny = sy[c-1] + dy6[d], nz = sz[c-1] + dz6[d];
+                if (nx < 0 || nx >= grid_x || ny < 0 || ny >= grid_y || nz < 0 || nz >= grid_z) continue;
+                int idx = nx + ny * grid_x + nz * grid_x * grid_y;
+                if (occupied[idx]) continue;
+                sx[c] = nx; sy[c] = ny; sz[c] = nz;
+                occupied[idx] = true;
+                found = true;
+                break;
+            }
+            if (!found) { chain_ok = false; break; }
+        }
+
+        if (!chain_ok) {
+            // Release all claimed voxels
+            for (int c = 0; c < 3; c++) {
+                if (sx[c] == 0 && sy[c] == 0 && sz[c] == 0 && c > 0) break;
+                int idx = sx[c] + sy[c] * grid_x + sz[c] * grid_x * grid_y;
+                occupied[idx] = false;
+            }
             continue;
         }
 
@@ -1060,20 +1105,22 @@ void initializeFibroblasts(
 
         fib_agents.push_back();
         flamegpu::AgentVector::Agent agent = fib_agents.back();
-        agent.setVariable<int>("x", x);
-        agent.setVariable<int>("y", y);
-        agent.setVariable<int>("z", z);
+        agent.setVariable<int>("x", sx[0]);
+        agent.setVariable<int>("y", sy[0]);
+        agent.setVariable<int>("z", sz[0]);
+        std::array<int, MAX_FIB_CHAIN_LENGTH> asx, asy, asz;
+        for (int i = 0; i < MAX_FIB_CHAIN_LENGTH; i++) { asx[i] = sx[i]; asy[i] = sy[i]; asz[i] = sz[i]; }
+        agent.setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", asx);
+        agent.setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", asy);
+        agent.setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", asz);
+        agent.setVariable<int>("chain_len", 3);
         agent.setVariable<int>("cell_state", FIB_NORMAL);
         agent.setVariable<int>("life", life);
-        // Assign slot so fib_state_step and fib_execute_divide can track this cell.
-        // Isolated cells have leader_slot=-1 (they are their own sensor/front).
-        agent.setVariable<int>("my_slot", placed);
-        agent.setVariable<int>("leader_slot", -1);
 
         placed++;
     }
 
-    std::cout << "Initialized " << placed << " Fibroblasts (Normal) around tumor margin" << std::endl;
+    std::cout << "Initialized " << placed << " Fibroblast chains (3-segment, Normal) around tumor margin" << std::endl;
 }
 
 // Helper: find a free adjacent voxel for chain extension
@@ -1115,77 +1162,70 @@ void initializeFibroblastsFromQSP(
     float life_mean)
 {
     int placed = 0;
-    int slot_counter = 0;
-    const int chain_len = 3;  // Initial chains: HEAD → MIDDLE → TAIL (activation adds 2 more → max 5)
+    const int init_chain_len = 3;
 
     for (int z = 0; z < grid_z; z++) {
         for (int y = 0; y < grid_y; y++) {
             for (int x = 0; x < grid_x; x++) {
                 const float rnd = static_cast<float>(rand()) / RAND_MAX;
                 if (rnd >= static_cast<float>(p_fib)) continue;
-                if (slot_counter + chain_len > MAX_FIB_INIT_SLOTS) break;
 
                 // Check if starting voxel is free
                 int idx0 = x + y * grid_x + z * grid_x * grid_y;
                 if (occupied[idx0][0] != 0) continue;
 
-                // Try to form a chain of chain_len cells starting here
-                // Positions for each cell in the chain
-                int cx[MAX_FIB_CHAIN_LENGTH], cy[MAX_FIB_CHAIN_LENGTH], cz[MAX_FIB_CHAIN_LENGTH];
-                cx[0] = x; cy[0] = y; cz[0] = z;
-                occupied[idx0][0] = 1;  // Mark HEAD occupied tentatively
+                // Try to form a 3-segment chain starting here
+                int cx[MAX_FIB_CHAIN_LENGTH] = {x, 0, 0, 0, 0};
+                int cy[MAX_FIB_CHAIN_LENGTH] = {y, 0, 0, 0, 0};
+                int cz[MAX_FIB_CHAIN_LENGTH] = {z, 0, 0, 0, 0};
+                occupied[idx0][0] = 1;
 
                 int actual_len = 1;
-                for (int c = 1; c < chain_len; c++) {
+                for (int c = 1; c < init_chain_len; c++) {
+                    int nx, ny, nz;
                     if (!findFreeAdjacent(cx[c-1], cy[c-1], cz[c-1],
                                           grid_x, grid_y, grid_z, occupied,
-                                          cx[c], cy[c], cz[c])) {
+                                          nx, ny, nz)) {
                         break;
                     }
-                    int idxc = cx[c] + cy[c] * grid_x + cz[c] * grid_x * grid_y;
+                    cx[c] = nx; cy[c] = ny; cz[c] = nz;
+                    int idxc = nx + ny * grid_x + nz * grid_x * grid_y;
                     occupied[idxc][0] = 1;
                     actual_len++;
                 }
-                // Note: HEAD already marked occupied above, all chain cells marked tentatively.
-                // actual_len is how many were placed (1 to chain_len).
 
-                // Assign slots for this chain: [slot_counter .. slot_counter+actual_len-1]
-                // Chain: cell[0]=HEAD (divides, future), cell[1]=MIDDLE, cell[actual_len-1]=TAIL (chemotaxis, leader_slot=-1)
-                //        cell[2] (leader_slot=slot_counter+1), etc.
-                if (slot_counter + actual_len > MAX_FIB_INIT_SLOTS) {
-                    // Not enough slots left — undo occupancy and stop placing
+                // Require full 3-segment chain
+                if (actual_len < init_chain_len) {
                     for (int c = 0; c < actual_len; c++) {
                         int idxc = cx[c] + cy[c] * grid_x + cz[c] * grid_x * grid_y;
                         occupied[idxc][0] = 0;
                     }
-                    break;
+                    continue;
                 }
 
-                for (int c = 0; c < actual_len; c++) {
-                    float life_rnd = static_cast<float>(rand()) / RAND_MAX;
-                    int life = static_cast<int>(life_mean * std::log(1.0f / (life_rnd + 1e-4f)) + 0.5f);
-                    if (life < 1) life = 1;
+                float life_rnd = static_cast<float>(rand()) / RAND_MAX;
+                int life = static_cast<int>(life_mean * std::log(1.0f / (life_rnd + 1e-4f)) + 0.5f);
+                if (life < 1) life = 1;
 
-                    fib_agents.push_back();
-                    flamegpu::AgentVector::Agent agent = fib_agents.back();
-                    agent.setVariable<int>("x", cx[c]);
-                    agent.setVariable<int>("y", cy[c]);
-                    agent.setVariable<int>("z", cz[c]);
-                    agent.setVariable<int>("cell_state", FIB_NORMAL);
-                    agent.setVariable<int>("life", life);
-                    agent.setVariable<int>("my_slot", slot_counter + c);
-                    // TAIL (c==actual_len-1): leader_slot=-1 (moves via chemotaxis)
-                    // Others: leader_slot = slot of cell directly toward tail (follows the tail's movement)
-                    agent.setVariable<int>("leader_slot", (c == actual_len - 1) ? -1 : (slot_counter + c + 1));
-                }
+                fib_agents.push_back();
+                flamegpu::AgentVector::Agent agent = fib_agents.back();
+                agent.setVariable<int>("x", cx[0]);
+                agent.setVariable<int>("y", cy[0]);
+                agent.setVariable<int>("z", cz[0]);
+                std::array<int, MAX_FIB_CHAIN_LENGTH> asx, asy, asz;
+                for (int i = 0; i < MAX_FIB_CHAIN_LENGTH; i++) { asx[i] = cx[i]; asy[i] = cy[i]; asz[i] = cz[i]; }
+                agent.setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", asx);
+                agent.setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", asy);
+                agent.setVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", asz);
+                agent.setVariable<int>("chain_len", init_chain_len);
+                agent.setVariable<int>("cell_state", FIB_NORMAL);
+                agent.setVariable<int>("life", life);
 
-                slot_counter += actual_len;
-                placed += actual_len;
+                placed++;
             }
         }
     }
-    std::cout << "  Placed " << placed << " Fibroblasts in chains (probability-based QSP), "
-              << slot_counter << " slots used" << std::endl;
+    std::cout << "  Placed " << placed << " Fibroblast chains (3-segment, probability-based QSP)" << std::endl;
 }
 
 // ============================================================================
