@@ -10,8 +10,10 @@
 /python/
 /outputs/
 /docs/
+/data/
 /.claude/
 /.vscode/
+/memory/
 CLAUDE.md
 /PDAC/sim/cluster.conf
 /PDAC/sim/external/
