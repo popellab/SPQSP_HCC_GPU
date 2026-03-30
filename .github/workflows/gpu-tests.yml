@@ -33,7 +33,7 @@ jobs:
         run: |
           ssh $REMOTE bash -s <<'SCRIPT'
             set -euo pipefail
-            SCRATCH=/anvil/scratch/$USER/pdac_test_$GITHUB_RUN_ID
+            SCRATCH=/anvil/scratch/$USER/hcc_test_$GITHUB_RUN_ID
             mkdir -p $SCRATCH
 
             # Pull image and convert to Apptainer SIF

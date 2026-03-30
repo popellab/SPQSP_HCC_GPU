@@ -1,11 +1,11 @@
-/PDAC/sim/build/
-/PDAC/sim/outputs/
-/PDAC/sim/profiling/
-/PDAC/sim/HCC_outputs2/
-/PDAC/sim/HCC_outputs/
-/PDAC/sim/HCC_outputs-donotuse/
-/PDAC/sim/TNBC_outputs/
-/PDAC/sim/TNBC_outputs_2/
+/HCC/sim/build/
+/HCC/sim/outputs/
+/HCC/sim/profiling/
+/HCC/sim/HCC_outputs2/
+/HCC/sim/HCC_outputs/
+/HCC/sim/HCC_outputs-donotuse/
+/HCC/sim/TNBC_outputs/
+/HCC/sim/TNBC_outputs_2/
 /figs/
 /python/
 /outputs/
@@ -15,6 +15,6 @@
 /.vscode/
 /memory/
 CLAUDE.md
-/PDAC/sim/cluster.conf
-/PDAC/sim/external/
+/HCC/sim/cluster.conf
+/HCC/sim/external/
 

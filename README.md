@@ -1,4 +1,4 @@
-# SPQSP PDAC — GPU Agent-Based Model
+# SPQSP HCC — GPU Agent-Based Model
 
 GPU-accelerated agent-based model (FLAME GPU 2) with CPU QSP coupling (SUNDIALS CVODE) for simulating pancreatic ductal adenocarcinoma tumor microenvironment dynamics.
 
@@ -14,13 +14,13 @@ FLAME GPU 2, SUNDIALS, and Boost are **automatically downloaded and built** if n
 ## Quick Start (HPC)
 
 ```bash
-cd PDAC/sim
+cd HCC/sim
 cp cluster.conf.example cluster.conf   # edit ACCOUNT for your allocation
 ./setup_deps.sh                        # one command — fetches FLAMEGPU2, SUNDIALS, Boost
 sbatch submit.sh -s 10 -g 11           # build + test run (first build ~8 min)
 ```
 
-`submit.sh` auto-detects the cluster (Delta, Anvil), loads modules, builds if needed, runs the simulation on scratch, and copies outputs back to `PDAC/sim/outputs/<job_id>/`.
+`submit.sh` auto-detects the cluster (Delta, Anvil), loads modules, builds if needed, runs the simulation on scratch, and copies outputs back to `HCC/sim/outputs/<job_id>/`.
 
 ### Supported Clusters
 
@@ -36,9 +36,9 @@ Adding a new cluster: add a `setup_<name>()` function in `submit.sh` and a hostn
 If you have CUDA and cmake available locally (workstation, Docker, etc.):
 
 ```bash
-cd PDAC/sim
+cd HCC/sim
 ./build.sh                    # auto-fetches deps via network
-./build/bin/pdac -s 10 -g 11  # quick test run
+./build/bin/hcc -s 10 -g 11  # quick test run
 ```
 
 First build takes ~8 minutes (downloads and compiles all dependencies). Subsequent builds are incremental (~1-2 min).
@@ -91,7 +91,7 @@ SUNDIALS_DIR=/path/to/sundials BOOST_ROOT=/path/to/boost ./build.sh
 ## Running
 
 ```bash
-./build/bin/pdac [options]
+./build/bin/hcc [options]
 
   -g, --grid-size N       Grid dimensions [8-320] (default: 50 = 1mm^3 at 20um)
   -s, --steps N           Simulation steps (default: 500, each step = 6 hours)
@@ -116,7 +116,7 @@ What `submit.sh` does:
 3. Builds the binary on the GPU node if it doesn't exist
 4. Creates a run directory on scratch for fast I/O
 5. Runs the simulation
-6. Copies outputs back to `PDAC/sim/outputs/<job_id>/`
+6. Copies outputs back to `HCC/sim/outputs/<job_id>/`
 
 ### Rebuilding
 
@@ -127,7 +127,7 @@ sbatch submit.sh            # next submission rebuilds
 
 ## Output Files
 
-Outputs are written to `./outputs/` relative to the working directory. On SLURM, they are also copied to `PDAC/sim/outputs/<job_id>/`.
+Outputs are written to `./outputs/` relative to the working directory. On SLURM, they are also copied to `HCC/sim/outputs/<job_id>/`.
 
 | File | Contents |
 |------|----------|
@@ -154,5 +154,5 @@ Outputs are written to `./outputs/` relative to the working directory. On SLURM,
 
 - **First run** after build takes 5-10 minutes for CUDA JIT warmup (not a hang).
 - **Memory**: Grid 50^3 uses ~2 GB VRAM; 320^3 uses ~8 GB.
-- SLURM logs go to `pdac_<job_id>.out` / `.err` in the directory you submit from.
+- SLURM logs go to `hcc_<job_id>.out` / `.err` in the directory you submit from.
 - The param XML is resolved relative to the executable, so it works from any working directory.
