@@ -36,6 +36,8 @@ extern flamegpu::FLAMEGPU_STEP_FUNCTION_POINTER exportQSPData;
 namespace HCC {
     extern void exportQSPData_step0();
     extern void set_qsp_output_path(const std::string& path);
+    extern void exportQSPPresimData_step0();
+    extern void set_qsp_presim_output_path(const std::string& path);
 }
 
 namespace HCC {
@@ -58,6 +60,16 @@ void ensureOutputDirectories() {
         std::filesystem::create_directories("outputs/abm");
     } catch (const std::exception& e) {
         std::cerr << "Warning: Could not create output directories: " << e.what() << std::endl;
+    }
+}
+
+void ensurePresimOutputDirectories() {
+    try {
+        std::filesystem::create_directories("outputs/presim/pde");
+        std::filesystem::create_directories("outputs/presim/abm");
+        std::filesystem::create_directories("outputs/presim/ecm");
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Could not create presim output directories: " << e.what() << std::endl;
     }
 }
 
@@ -219,9 +231,29 @@ void exportPDEData_step0(int grid_x, int grid_y, int grid_z) {
     export_pde_async_no_join(grid_x, grid_y, grid_z, "outputs/pde/pde_step_000000.pde.lz4");
 }
 
-FLAMEGPU_STEP_FUNCTION(exportPDEData) {
-    if (HCC::is_presim_mode_active()) return;
+// Called manually from main() before the presim loop — captures initial PDE state (presim step 0).
+void exportPresimPDEData_step0(int grid_x, int grid_y, int grid_z) {
+    ensurePresimOutputDirectories();
     if (!HCC::g_pde_solver) return;
+    if (g_pde_io_thread.joinable()) g_pde_io_thread.join();
+    export_pde_async_no_join(grid_x, grid_y, grid_z, "outputs/presim/pde/pde_presim_000000.pde.lz4");
+}
+
+FLAMEGPU_STEP_FUNCTION(exportPDEData) {
+    if (!HCC::g_pde_solver) return;
+
+    if (HCC::is_presim_mode_active()) {
+        const unsigned int cur_step = FLAMEGPU->environment.getProperty<unsigned int>("current_step");
+        const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+        const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+        const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+        if (g_pde_io_thread.joinable()) g_pde_io_thread.join();
+        char path_buf[256];
+        snprintf(path_buf, sizeof(path_buf), "outputs/presim/pde/pde_presim_%06d.pde.lz4",
+                 static_cast<int>(cur_step + 1));
+        export_pde_async_no_join(grid_x, grid_y, grid_z, std::string(path_buf));
+        return;
+    }
 
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
     const int interval = FLAMEGPU->environment.getProperty<int>("interval_out");
@@ -331,18 +363,44 @@ void exportECMData_step0(int grid_x, int grid_y, int grid_z) {
     g_ecm_buf_idx = 1 - bi;
 }
 
+void exportPresimECMData_step0(int grid_x, int grid_y, int grid_z) {
+    ensurePresimOutputDirectories();
+    if (g_ecm_io_thread.joinable()) g_ecm_io_thread.join();
+    int bi = g_ecm_buf_idx;
+    collect_ecm_to_buf(g_ecm_bufs[bi], grid_x, grid_y, grid_z);
+    std::string path = "outputs/presim/ecm/ecm_presim_000000.ecm.lz4";
+    g_ecm_io_thread = std::thread([bi, path, grid_x, grid_y, grid_z]() {
+        write_ecm_lz4_buf(path.c_str(), grid_x, grid_y, grid_z, g_ecm_bufs[bi]);
+    });
+    g_ecm_buf_idx = 1 - bi;
+}
+
 FLAMEGPU_STEP_FUNCTION(exportECMData) {
-    if (HCC::is_presim_mode_active()) return;
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+
+    if (HCC::is_presim_mode_active()) {
+        const unsigned int cur_step = FLAMEGPU->environment.getProperty<unsigned int>("current_step");
+        if (g_ecm_io_thread.joinable()) g_ecm_io_thread.join();
+        int bi = g_ecm_buf_idx;
+        collect_ecm_to_buf(g_ecm_bufs[bi], grid_x, grid_y, grid_z);
+        char path_buf[256];
+        snprintf(path_buf, sizeof(path_buf), "outputs/presim/ecm/ecm_presim_%06d.ecm.lz4",
+                 static_cast<int>(cur_step + 1));
+        std::string path = path_buf;
+        g_ecm_io_thread = std::thread([bi, path, grid_x, grid_y, grid_z]() {
+            write_ecm_lz4_buf(path.c_str(), grid_x, grid_y, grid_z, g_ecm_bufs[bi]);
+        });
+        g_ecm_buf_idx = 1 - bi;
+        return;
+    }
 
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
     const int interval = FLAMEGPU->environment.getProperty<int>("interval_out");
     if (main_step % interval != 0) return;
 
     try { std::filesystem::create_directories("outputs/ecm"); } catch (...) {}
-
-    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
-    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
 
     if (g_ecm_io_thread.joinable()) g_ecm_io_thread.join();
     int bi = g_ecm_buf_idx;
@@ -582,8 +640,15 @@ static void collect_abm_step(flamegpu::HostAPI* FLAMEGPU, std::vector<int32_t>& 
 
 // Host function: prepare GPU buffer for ABM export (runs as a layer before pack_for_export)
 FLAMEGPU_HOST_FUNCTION(prepare_abm_export) {
-    if (HCC::is_presim_mode_active()) {
+    const int abm_enabled = FLAMEGPU->environment.getProperty<int>("abm_output_enabled");
+    if (!abm_enabled) {
         FLAMEGPU->environment.setProperty<int>("do_abm_export", 0);
+        return;
+    }
+    if (HCC::is_presim_mode_active()) {
+        // Export every presim step (no interval filtering)
+        cudaMemset(g_abm_device_counter, 0, sizeof(unsigned int));
+        FLAMEGPU->environment.setProperty<int>("do_abm_export", 1);
         return;
     }
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
@@ -604,6 +669,19 @@ void exportABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescripti
     int bi = g_abm_buf_idx;
     collect_abm_step0(sim, model, g_abm_bufs[bi]);
     std::string path = "outputs/abm/agents_step_000000.abm.lz4";
+    g_abm_io_thread = std::thread([bi, path]() {
+        write_abm_lz4(path.c_str(), g_abm_bufs[bi]);
+    });
+    g_abm_buf_idx = 1 - bi;
+}
+
+// Called manually from main() before the presim loop — captures initial agent state (presim step 0).
+void exportPresimABMData_step0(flamegpu::CUDASimulation& sim, flamegpu::ModelDescription& model) {
+    ensurePresimOutputDirectories();
+    if (g_abm_io_thread.joinable()) g_abm_io_thread.join();
+    int bi = g_abm_buf_idx;
+    collect_abm_step0(sim, model, g_abm_bufs[bi]);
+    std::string path = "outputs/presim/abm/agents_presim_000000.abm.lz4";
     g_abm_io_thread = std::thread([bi, path]() {
         write_abm_lz4(path.c_str(), g_abm_bufs[bi]);
     });
@@ -632,7 +710,33 @@ static void write_cancer_init_diagnostic(flamegpu::CUDASimulation& sim,
 }
 
 FLAMEGPU_STEP_FUNCTION(exportABMData) {
-    if (HCC::is_presim_mode_active()) return;
+    if (HCC::is_presim_mode_active()) {
+        const unsigned int cur_step = FLAMEGPU->environment.getProperty<unsigned int>("current_step");
+        if (g_abm_io_thread.joinable()) g_abm_io_thread.join();
+
+        unsigned int n_agents = 0;
+        cudaMemcpy(&n_agents, g_abm_device_counter, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+        int bi = g_abm_buf_idx;
+        size_t copy_bytes = static_cast<size_t>(n_agents) * ABM_EXPORT_NCOLS * sizeof(int32_t);
+        cudaMemcpyAsync(g_abm_pinned[bi], g_abm_device_buf, copy_bytes,
+                        cudaMemcpyDeviceToHost, g_pde_stream);
+        cudaEventRecord(g_pde_event, g_pde_stream);
+
+        char path_buf[256];
+        snprintf(path_buf, sizeof(path_buf), "outputs/presim/abm/agents_presim_%06d.abm.lz4",
+                 static_cast<int>(cur_step + 1));
+        std::string path = path_buf;
+        int32_t* host_buf = g_abm_pinned[bi];
+        int n_agents_copy = static_cast<int>(n_agents);
+        g_abm_io_thread = std::thread([host_buf, n_agents_copy, path]() {
+            cudaEventSynchronize(g_pde_event);
+            write_abm_lz4_buf(path.c_str(), host_buf, n_agents_copy);
+        });
+        g_abm_buf_idx = 1 - bi;
+        return;
+    }
+
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
     const int interval = FLAMEGPU->environment.getProperty<int>("interval_out");
     if (main_step % interval != 0) return;
@@ -798,8 +902,10 @@ int main(int argc, const char** argv) {
         config.voxel_size,
         gpu_params);
 
-    // Store output interval in environment for step functions
+    // Store output interval and output-enabled flags in environment for step functions
     model->Environment().newProperty<int>("interval_out", config.interval_out);
+    model->Environment().newProperty<int>("abm_output_enabled", (config.grid_out & 1) ? 1 : 0);
+    model->Environment().newProperty<int>("pde_output_enabled", (config.grid_out & 2) ? 1 : 0);
     init_lap("build_model");
 
     // ========== INITIALIZE PDE SOLVER ==========
@@ -908,15 +1014,62 @@ int main(int argc, const char** argv) {
 
     _lymph.set_presimulation_mode(true);
 
+    // ── Presim outputs: build seed-stamped paths ──
+    char presim_qsp_path[256], presim_stats_path[256];
+    snprintf(presim_qsp_path,   sizeof(presim_qsp_path),   "outputs/presim/qsp_%u.csv",   config.random_seed);
+    snprintf(presim_stats_path, sizeof(presim_stats_path), "outputs/presim/stats_%u.csv", config.random_seed);
+    HCC::set_qsp_presim_output_path(presim_qsp_path);
+
+    // ── Presim step-0: export initial conditions before any presim step runs ──
+    if (config.grid_out & 2) {
+        exportPresimPDEData_step0(config.grid_x, config.grid_y, config.grid_z);
+        exportPresimECMData_step0(config.grid_x, config.grid_y, config.grid_z);
+    }
+    if (config.grid_out & 1) exportPresimABMData_step0(simulation, *model);
+    HCC::exportQSPPresimData_step0();
+
+    // ── Presim stats file ──
+    std::filesystem::create_directories("outputs/presim");
+    std::ofstream presim_stats_file(presim_stats_path);
+    if (presim_stats_file.is_open()) {
+        presim_stats_file << "step,"
+            << "agentCount.cancer.stem,agentCount.cancer.prog,agentCount.cancer.sen,"
+            << "agentCount.CD8.effector,agentCount.CD8.cytotoxic,agentCount.CD8.suppressed,"
+            << "agentCount.Th.default,agentCount.Treg.default,"
+            << "agentCount.MDSC.default,"
+            << "agentCount.MAC.M1,agentCount.MAC.M2,"
+            << "agentCount.FIB.normal,agentCount.FIB.CAF,"
+            << "agentCount.VAS.tip,agentCount.VAS.default,"
+            << "recruit.CD8.effector,recruit.Th.default,recruit.Treg.default,"
+            << "recruit.MDSC.default,recruit.MAC.M1,recruit.MAC.M2,"
+            << "recruit.t_sources,recruit.mdsc_sources,recruit.mac_sources,"
+            << "prolif.CD8.effector,prolif.CD8.cytotoxic,prolif.CD8.suppressed,"
+            << "prolif.Th.default,prolif.Treg.default,"
+            << "prolif.MDSC.default,"
+            << "prolif.cancer.stem,prolif.cancer.prog,prolif.cancer.sen,"
+            << "prolif.MAC.M1,prolif.MAC.M2,"
+            << "prolif.FIB.normal,prolif.FIB.CAF,"
+            << "prolif.VAS.tip,prolif.VAS.phalanx,"
+            << "death.CD8.effector,death.CD8.cytotoxic,death.CD8.suppressed,"
+            << "death.Th.default,death.Treg.default,"
+            << "death.MDSC.default,"
+            << "death.cancer.stem,death.cancer.prog,death.cancer.sen,"
+            << "death.MAC.M1,death.MAC.M2,"
+            << "death.FIB.normal,death.FIB.CAF,"
+            << "death.VAS.tip,death.VAS.phalanx,"
+            << "PDL1_frac\n";
+        presim_stats_file.flush();
+    }
+
     const unsigned int max_presim_steps = 100000;
     unsigned int presim_step = 0;
 
+    // Reset event/state counters before presim loop
+    cudaMemset(device_event_counters, 0, HCC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
+    cudaMemset(device_state_counters, 0, HCC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int));
+
     while (cur_vol < full_target_vol && presim_step < max_presim_steps) {
-        // std::cout << "[DEBUG] About to call simulation.step() for presim step " << presim_step << std::endl;
-        // std::cout.flush();
         bool ok = simulation.step();
-        // std::cout << "[DEBUG] Returned from simulation.step() successfully" << std::endl;
-        // std::cout.flush();
         if (!ok) {
             std::cout << "  Pre-simulation: ABM terminated early (all cancer cells gone)" << std::endl;
             break;
@@ -929,9 +1082,64 @@ int main(int argc, const char** argv) {
                       << ": QSP tum_vol=" << cur_vol
                       << " cm^3  (target=" << full_target_vol << ")" << std::endl;
         }
+
+        // Write presim stats row
+        if (presim_stats_file.is_open()) {
+            unsigned int host_events[HCC::ABM_EVENT_COUNTER_SIZE];
+            unsigned int host_states[HCC::ABM_STATE_COUNTER_SIZE];
+            cudaMemcpy(host_events, device_event_counters,
+                HCC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(host_states, device_state_counters,
+                HCC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+            HCC::RecruitStats rs = HCC::get_last_recruit_stats();
+
+            unsigned int total_cancer = host_states[HCC::SC_CANCER_STEM]
+                                      + host_states[HCC::SC_CANCER_PROG]
+                                      + host_states[HCC::SC_CANCER_SEN];
+            float pdl1_frac = (total_cancer > 0)
+                ? static_cast<float>(host_events[HCC::EVT_PDL1_COUNT]) / total_cancer
+                : 0.0f;
+
+            presim_stats_file << presim_step << ","
+                << host_states[HCC::SC_CANCER_STEM] << "," << host_states[HCC::SC_CANCER_PROG] << "," << host_states[HCC::SC_CANCER_SEN] << ","
+                << host_states[HCC::SC_CD8_EFF] << "," << host_states[HCC::SC_CD8_CYT] << "," << host_states[HCC::SC_CD8_SUP] << ","
+                << host_states[HCC::SC_TH] << "," << host_states[HCC::SC_TREG] << ","
+                << host_states[HCC::SC_MDSC] << ","
+                << host_states[HCC::SC_MAC_M1] << "," << host_states[HCC::SC_MAC_M2] << ","
+                << host_states[HCC::SC_FIB_NORM] << "," << host_states[HCC::SC_FIB_CAF] << ","
+                << host_states[HCC::SC_VAS_TIP] << "," << host_states[HCC::SC_VAS_PHALANX] << ","
+                << rs.teff_rec << "," << rs.th_rec << "," << rs.treg_rec << ","
+                << rs.mdsc_rec << "," << rs.mac_m1_rec << "," << rs.mac_m2_rec << ","
+                << rs.t_sources << "," << rs.mdsc_sources << "," << rs.mac_sources << ","
+                << host_events[HCC::EVT_PROLIF_CD8_EFF] << "," << host_events[HCC::EVT_PROLIF_CD8_CYT] << "," << host_events[HCC::EVT_PROLIF_CD8_SUP] << ","
+                << host_events[HCC::EVT_PROLIF_TH] << "," << host_events[HCC::EVT_PROLIF_TREG] << ","
+                << host_events[HCC::EVT_PROLIF_MDSC] << ","
+                << host_events[HCC::EVT_PROLIF_CANCER_STEM] << "," << host_events[HCC::EVT_PROLIF_CANCER_PROG] << "," << host_events[HCC::EVT_PROLIF_CANCER_SEN] << ","
+                << host_events[HCC::EVT_PROLIF_MAC_M1] << "," << host_events[HCC::EVT_PROLIF_MAC_M2] << ","
+                << host_events[HCC::EVT_PROLIF_FIB_NORM] << "," << host_events[HCC::EVT_PROLIF_FIB_CAF] << ","
+                << host_events[HCC::EVT_PROLIF_VAS_TIP] << "," << host_events[HCC::EVT_PROLIF_VAS_PHALANX] << ","
+                << host_events[HCC::EVT_DEATH_CD8_EFF] << "," << host_events[HCC::EVT_DEATH_CD8_CYT] << "," << host_events[HCC::EVT_DEATH_CD8_SUP] << ","
+                << host_events[HCC::EVT_DEATH_TH] << "," << host_events[HCC::EVT_DEATH_TREG] << ","
+                << host_events[HCC::EVT_DEATH_MDSC] << ","
+                << host_events[HCC::EVT_DEATH_CANCER_STEM] << "," << host_events[HCC::EVT_DEATH_CANCER_PROG] << "," << host_events[HCC::EVT_DEATH_CANCER_SEN] << ","
+                << host_events[HCC::EVT_DEATH_MAC_M1] << "," << host_events[HCC::EVT_DEATH_MAC_M2] << ","
+                << host_events[HCC::EVT_DEATH_FIB_NORM] << "," << host_events[HCC::EVT_DEATH_FIB_CAF] << ","
+                << host_events[HCC::EVT_DEATH_VAS_TIP] << "," << host_events[HCC::EVT_DEATH_VAS_PHALANX] << ","
+                << std::fixed << std::setprecision(4) << pdl1_frac << "\n";
+            presim_stats_file.flush();
+
+            cudaMemset(device_event_counters, 0, HCC::ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int));
+            cudaMemset(device_state_counters, 0, HCC::ABM_STATE_COUNTER_SIZE * sizeof(unsigned int));
+        }
     }
 
     _lymph.set_presimulation_mode(false);
+
+    if (presim_stats_file.is_open()) presim_stats_file.close();
+
+    // Flush any async presim I/O before proceeding to main-sim exports
+    flush_async_io();
 
     std::cout << "  Pre-simulation complete: " << presim_step << " steps, "
               << "QSP tum_vol=" << cur_vol << " cm^3" << std::endl;

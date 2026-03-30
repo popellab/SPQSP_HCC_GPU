@@ -10,6 +10,8 @@
 // File-scope variables (accessible to exportQSPData step function outside HCC namespace)
 static std::ofstream g_qsp_csv;
 static std::string g_qsp_output_path = "outputs/qsp.csv";
+static std::ofstream g_qsp_presim_csv;
+static std::string g_qsp_presim_output_path = "outputs/presim/qsp.csv";
 
 namespace HCC{
 
@@ -35,6 +37,10 @@ void set_qsp_output_path(const std::string& path) {
     g_qsp_output_path = path;
 }
 
+void set_qsp_presim_output_path(const std::string& path) {
+    g_qsp_presim_output_path = path;
+}
+
 // Export step-0 QSP state (initial condition, before any simulation steps).
 // Called from main.cu after presim completes and before the main loop.
 void exportQSPData_step0() {
@@ -49,6 +55,20 @@ void exportQSPData_step0() {
     }
     g_qsp_csv << 0 << *ode << "\n";
     g_qsp_csv.flush();
+}
+
+// Export presim step-0 QSP state (initial conditions, before presim loop begins).
+// Called from main.cu before the presim while loop.
+void exportQSPPresimData_step0() {
+    if (!g_lymph) return;
+    CancerVCT::ODE_system* ode = g_lymph->get_ode_system();
+    if (!ode) return;
+
+    std::filesystem::create_directories("outputs/presim");
+    g_qsp_presim_csv.open(g_qsp_presim_output_path);
+    g_qsp_presim_csv << "step" << CancerVCT::ODE_system::getHeader() << "\n";
+    g_qsp_presim_csv << 0 << *ode << "\n";
+    g_qsp_presim_csv.flush();
 }
 
 FLAMEGPU_HOST_FUNCTION(solve_qsp_step) {
@@ -165,10 +185,18 @@ double get_last_qsp_ms() {
 FLAMEGPU_STEP_FUNCTION(exportQSPData) {
     HCC::LymphCentralWrapper* lymph = HCC::get_lymph_pointer();
     if (!lymph) return;
-    if (lymph->is_presimulation_mode()) return;
 
     CancerVCT::ODE_system* ode = lymph->get_ode_system();
     if (!ode) return;
+
+    if (lymph->is_presimulation_mode()) {
+        // Write to presim QSP CSV (file opened by exportQSPPresimData_step0)
+        if (!g_qsp_presim_csv.is_open()) return;
+        const unsigned int cur_step = FLAMEGPU->environment.getProperty<unsigned int>("current_step");
+        g_qsp_presim_csv << (cur_step + 1) << *ode << "\n";
+        g_qsp_presim_csv.flush();
+        return;
+    }
 
     const unsigned int main_step = FLAMEGPU->environment.getProperty<unsigned int>("main_sim_step");
 
