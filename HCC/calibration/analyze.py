@@ -188,7 +188,8 @@ def plot_posteriors(history, truth: dict[str, float], out: Path) -> None:
     t_final = history.max_t
     df, w = history.get_distribution(m=0, t=t_final)
     w = np.asarray(w, dtype=np.float64)
-    w /= w.sum() if w.sum() > 0 else 1.0
+    s = w.sum()
+    w = w / s if s > 0 else w
 
     keys = list(PARAM_BOUNDS.keys())
     fig, axes = plt.subplots(1, len(keys), figsize=(4 * len(keys), 4))
@@ -217,7 +218,8 @@ def plot_corner(history, truth: dict[str, float], out: Path) -> None:
     t_final = history.max_t
     df, w = history.get_distribution(m=0, t=t_final)
     w = np.asarray(w, dtype=np.float64)
-    w /= w.sum() if w.sum() > 0 else 1.0
+    s = w.sum()
+    w = w / s if s > 0 else w
 
     keys = list(PARAM_BOUNDS.keys())
     n = len(keys)
@@ -324,9 +326,10 @@ def run_posterior_predictive(
     t_final = history.max_t
     df, w = history.get_distribution(m=0, t=int(t_final))
     w = np.asarray(w, dtype=np.float64)
-    if w.sum() <= 0:
+    s = w.sum()
+    if s <= 0:
         raise RuntimeError("Final population has zero total weight")
-    w = w / w.sum()
+    w = w / s
 
     rng = np.random.default_rng(rng_seed)
     idx = rng.choice(len(df), size=n, replace=True, p=w)
@@ -437,9 +440,10 @@ def write_posterior_summary(history, truth: dict[str, float], out: Path) -> None
     for t in range(history.max_t + 1):
         df, w = history.get_distribution(m=0, t=int(t))
         w = np.asarray(w, dtype=np.float64)
-        if w.sum() <= 0:
+        s = w.sum()
+        if s <= 0:
             continue
-        w /= w.sum()
+        w = w / s
         cells = []
         for k in keys:
             v = np.asarray(df[k].values, dtype=np.float64)
