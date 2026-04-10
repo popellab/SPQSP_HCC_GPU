@@ -92,6 +92,7 @@ def run_hcc(
             binary,
             "-p", xml_out,
             "-s", "0",
+            "-G", "1",
             "--seed", str(seed),
         ]
         if grid is not None:

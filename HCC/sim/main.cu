@@ -161,14 +161,20 @@ static int g_pde_buf_idx = 0;
 static int g_abm_buf_idx = 0;
 static int g_ecm_buf_idx = 0;
 
-// Allocate pinned PDE buffers and CUDA stream (call once after grid size is known)
+// Create the shared async D2H stream + event used by both PDE and ABM export paths.
+// Must be called before any exportXxxData step function runs, regardless of -G flags.
+static void init_async_io_stream() {
+    if (!g_pde_stream) cudaStreamCreateWithFlags(&g_pde_stream, cudaStreamNonBlocking);
+    if (!g_pde_event)  cudaEventCreateWithFlags(&g_pde_event, cudaEventDisableTiming);
+}
+
+// Allocate pinned PDE buffers (call once after grid size is known, only when PDE output is enabled)
 static void init_pde_io(int grid_x, int grid_y, int grid_z) {
     g_pde_buf_floats = static_cast<size_t>(HCC::NUM_SUBSTRATES) * grid_x * grid_y * grid_z;
     size_t bytes = g_pde_buf_floats * sizeof(float);
     cudaMallocHost(&g_pde_pinned[0], bytes);
     cudaMallocHost(&g_pde_pinned[1], bytes);
-    cudaStreamCreateWithFlags(&g_pde_stream, cudaStreamNonBlocking);
-    cudaEventCreateWithFlags(&g_pde_event, cudaEventDisableTiming);
+    init_async_io_stream();
 }
 
 // Allocate GPU buffer + pinned host buffers for ABM export
@@ -921,6 +927,9 @@ int main(int argc, const char** argv) {
     // Allocate pinned host buffers and CUDA stream for async PDE output
     if (config.grid_out & 2) {
         init_pde_io(config.grid_x, config.grid_y, config.grid_z);
+    } else {
+        // ABM export (-G 1) also uses the shared stream/event; make sure they exist.
+        init_async_io_stream();
     }
     init_lap("init_pde");
 

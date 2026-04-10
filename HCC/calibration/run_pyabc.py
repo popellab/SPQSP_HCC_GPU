@@ -159,11 +159,17 @@ def cmd_abc(args: argparse.Namespace) -> int:
     }
     prior = pyabc.Distribution(**prior_dict)
 
+    # Force single-process sampling: the HCC binary owns the GPU, so PyABC's
+    # default multicore sampler would launch concurrent hcc processes all
+    # fighting for the same device and OOM/crash.
+    sampler = pyabc.sampler.SingleCoreSampler()
+
     abc = pyabc.ABCSMC(
         models=model,
         parameter_priors=prior,
         distance_function=distance,
         population_size=args.population_size,
+        sampler=sampler,
     )
     abc.new(args.db, {"summary": target_vec})
     history = abc.run(
