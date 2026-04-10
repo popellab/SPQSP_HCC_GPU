@@ -9,6 +9,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/calib_%j.out
 #SBATCH --error=logs/calib_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=cchris80@jh.edu
 
 # ============================================================================
 # HCC calibration pipeline on Delta (A100 / gpuA100x4).
@@ -37,10 +39,10 @@
 set -euo pipefail
 
 # ── Resolve project layout ──────────────────────────────────────────────────
-# Script is HCC/calibration/submit_calibration.sh -> repo root = parents[2]
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CALIB_DIR="${SCRIPT_DIR}"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# SLURM copies the script to a spool dir, so BASH_SOURCE[0] is unreliable.
+# Use SLURM_SUBMIT_DIR (set by sbatch) and the known relative path instead.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+CALIB_DIR="${REPO_ROOT}/HCC/calibration"
 SIM_DIR="${REPO_ROOT}/HCC/sim"
 HCC_BIN="${SIM_DIR}/build/bin/hcc"
 BASE_XML="${SIM_DIR}/resource/param_all_test.xml"
@@ -97,11 +99,10 @@ trap cleanup EXIT
 
 # ── Delta modules ───────────────────────────────────────────────────────────
 module purge
-module load gcc/11.4.0
-module load cuda/12.3
-module load cmake/3.27
-# Prefer a Python module if available; otherwise rely on system python3.
-module load anaconda3_gpu 2>/dev/null || module load anaconda3 2>/dev/null || true
+module load gcc-native/13.2
+module load cuda/12.8
+module load cmake/3.31.8
+module load python/3.13.5-gcc13.3.1
 
 # ── Job banner ──────────────────────────────────────────────────────────────
 echo "============================================================"
@@ -114,14 +115,12 @@ echo "  Scratch:     ${WORK_DIR}"
 echo "  Results:     ${RESULTS_DIR}"
 echo "============================================================"
 
-# ── Stage 0: build check ────────────────────────────────────────────────────
-if [[ ! -x "${HCC_BIN}" ]]; then
-    echo ""
-    echo "── Stage 0: building hcc binary ──────────────────────────"
-    pushd "${SIM_DIR}" > /dev/null
-    ./build.sh --cuda-arch 80 -j 4
-    popd > /dev/null
-fi
+# ── Stage 0: build (always, so binary stays in sync with code changes) ──────
+echo ""
+echo "── Stage 0: building hcc binary ──────────────────────────"
+pushd "${SIM_DIR}" > /dev/null
+./build.sh --cuda-arch 80 -j 4
+popd > /dev/null
 if [[ ! -x "${HCC_BIN}" ]]; then
     echo "ERROR: build completed but ${HCC_BIN} is not executable." >&2
     exit 1

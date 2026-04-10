@@ -855,6 +855,12 @@ FLAMEGPU_EXIT_CONDITION(checkSimulationEnd) {
 int main(int argc, const char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
 
+    // Force CUDA context creation immediately. On HPC clusters (e.g. Delta) GPUs
+    // run in EXCLUSIVE_PROCESS mode, so lazy context creation inside PDESolver
+    // (which runs before flamegpu::CUDASimulation) fails. cudaFree(nullptr) is the
+    // idiomatic no-op that establishes a context on device 0.
+    cudaFree(nullptr);
+
     // Check for -p flag (XML path override)
     // Default: resource/param_all_test.xml relative to the executable location
     std::string exe_dir;
