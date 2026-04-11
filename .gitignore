@@ -21,3 +21,5 @@ CLAUDE.md
 .venv/
 *.db
 *.json
+*.err
+*.out

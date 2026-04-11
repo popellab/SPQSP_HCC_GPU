@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/calib_%j.out
 #SBATCH --error=logs/calib_%j.err
 #SBATCH --mail-type=END,FAIL
@@ -84,11 +84,17 @@ FIG_DIR="${WORK_DIR}/figures"
 # Final copy target (small artifacts only)
 RESULTS_DIR="${CALIB_DIR}/results/${JOB_ID}"
 
-# ── Cleanup on exit: wipe job-local scratch unconditionally ─────────────────
+# ── Cleanup on exit: save artifacts first, then wipe scratch ────────────────
 cleanup() {
     local rc=$?
     echo ""
     echo "── Cleanup (exit=${rc}) ───────────────────────────────────"
+    # Always attempt to salvage whatever exists (handles TIMEOUT/FAIL cases)
+    mkdir -p "${RESULTS_DIR}"
+    [[ -f "${GT_JSON}" ]]   && cp "${GT_JSON}"   "${RESULTS_DIR}/" && echo "  saved ground_truth.json"
+    [[ -f "${ABC_DB_PATH}" ]] && cp "${ABC_DB_PATH}" "${RESULTS_DIR}/" && echo "  saved abc.db"
+    [[ -d "${FIG_DIR}" ]]   && cp -r "${FIG_DIR}" "${RESULTS_DIR}/figures" && echo "  saved figures/"
+    [[ -f "${BASE_XML}" ]]  && cp "${BASE_XML}"  "${RESULTS_DIR}/param_snapshot.xml" && echo "  saved param_snapshot.xml"
     if [[ -d "${WORK_DIR}" ]]; then
         du -sh "${WORK_DIR}" 2>/dev/null || true
         rm -rf "${WORK_DIR}"
@@ -208,18 +214,8 @@ python -m HCC.calibration.analyze \
 echo "  analysis done in $((SECONDS - t0))s"
 find "${TMPDIR_LOCAL}" -mindepth 1 -maxdepth 1 -type d -name 'hcc_calib_*' -exec rm -rf {} + 2>/dev/null || true
 
-# ── Copy artifacts back to the repo tree ────────────────────────────────────
-echo ""
-echo "── Copying artifacts to ${RESULTS_DIR} ───────────────────"
-mkdir -p "${RESULTS_DIR}"
-cp "${GT_JSON}" "${RESULTS_DIR}/"
-cp "${ABC_DB_PATH}" "${RESULTS_DIR}/"
-cp -r "${FIG_DIR}" "${RESULTS_DIR}/figures"
-# Snapshot the base XML so results are self-describing
-cp "${BASE_XML}" "${RESULTS_DIR}/param_snapshot.xml"
-
 echo ""
 echo "============================================================"
-echo "Pipeline complete. Results: ${RESULTS_DIR}"
-ls -lh "${RESULTS_DIR}" "${RESULTS_DIR}/figures"
+echo "Pipeline complete. Artifacts will be copied by cleanup trap."
+echo "Results destination: ${RESULTS_DIR}"
 echo "============================================================"
