@@ -65,7 +65,7 @@ def simulate_summary(
     grid: int | None,
     keep_workdir: bool,
 ) -> np.ndarray:
-    """Run HCC with these params and return the 15-value FunCN summary."""
+    """Run HCC with these params and return the 5-value FunCN summary."""
     overrides = _params_to_overrides(params)
     result = run_hcc(
         overrides=overrides,

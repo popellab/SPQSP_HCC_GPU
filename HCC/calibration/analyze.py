@@ -41,7 +41,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .funcn import PAIR_NAMES, QUANTILES, summary_labels
+from .funcn import PAIR_NAMES, summary_labels
 from .run_pyabc import PARAM_BOUNDS, PARAM_PATHS, simulate_summary
 
 
@@ -264,12 +264,10 @@ def plot_corner(history, truth: dict[str, float], out: Path) -> None:
 def plot_funcn_distance_by_pair(history, target_vec: np.ndarray, pops, out: Path) -> None:
     """Per-pair squared-error contribution vs population.
 
-    For each pair we average (a - target)^2 over that pair's 3 quantile
-    components, then summarise the (weighted) particle distribution at each
-    population with a median + IQR band.
+    Each pair is a single value (mean interaction weight), so the per-particle
+    error is just (sim - target)^2 for that pair index.
     """
     n_pairs = len(PAIR_NAMES)
-    qn = len(QUANTILES)
     t_values = list(pops["t"])
 
     medians = np.full((len(t_values), n_pairs), np.nan)
@@ -284,11 +282,10 @@ def plot_funcn_distance_by_pair(history, target_vec: np.ndarray, pops, out: Path
         if not stats:
             continue
         w_arr = np.asarray(w_list, dtype=np.float64)
-        vecs = np.stack([_extract_summary(s, target_vec.size) for s in stats])  # (P, 15)
-        sq = (vecs - target_vec[None, :]) ** 2                                   # (P, 15)
+        vecs = np.stack([_extract_summary(s, target_vec.size) for s in stats])  # (P, 5)
+        sq = (vecs - target_vec[None, :]) ** 2                                   # (P, 5)
         for p in range(n_pairs):
-            cols = slice(p * qn, (p + 1) * qn)
-            per_particle = sq[:, cols].mean(axis=1)                              # (P,)
+            per_particle = sq[:, p]                                              # (P,)
             medians[ti, p] = _weighted_quantile(per_particle, w_arr, 0.5)
             lowers[ti, p]  = _weighted_quantile(per_particle, w_arr, 0.25)
             uppers[ti, p]  = _weighted_quantile(per_particle, w_arr, 0.75)
@@ -320,7 +317,7 @@ def run_posterior_predictive(
 ) -> dict[str, Any]:
     """Sample N particles from the final posterior (weighted) and resimulate.
 
-    Returns a dict with 'params' (list of dicts), 'summaries' (N_ok, 15 array),
+    Returns a dict with 'params' (list of dicts), 'summaries' (N_ok, 5 array),
     and 'failed' (count of runs that errored).
     """
     t_final = history.max_t
@@ -371,45 +368,37 @@ def run_posterior_predictive(
 
 
 def plot_posterior_predictive(ppc: dict[str, Any], out: Path) -> None:
-    summaries = ppc["summaries"]            # (N_ok, 15)
+    summaries = ppc["summaries"]            # (N_ok, 5)
     target = np.asarray(ppc["target"], dtype=np.float64)
     n_pairs = len(PAIR_NAMES)
-    qn = len(QUANTILES)
 
-    fig, axes = plt.subplots(1, n_pairs, figsize=(3.2 * n_pairs, 4), sharey=False)
-    if n_pairs == 1:
-        axes = [axes]
-    for p, name in enumerate(PAIR_NAMES):
-        ax = axes[p]
-        cols = slice(p * qn, (p + 1) * qn)
-        data = [summaries[:, p * qn + q] for q in range(qn)]
-        positions = np.arange(qn) + 1
-        bp = ax.boxplot(
-            data,
-            positions=positions,
-            widths=0.55,
-            showfliers=False,
-            patch_artist=True,
-        )
-        for patch in bp["boxes"]:
-            patch.set_facecolor("#9ecae1")
-            patch.set_alpha(0.8)
-        # Individual PPC draws as faint jitter
-        for qi in range(qn):
-            jitter = (np.random.default_rng(qi).uniform(-0.12, 0.12, size=summaries.shape[0]))
-            ax.scatter(np.full(summaries.shape[0], positions[qi]) + jitter,
-                       summaries[:, p * qn + qi],
-                       s=10, alpha=0.35, color="tab:blue", edgecolors="none")
-        # Target
-        ax.scatter(positions, target[cols], marker="X", s=110, color="red",
-                   edgecolors="black", linewidths=0.6, zorder=5, label="target")
-        ax.set_xticks(positions)
-        ax.set_xticklabels([f"p{int(q*100):02d}" for q in QUANTILES])
-        ax.set_title(name, fontsize=10)
-        ax.grid(True, axis="y", alpha=0.3)
-        if p == 0:
-            ax.set_ylabel("FunCN score")
-            ax.legend(fontsize=8, loc="best")
+    fig, ax = plt.subplots(figsize=(max(6, 1.8 * n_pairs), 5))
+    positions = np.arange(n_pairs) + 1
+    bp = ax.boxplot(
+        [summaries[:, p] for p in range(n_pairs)],
+        positions=positions,
+        widths=0.55,
+        showfliers=False,
+        patch_artist=True,
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor("#9ecae1")
+        patch.set_alpha(0.8)
+    # Individual PPC draws as faint jitter
+    for p in range(n_pairs):
+        jitter = np.random.default_rng(p).uniform(-0.12, 0.12, size=summaries.shape[0])
+        ax.scatter(np.full(summaries.shape[0], positions[p]) + jitter,
+                   summaries[:, p],
+                   s=10, alpha=0.35, color="tab:blue", edgecolors="none")
+    # Target
+    ax.scatter(positions, target, marker="X", s=110, color="red",
+               edgecolors="black", linewidths=0.6, zorder=5, label="target")
+    short_names = [n.replace("Reference_", "").replace("_Weight_", "\n→ ") for n in PAIR_NAMES]
+    ax.set_xticks(positions)
+    ax.set_xticklabels(short_names, fontsize=9)
+    ax.set_ylabel("Interaction weight")
+    ax.legend(fontsize=8, loc="best")
+    ax.grid(True, axis="y", alpha=0.3)
     fig.suptitle(
         f"Posterior predictive check  "
         f"(N={summaries.shape[0]}, failed={ppc['failed']})",
