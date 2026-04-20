@@ -17,6 +17,8 @@
 CLAUDE.md
 /HCC/sim/cluster.conf
 /HCC/sim/external/
+/HCC/profiling/
+/figures/
 *.png
 .venv/
 *.db

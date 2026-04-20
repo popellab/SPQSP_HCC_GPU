@@ -21,6 +21,12 @@
 # Usage:
 #   sbatch submit.sh                       # defaults: 500 steps, 50^3 grid
 #   sbatch submit.sh -s 100 -g 30         # custom run
+#
+# Profiling (Nsight Systems):
+#   sbatch --export=ALL,NSYS=1 submit.sh -s 280 -g 50 -G 3
+#     - forces build with FLAMEGPU2 NVTX markers if needed
+#     - wraps hcc in `nsys profile` and writes .nsys-rep to
+#       ${PROJECT_DIR}/profiling/${SLURM_JOB_ID}/
 # ============================================================================
 
 set -e
@@ -29,6 +35,9 @@ PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 HCC_BIN="${PROJECT_DIR}/build/bin/hcc"
 EXT_DIR="${PROJECT_DIR}/external"
 DEFAULT_ARGS="-s 500 -g 50 -oa 1 -op 1"
+
+# Profiling: set NSYS=1 to wrap hcc in Nsight Systems capture
+NSYS="${NSYS:-0}"
 
 # ============================================================================
 # Load user config
@@ -169,12 +178,25 @@ echo "================================================"
 # Build if needed
 # ============================================================================
 
+# If NSYS=1, also rebuild if the existing binary was not built with NVTX
+NEED_BUILD=0
 if [[ ! -x "${HCC_BIN}" ]]; then
+    NEED_BUILD=1
+elif [[ "${NSYS}" == "1" ]] && [[ -f "${PROJECT_DIR}/build/CMakeCache.txt" ]]; then
+    if ! grep -q "FLAMEGPU_ENABLE_NVTX:BOOL=ON" "${PROJECT_DIR}/build/CMakeCache.txt"; then
+        echo ""
+        echo "=== NSYS=1 but existing binary lacks FLAMEGPU2 NVTX — rebuilding with --nvtx ==="
+        NEED_BUILD=1
+    fi
+fi
+
+if [[ "${NEED_BUILD}" == "1" ]]; then
     echo ""
-    echo "=== Binary not found — building ==="
+    echo "=== Building hcc ==="
     cd "${PROJECT_DIR}"
 
     BUILD_ARGS=(--cuda-arch "${CUDA_ARCH}")
+    [[ "${NSYS}" == "1" ]] && BUILD_ARGS+=(--nvtx)
 
     # Use pre-staged deps from external/ if available
     if [[ -f "${EXT_DIR}/flamegpu2/CMakeLists.txt" ]]; then
@@ -208,10 +230,27 @@ fi
 # ============================================================================
 
 mkdir -p "${RUN_DIR}"
+
+# If profiling, set up persistent profile dir (outside scratch so it survives
+# cluster cleanup) and locate nsys.
+PROFILE_DIR=""
+if [[ "${NSYS}" == "1" ]]; then
+    PROFILE_DIR="${PROJECT_DIR}/profiling/${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
+    mkdir -p "${PROFILE_DIR}"
+    if ! command -v nsys >/dev/null 2>&1; then
+        echo "ERROR: NSYS=1 but 'nsys' not on PATH. Load a cudatoolkit module providing Nsight Systems."
+        exit 1
+    fi
+fi
+
 echo "================================================"
 echo "  Binary:      ${HCC_BIN}"
 echo "  Working dir: ${RUN_DIR}"
 echo "  Args:        ${@:-${DEFAULT_ARGS}}"
+if [[ "${NSYS}" == "1" ]]; then
+    echo "  Profile:     enabled (nsys) → ${PROFILE_DIR}"
+    echo "  nsys:        $(nsys --version 2>/dev/null | head -1)"
+fi
 echo "================================================"
 
 cd "${RUN_DIR}"
@@ -219,8 +258,23 @@ cd "${RUN_DIR}"
 # Copy param file for reproducibility
 cp "${PROJECT_DIR}/resource/param_all_test.xml" "${RUN_DIR}/param_snapshot.xml"
 
-# Run
-${HCC_BIN} ${@:-${DEFAULT_ARGS}}
+# Run (optionally wrapped in nsys profile)
+if [[ "${NSYS}" == "1" ]]; then
+    nsys profile \
+        --output="${PROFILE_DIR}/hcc_prof" \
+        --trace=cuda,nvtx,osrt \
+        --cuda-memory-usage=true \
+        --force-overwrite=true \
+        --stats=false \
+        "${HCC_BIN}" ${@:-${DEFAULT_ARGS}}
+    # Also snapshot the args used for the profile, so later analysis has context
+    echo "args: ${@:-${DEFAULT_ARGS}}" > "${PROFILE_DIR}/run.meta"
+    echo "host: $(hostname)" >> "${PROFILE_DIR}/run.meta"
+    echo "gpu:  $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)" >> "${PROFILE_DIR}/run.meta"
+    cp "${PROJECT_DIR}/resource/param_all_test.xml" "${PROFILE_DIR}/param_snapshot.xml"
+else
+    "${HCC_BIN}" ${@:-${DEFAULT_ARGS}}
+fi
 
 # ============================================================================
 # Copy outputs to home directory for persistent storage
@@ -238,4 +292,5 @@ echo "================================================"
 echo "Run complete."
 echo "  Scratch: ${RUN_DIR}/outputs/"
 echo "  Home:    ${HOME_OUT}/"
+[[ -n "${PROFILE_DIR}" ]] && echo "  Profile: ${PROFILE_DIR}/hcc_prof.nsys-rep"
 echo "================================================"

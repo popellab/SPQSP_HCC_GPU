@@ -26,6 +26,9 @@ echo "CUDA: $(nvcc --version | grep release)"
 
 # First-time build fetches FLAMEGPU2, Boost, SUNDIALS from GitHub (~8-15 min)
 # Subsequent incremental builds are ~2 min
-./build.sh --cuda-arch 80 -j 4
+# Pass NSYS=1 to build with FLAMEGPU2 NVTX markers for Nsight Systems profiling.
+BUILD_ARGS=(--cuda-arch 80 -j 4)
+[[ "${NSYS:-0}" == "1" ]] && BUILD_ARGS+=(--nvtx)
+./build.sh "${BUILD_ARGS[@]}"
 
 echo "=== Build finished: $(date) ==="

@@ -13,6 +13,7 @@ BUILD_TYPE="Release"
 CUDA_ARCH=""
 FLAMEGPU_PATH=""
 JOBS=""
+NVTX="OFF"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             JOBS="$2"
             shift 2
             ;;
+        --nvtx)
+            NVTX="ON"
+            shift
+            ;;
         --clean)
             echo "Cleaning build directory..."
             rm -rf "${BUILD_DIR}"
@@ -46,6 +51,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --cuda-arch ARCH    Set CUDA architecture (e.g., 80 for A100, 90 for H100)"
             echo "  --flamegpu PATH     Path to local FLAMEGPU2 source"
             echo "  -j, --jobs N        Number of parallel build jobs (default: nproc)"
+            echo "  --nvtx              Enable FLAMEGPU2 NVTX markers (for Nsight Systems profiling)"
             echo "  --clean             Remove build directory"
             echo "  --help              Show this help"
             echo ""
@@ -118,6 +124,7 @@ fi
 
 CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+    -DFLAMEGPU_ENABLE_NVTX="${NVTX}"
 )
 
 [[ -n "${CUDA_ARCH}" ]] && CMAKE_ARGS+=(-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}")
@@ -129,6 +136,7 @@ echo ""
 echo "=== Configuring SPQSP HCC ==="
 echo "  Build type:  ${BUILD_TYPE}"
 echo "  Build dir:   ${BUILD_DIR}"
+echo "  NVTX:        ${NVTX}"
 [[ -n "${CUDA_ARCH}" ]] && echo "  CUDA arch:   ${CUDA_ARCH}"
 [[ -n "${SUNDIALS_DIR}" ]] && echo "  SUNDIALS:    ${SUNDIALS_DIR}"
 [[ -n "${BOOST_ROOT}" ]] && echo "  Boost:       ${BOOST_ROOT}"
