@@ -181,6 +181,128 @@ __global__ void lod_z_kernel(
 }
 
 // ============================================================================
+// BATCHED KERNELS: handle all NUM_SUBSTRATES in a single launch via blockIdx.z
+//
+// Cuts PDE launches per step from ~480 (40 per substep × 12 substeps) to ~48
+// (4 per substep × 12 substeps). Uses the existing SoA layout [s*V + voxel_idx].
+// ============================================================================
+
+__global__ void apply_sources_uptakes_batched_kernel(
+    float* __restrict__ C_base,    // [NUM_SUBSTRATES * V]
+    const float* __restrict__ S_base,
+    const float* __restrict__ U_base,
+    float dt, int V)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int s   = blockIdx.y;
+    if (idx >= V) return;
+
+    size_t off = (size_t)s * V + idx;
+    float p = C_base[off];
+    float s_val = S_base[off];
+    float u = U_base[off];
+
+    float p_new;
+    if (u > 1e-10f) {
+        float su = s_val / u;
+        p_new = (p - su) * expf(-u * dt) + su;
+    } else {
+        p_new = p + s_val * dt;
+    }
+    C_base[off] = fmaxf(0.0f, p_new);
+}
+
+__global__ void lod_x_batched_kernel(
+    float* __restrict__ C_base,
+    const float* __restrict__ denom_base,  // [NUM_SUBSTRATES * nx]
+    const float* __restrict__ cx_base,
+    const float* __restrict__ c1_arr,      // [NUM_SUBSTRATES]
+    int nx, int ny, int nz, int V)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y;
+    int s = blockIdx.z;
+    if (j >= ny) return;
+
+    float c1 = c1_arr[s];
+    if (c1 == 0.0f) return;  // non-diffusing substrate: skip LOD entirely
+
+    float* line = C_base + (size_t)s * V + (size_t)k * ny*nx + (size_t)j * nx;
+    const float* denom = denom_base + s * nx;
+    const float* cx    = cx_base    + s * nx;
+
+    line[0] /= denom[0];
+    for (int i = 1; i < nx; i++) {
+        line[i] += c1 * line[i-1];
+        line[i] /= denom[i];
+    }
+    for (int i = nx-2; i >= 0; i--) {
+        line[i] -= cx[i] * line[i+1];
+    }
+}
+
+__global__ void lod_y_batched_kernel(
+    float* __restrict__ C_base,
+    const float* __restrict__ denom_base,
+    const float* __restrict__ cy_base,
+    const float* __restrict__ c1_arr,
+    int nx, int ny, int nz, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y;
+    int s = blockIdx.z;
+    if (i >= nx) return;
+
+    float c1 = c1_arr[s];
+    if (c1 == 0.0f) return;
+
+    float* C = C_base + (size_t)s * V;
+    const float* denom = denom_base + s * ny;
+    const float* cy    = cy_base    + s * ny;
+    int base = k * ny*nx + i;
+
+    C[base] /= denom[0];
+    for (int j = 1; j < ny; j++) {
+        C[base + j*nx] += c1 * C[base + (j-1)*nx];
+        C[base + j*nx] /= denom[j];
+    }
+    for (int j = ny-2; j >= 0; j--) {
+        C[base + j*nx] -= cy[j] * C[base + (j+1)*nx];
+    }
+}
+
+__global__ void lod_z_batched_kernel(
+    float* __restrict__ C_base,
+    const float* __restrict__ denom_base,
+    const float* __restrict__ cz_base,
+    const float* __restrict__ c1_arr,
+    int nx, int ny, int nz, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y;
+    int s = blockIdx.z;
+    if (i >= nx) return;
+
+    float c1 = c1_arr[s];
+    if (c1 == 0.0f) return;
+
+    float* C = C_base + (size_t)s * V;
+    const float* denom = denom_base + s * nz;
+    const float* cz    = cz_base    + s * nz;
+    int stride = ny * nx;
+    int base   = j * nx + i;
+
+    C[base] /= denom[0];
+    for (int k = 1; k < nz; k++) {
+        C[base + k*stride] += c1 * C[base + (k-1)*stride];
+        C[base + k*stride] /= denom[k];
+    }
+    for (int k = nz-2; k >= 0; k--) {
+        C[base + k*stride] -= cz[k] * C[base + (k+1)*stride];
+    }
+}
+
+// ============================================================================
 // KERNEL: Compute gradients via central differences
 //
 // grad_x[i,j,k] = (C[i+1,j,k] - C[i-1,j,k]) / (2*dx)  (forward/backward at boundaries)
@@ -242,7 +364,8 @@ PDESolver::PDESolver(const PDEConfig& config)
       d_grad_(nullptr), d_recruitment_(nullptr),
       d_thomas_denom_x_(nullptr), d_thomas_c_x_(nullptr),
       d_thomas_denom_y_(nullptr), d_thomas_c_y_(nullptr),
-      d_thomas_denom_z_(nullptr), d_thomas_c_z_(nullptr)
+      d_thomas_denom_z_(nullptr), d_thomas_c_z_(nullptr),
+      d_c1_(nullptr)
 {
     for (int s = 0; s < NUM_SUBSTRATES; s++) {
         h_c1_[s] = 0.0f;
@@ -261,6 +384,7 @@ PDESolver::~PDESolver() {
     if (d_thomas_c_y_)    CUDA_CHECK(cudaFree(d_thomas_c_y_));
     if (d_thomas_denom_z_) CUDA_CHECK(cudaFree(d_thomas_denom_z_));
     if (d_thomas_c_z_)    CUDA_CHECK(cudaFree(d_thomas_c_z_));
+    if (d_c1_)            CUDA_CHECK(cudaFree(d_c1_));
 }
 
 // ============================================================================
@@ -288,8 +412,12 @@ void PDESolver::initialize() {
     CUDA_CHECK(cudaMalloc(&d_thomas_c_y_,     NUM_SUBSTRATES * config_.ny * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_thomas_denom_z_, NUM_SUBSTRATES * config_.nz * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_thomas_c_z_,     NUM_SUBSTRATES * config_.nz * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_c1_,             NUM_SUBSTRATES * sizeof(float)));
 
     precompute_thomas_coefficients();
+
+    // Upload per-substrate c1 values for batched kernels
+    CUDA_CHECK(cudaMemcpy(d_c1_, h_c1_, NUM_SUBSTRATES * sizeof(float), cudaMemcpyHostToDevice));
 
     std::cout << "[PDESolver v3] Initialized: " << config_.nx << "×" << config_.ny
               << "×" << config_.nz << " grid, " << NUM_SUBSTRATES
@@ -393,57 +521,31 @@ void PDESolver::solve_timestep() {
     int nz = config_.nz;
     float dt = config_.dt_pde;
 
-    const int threads = 256;
+    // --- Step 1: batched exact ODE for all substrates (1 launch vs NUM_SUBSTRATES) ---
+    {
+        const int threads = 256;
+        dim3 grid((V + threads - 1) / threads, NUM_SUBSTRATES);
+        apply_sources_uptakes_batched_kernel<<<grid, threads>>>(
+            d_conc_, d_src_, d_upt_, dt, V);
+    }
 
-    for (int s = 0; s < NUM_SUBSTRATES; s++) {
-        float* C  = d_conc_ + (size_t)s * V;
-        float* S  = d_src_  + (size_t)s * V;
-        float* U  = d_upt_  + (size_t)s * V;
-        float  c1 = h_c1_[s];
+    // --- Steps 2–4: batched LOD sweeps. Non-diffusing substrates (c1=0) return early. ---
+    {
+        const int bx = 32;
+        dim3 grid_x((ny + bx-1)/bx, nz, NUM_SUBSTRATES);
+        lod_x_batched_kernel<<<grid_x, bx>>>(
+            d_conc_, d_thomas_denom_x_, d_thomas_c_x_, d_c1_,
+            nx, ny, nz, V);
 
-        // --- Step 1: exact ODE for cell source/uptake (background decay in LOD) ---
-        {
-            int blocks = (V + threads - 1) / threads;
-            apply_sources_uptakes_kernel<<<blocks, threads>>>(C, S, U, dt, V);
-        }
+        dim3 grid_y((nx + bx-1)/bx, nz, NUM_SUBSTRATES);
+        lod_y_batched_kernel<<<grid_y, bx>>>(
+            d_conc_, d_thomas_denom_y_, d_thomas_c_y_, d_c1_,
+            nx, ny, nz, V);
 
-        // Skip LOD entirely if D = 0 — diffusion-free substrate
-        if (config_.diffusion_coeffs[s] == 0.0f) {
-            continue;
-        }
-
-        // --- Step 2: LOD x-pass ---
-        // Each thread handles one (j, k) pair → one x-line of length nx
-        {
-            const int bx = 32;
-            dim3 grid((ny + bx-1)/bx, nz);
-            lod_x_kernel<<<grid, bx>>>(C,
-                d_thomas_denom_x_ + s * nx,
-                d_thomas_c_x_     + s * nx,
-                c1, nx, ny, nz);
-        }
-
-        // --- Step 3: LOD y-pass ---
-        // Each thread handles one (i, k) pair → one y-line of length ny
-        {
-            const int bx = 32;
-            dim3 grid((nx + bx-1)/bx, nz);
-            lod_y_kernel<<<grid, bx>>>(C,
-                d_thomas_denom_y_ + s * ny,
-                d_thomas_c_y_     + s * ny,
-                c1, nx, ny, nz);
-        }
-
-        // --- Step 4: LOD z-pass ---
-        // Each thread handles one (i, j) pair → one z-line of length nz
-        {
-            const int bx = 32;
-            dim3 grid((nx + bx-1)/bx, ny);
-            lod_z_kernel<<<grid, bx>>>(C,
-                d_thomas_denom_z_ + s * nz,
-                d_thomas_c_z_     + s * nz,
-                c1, nx, ny, nz);
-        }
+        dim3 grid_z((nx + bx-1)/bx, ny, NUM_SUBSTRATES);
+        lod_z_batched_kernel<<<grid_z, bx>>>(
+            d_conc_, d_thomas_denom_z_, d_thomas_c_z_, d_c1_,
+            nx, ny, nz, V);
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());

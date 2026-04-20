@@ -339,6 +339,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             FLAMEGPU->setVariable<int>("death_reason", 0);  // 0 = natural senescence
             auto* evts = reinterpret_cast<unsigned int*>(FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
             atomicAdd(&evts[EVT_DEATH_CANCER_SEN], 1u);
+            atomicAdd(&evts[EVT_CC_DEATH_NATURAL], 1u);
             return flamegpu::DEAD;
         }
         FLAMEGPU->setVariable<int>("life", life);
@@ -409,6 +410,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             const int death_slot = (cell_state == CANCER_STEM) ? EVT_DEATH_CANCER_STEM :
                                    (cell_state == CANCER_PROGENITOR) ? EVT_DEATH_CANCER_PROG : EVT_DEATH_CANCER_SEN;
             atomicAdd(&evts[death_slot], 1u);
+            atomicAdd(&evts[EVT_CC_DEATH_T_KILL], 1u);
             return flamegpu::DEAD;
         }
     }
@@ -456,6 +458,7 @@ FLAMEGPU_AGENT_FUNCTION(cancer_cell_state_step, flamegpu::MessageNone, flamegpu:
             const int death_slot = (cell_state == CANCER_STEM) ? EVT_DEATH_CANCER_STEM :
                                    (cell_state == CANCER_PROGENITOR) ? EVT_DEATH_CANCER_PROG : EVT_DEATH_CANCER_SEN;
             atomicAdd(&evts[death_slot], 1u);
+            atomicAdd(&evts[EVT_CC_DEATH_MAC_KILL], 1u);
             return flamegpu::DEAD;
         }
     }

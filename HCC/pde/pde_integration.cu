@@ -1175,37 +1175,27 @@ FLAMEGPU_HOST_FUNCTION(update_ecm_grid) {
 // ============================================================================
 FLAMEGPU_HOST_FUNCTION(aggregate_abm_events) {
     nvtxRangePush("Aggregate ABM Events");
+
+    // Read the 3 cancer death-by-cause counters directly from the device event counter
+    // array (populated via atomicAdd in cancer_cell death sites). Replaces a full
+    // DeviceAgentVector copy + CPU iteration over ~100k cancer agents.
+    auto* d_evts = reinterpret_cast<unsigned int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("event_counters_ptr"));
+
+    unsigned int h_evts[ABM_EVENT_COUNTER_SIZE];
+    cudaMemcpy(h_evts, d_evts,
+               ABM_EVENT_COUNTER_SIZE * sizeof(unsigned int),
+               cudaMemcpyDeviceToHost);
+
+    const int cc_death_natural  = static_cast<int>(h_evts[EVT_CC_DEATH_NATURAL]);
+    const int cc_death_t_kill   = static_cast<int>(h_evts[EVT_CC_DEATH_T_KILL]);
+    const int cc_death_mac_kill = static_cast<int>(h_evts[EVT_CC_DEATH_MAC_KILL]);
+    const int cc_death_total    = cc_death_natural + cc_death_t_kill + cc_death_mac_kill;
+
     auto counters = FLAMEGPU->environment.getMacroProperty<int, ABM_EVENT_COUNTER_SIZE>("abm_event_counters");
-    auto cc_api = FLAMEGPU->agent("CancerCell");
-
-    // Get population data for iteration
-    flamegpu::DeviceAgentVector cc_agents = cc_api.getPopulationData();
-    const unsigned int cc_count = cc_agents.size();
-
-    // Count cancer cell deaths by cause from dead agents
-    int cc_death_total = 0;
-    int cc_death_natural = 0;
-    int cc_death_t_kill = 0;
-    int cc_death_mac_kill = 0;
-
-    for (unsigned int i = 0; i < cc_count; i++) {
-        if (cc_agents[i].getVariable<int>("dead") != 0) {
-            cc_death_total++;
-            int reason = cc_agents[i].getVariable<int>("death_reason");
-            if (reason == 0) {
-                cc_death_natural++;
-            } else if (reason == 1) {
-                cc_death_t_kill++;
-            } else if (reason == 2) {
-                cc_death_mac_kill++;
-            }
-        }
-    }
-
-    // Update counter MacroProperty with aggregated values
-    counters[ABM_COUNT_CC_DEATH] = cc_death_total;
-    counters[ABM_COUNT_CC_DEATH_NATURAL] = cc_death_natural;
-    counters[ABM_COUNT_CC_DEATH_T_KILL] = cc_death_t_kill;
+    counters[ABM_COUNT_CC_DEATH]          = cc_death_total;
+    counters[ABM_COUNT_CC_DEATH_NATURAL]  = cc_death_natural;
+    counters[ABM_COUNT_CC_DEATH_T_KILL]   = cc_death_t_kill;
     counters[ABM_COUNT_CC_DEATH_MAC_KILL] = cc_death_mac_kill;
     nvtxRangePop();
 }

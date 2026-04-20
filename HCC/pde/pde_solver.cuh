@@ -143,6 +143,7 @@ private:
 
     // Per-substrate c1 = dt*D/dx² values (for LOD kernel arguments)
     float h_c1_[NUM_SUBSTRATES];
+    float* d_c1_;  // [NUM_SUBSTRATES] device copy for batched kernels
 
     // Precompute Thomas coefficients on host and upload
     void precompute_thomas_coefficients();

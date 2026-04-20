@@ -341,14 +341,25 @@ FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu
     const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
     const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
     const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+    const int grid_xy = grid_x * grid_y;
 
     const float scale = (cell_state == FIB_CAF) ? 1.0f : 0.5f;
 
-    const int radius = 10;
-    const float variance = 9.0f;  // sigma^2 = 3^2
-    const float normalizer = 0.014784f;
+    constexpr int radius = 10;
+    constexpr float variance = 9.0f;       // sigma^2 = 3^2
+    constexpr float normalizer = 0.014784f;
+    constexpr int r2 = radius * radius;
 
-    float* field_ptr = reinterpret_cast<float*>(
+    // Separable Gaussian: exp(-(dx²+dy²+dz²)/(2σ²)) = k1d[|dx|]·k1d[|dy|]·k1d[|dz|].
+    // Replaces 9261 expf()/segment with 11 expf() + cheap multiplies.
+    float k1d[radius + 1];
+    #pragma unroll
+    for (int i = 0; i <= radius; i++) {
+        k1d[i] = expf(-static_cast<float>(i * i) / (2.0f * variance));
+    }
+    const float s_n = scale * normalizer;
+
+    float* __restrict__ field_ptr = reinterpret_cast<float*>(
         FLAMEGPU->environment.getProperty<uint64_t>("fib_density_field_ptr"));
 
     for (int seg = 0; seg < chain_len; seg++) {
@@ -356,18 +367,27 @@ FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu
         const int cy = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", seg);
         const int cz = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", seg);
 
-        for (int dx = -radius; dx <= radius; dx++) {
-            const int nx = cx + dx;
-            if (nx < 0 || nx >= grid_x) continue;
+        for (int dz = -radius; dz <= radius; dz++) {
+            const int nz = cz + dz;
+            if (nz < 0 || nz >= grid_z) continue;
+            const int dz2 = dz * dz;
+            const float kz = k1d[dz < 0 ? -dz : dz];
+            const int z_base = nz * grid_xy;
+
             for (int dy = -radius; dy <= radius; dy++) {
                 const int ny = cy + dy;
                 if (ny < 0 || ny >= grid_y) continue;
-                for (int dz = -radius; dz <= radius; dz++) {
-                    const int nz = cz + dz;
-                    if (nz < 0 || nz >= grid_z) continue;
-                    float dist_sq = static_cast<float>(dx * dx + dy * dy + dz * dz);
-                    float kernel_val = scale * normalizer * expf(-dist_sq / (2.0f * variance));
-                    atomicAdd(&field_ptr[nz * (grid_x * grid_y) + ny * grid_x + nx], kernel_val);
+                const int dy2_dz2 = dy * dy + dz2;
+                if (dy2_dz2 > r2) continue;  // spherical cull: whole dx row outside
+                const float kyz = kz * k1d[dy < 0 ? -dy : dy];
+                const int row_base = z_base + ny * grid_x;
+
+                for (int dx = -radius; dx <= radius; dx++) {
+                    const int nx = cx + dx;
+                    if (nx < 0 || nx >= grid_x) continue;
+                    if (dx * dx + dy2_dz2 > r2) continue;  // spherical cull
+                    const float kernel_val = s_n * kyz * k1d[dx < 0 ? -dx : dx];
+                    atomicAdd(&field_ptr[row_base + nx], kernel_val);
                 }
             }
         }

@@ -123,7 +123,11 @@ enum EventCounterIdx : int {
     EVT_DEATH_VAS_PHALANX,
     // PDL1 expression numerator (divide by total cancer for PDL1_frac)
     EVT_PDL1_COUNT,
-    ABM_EVENT_COUNTER_SIZE    // = 31
+    // Cancer deaths by cause (QSP coupling: replaces CPU agent iteration in aggregate_abm_events)
+    EVT_CC_DEATH_NATURAL,
+    EVT_CC_DEATH_T_KILL,
+    EVT_CC_DEATH_MAC_KILL,
+    ABM_EVENT_COUNTER_SIZE    // = 34
 };
 
 // ── Per-step population counts by state (device_state_counters[], env prop "state_counters_ptr") ─
