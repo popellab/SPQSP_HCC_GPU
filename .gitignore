@@ -19,6 +19,7 @@ CLAUDE.md
 /HCC/sim/external/
 /HCC/profiling/
 /figures/
+/HCC/calibration/results/
 *.png
 .venv/
 *.db

@@ -151,7 +151,7 @@ def cmd_abc(args: argparse.Namespace) -> int:
         b = np.asarray(x0["summary"], dtype=np.float64)
         if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
             return float("inf")
-        return float(np.mean((a - b) ** 2))
+        return float(np.sqrt(np.sum((a - b) ** 2)))
 
     prior_dict = {
         key: pyabc.RV("uniform", lo, hi - lo)

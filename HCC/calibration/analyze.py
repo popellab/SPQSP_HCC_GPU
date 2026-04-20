@@ -235,15 +235,28 @@ def plot_corner(history, truth: dict[str, float], out: Path) -> None:
                 if ki in truth:
                     ax.axvline(truth[ki], color="red", lw=1.5)
             elif i > j:
+                from scipy.stats import gaussian_kde
                 x = np.asarray(df[kj].values, dtype=np.float64)
                 y = np.asarray(df[ki].values, dtype=np.float64)
-                sz = 4 + 200 * w / (w.max() if w.max() > 0 else 1)
-                ax.scatter(x, y, s=sz, alpha=0.5, color="tab:blue", edgecolors="none")
+                xlo, xhi = PARAM_BOUNDS[kj]
+                ylo, yhi = PARAM_BOUNDS[ki]
+                try:
+                    kde = gaussian_kde(np.vstack([x, y]), weights=w)
+                    gx = np.linspace(xlo, xhi, 60)
+                    gy = np.linspace(ylo, yhi, 60)
+                    GX, GY = np.meshgrid(gx, gy)
+                    Z = kde(np.vstack([GX.ravel(), GY.ravel()])).reshape(GX.shape)
+                    ax.contourf(GX, GY, Z, levels=8, cmap="Blues")
+                    ax.contour(GX, GY, Z, levels=8, colors="steelblue",
+                               linewidths=0.4, alpha=0.6)
+                except np.linalg.LinAlgError:
+                    # Degenerate distribution — fall back to scatter
+                    ax.scatter(x, y, s=6, alpha=0.4, color="tab:blue", edgecolors="none")
                 if kj in truth and ki in truth:
                     ax.axvline(truth[kj], color="red", lw=1, alpha=0.7)
                     ax.axhline(truth[ki], color="red", lw=1, alpha=0.7)
-                ax.set_xlim(*PARAM_BOUNDS[kj])
-                ax.set_ylim(*PARAM_BOUNDS[ki])
+                ax.set_xlim(xlo, xhi)
+                ax.set_ylim(ylo, yhi)
             else:
                 ax.set_visible(False)
 
@@ -372,7 +385,7 @@ def plot_posterior_predictive(ppc: dict[str, Any], out: Path) -> None:
     target = np.asarray(ppc["target"], dtype=np.float64)
     n_pairs = len(PAIR_NAMES)
 
-    fig, ax = plt.subplots(figsize=(max(6, 1.8 * n_pairs), 5))
+    fig, ax = plt.subplots(figsize=(max(8, 2.2 * n_pairs), 6))
     positions = np.arange(n_pairs) + 1
     bp = ax.boxplot(
         [summaries[:, p] for p in range(n_pairs)],
@@ -389,20 +402,21 @@ def plot_posterior_predictive(ppc: dict[str, Any], out: Path) -> None:
         jitter = np.random.default_rng(p).uniform(-0.12, 0.12, size=summaries.shape[0])
         ax.scatter(np.full(summaries.shape[0], positions[p]) + jitter,
                    summaries[:, p],
-                   s=10, alpha=0.35, color="tab:blue", edgecolors="none")
+                   s=16, alpha=0.35, color="tab:blue", edgecolors="none")
     # Target
-    ax.scatter(positions, target, marker="X", s=110, color="red",
-               edgecolors="black", linewidths=0.6, zorder=5, label="target")
+    ax.scatter(positions, target, marker="X", s=180, color="red",
+               edgecolors="black", linewidths=0.8, zorder=5, label="target")
     short_names = [n.replace("Reference_", "").replace("_Weight_", "\n→ ") for n in PAIR_NAMES]
     ax.set_xticks(positions)
-    ax.set_xticklabels(short_names, fontsize=9)
-    ax.set_ylabel("Interaction weight")
-    ax.legend(fontsize=8, loc="best")
+    ax.set_xticklabels(short_names, fontsize=13)
+    ax.set_ylabel("Interaction weight", fontsize=14)
+    ax.tick_params(axis="y", labelsize=12)
+    ax.legend(fontsize=12, loc="best")
     ax.grid(True, axis="y", alpha=0.3)
     fig.suptitle(
         f"Posterior predictive check  "
         f"(N={summaries.shape[0]}, failed={ppc['failed']})",
-        y=1.02,
+        fontsize=14, y=1.02,
     )
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -469,6 +483,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Base seed for PPC simulations (each draw uses base + i)")
     p.add_argument("--ppc-rng-seed", type=int, default=0,
                    help="Seed for the weighted resampling of particles")
+    p.add_argument("--ppc-json", default=None, metavar="PATH",
+                   help="Re-plot posterior_predictive.png from an existing "
+                        "posterior_predictive.json (skips simulation, no GPU needed).")
     args = p.parse_args(argv)
 
     target_payload = json.loads(Path(args.target).read_text())
@@ -496,7 +513,17 @@ def main(argv: list[str] | None = None) -> int:
     plot_funcn_distance_by_pair(history, target_vec, pops, out_dir / "funcn_distance_by_pair.png")
     write_posterior_summary(history, truth, out_dir / "posterior_summary.txt")
 
-    if args.ppc > 0:
+    if args.ppc_json:
+        print(f"Re-plotting posterior predictive from {args.ppc_json} ...")
+        raw = json.loads(Path(args.ppc_json).read_text())
+        ppc_replot = {
+            "params": raw["params"],
+            "summaries": np.asarray(raw["summaries"], dtype=np.float64),
+            "target": np.asarray(raw["target"], dtype=np.float64),
+            "failed": int(raw.get("failed", 0)),
+        }
+        plot_posterior_predictive(ppc_replot, out_dir / "posterior_predictive.png")
+    elif args.ppc > 0:
         grid = target_payload.get("grid")
         print(f"Running posterior predictive check: {args.ppc} simulations...")
         ppc = run_posterior_predictive(

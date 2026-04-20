@@ -6,6 +6,9 @@
 #SBATCH --time=1:00:00
 #SBATCH --output=hcc_%j.out
 #SBATCH --error=hcc_%j.err
+#SBATCH --account=bgre-delta-gpu
+#SBATCH --partition=gpuA100x4
+#SBATCH --gres=gpu:1
 
 # ============================================================================
 # SPQSP HCC — Cluster-agnostic SLURM submission script

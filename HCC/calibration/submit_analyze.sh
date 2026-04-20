@@ -101,6 +101,17 @@ echo "  Figures:  ${FIG_DIR}"
 echo "  PPC_N:    ${PPC_N}"
 echo "============================================================"
 
+# ── Build (keep binary in sync with source) ─────────────────────────────────
+echo ""
+echo "── Building hcc binary ───────────────────────────────────"
+cd "${SIM_DIR}"
+./build.sh --cuda-arch 80 -j 4
+if [[ ! -x "${HCC_BIN}" ]]; then
+    echo "ERROR: build completed but ${HCC_BIN} is not executable." >&2
+    exit 1
+fi
+echo "  binary: ${HCC_BIN}"
+
 # Runs are invoked from the repo root so module paths resolve.
 cd "${REPO_ROOT}"
 

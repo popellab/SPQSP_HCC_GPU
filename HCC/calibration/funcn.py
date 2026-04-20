@@ -6,7 +6,8 @@ on target type T is:
 
     w_S(i) = sum_{j != i, j in S} K(d_ij) / sum_{j != i} K(d_ij)
 
-where K is a 2D Gaussian kernel with bandwidth sigma (default 10 um) and d_ij
+where K is a 2D Gaussian kernel with bandwidth sigma (default 10 um, matching the
+manuscript) and d_ij
 is the 2D Euclidean distance.  The per-slice interaction matrix entry (T, S) is
 the mean of w_S(i) over all cells i of type T.  The final summary averages
 these matrices across all z-slices.
@@ -38,7 +39,7 @@ from .abm_reader import (
     TREG_TREG,
 )
 
-DEFAULT_SIGMA_UM = 20.0
+DEFAULT_SIGMA_UM = 10.0
 DEFAULT_VOXEL_UM = 20.0
 
 # Cell type labels used in the interaction matrix, matching the reference R code.
