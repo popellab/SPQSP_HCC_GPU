@@ -32,7 +32,8 @@ namespace HCC {
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_pde_step;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER update_agent_counts;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER solve_qsp_step;
-extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER zero_fib_density_field;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER reset_fib_seg_counter;
+extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER fib_density_gather;
 // fib_execute_divide removed: activation is now device-side (fib_activate)
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER aggregate_abm_events;
 extern flamegpu::FLAMEGPU_HOST_FUNCTION_POINTER copy_abm_counters_to_environment;
@@ -47,15 +48,20 @@ void defineMainModelLayers(flamegpu::ModelDescription& model) {
         layer.addHostFunction(timing_step_start);
     }
 
-    // 1. ECM update: zero density field, scatter fibroblast Gaussian kernels, apply decay + secretion.
+    // 1. ECM update: pack fib segments into flat arrays, run thread-per-voxel
+    //    gather kernel to build Gaussian density field, then decay + secretion.
     //    Matches HCC update_ECM() which runs first in timeSlice before recruitment.
     {
-        flamegpu::LayerDescription layer = model.newLayer("zero_fib_density_field");
-        layer.addHostFunction(zero_fib_density_field);
+        flamegpu::LayerDescription layer = model.newLayer("reset_fib_seg_counter");
+        layer.addHostFunction(reset_fib_seg_counter);
     }
     {
-        flamegpu::LayerDescription layer = model.newLayer("build_density_field");
-        layer.addAgentFunction(AGENT_FIBROBLAST, "build_density_field");
+        flamegpu::LayerDescription layer = model.newLayer("fib_pack_segments");
+        layer.addAgentFunction(AGENT_FIBROBLAST, "pack_segments");
+    }
+    {
+        flamegpu::LayerDescription layer = model.newLayer("fib_density_gather");
+        layer.addHostFunction(fib_density_gather);
     }
     {
         flamegpu::LayerDescription layer = model.newLayer("update_ecm");

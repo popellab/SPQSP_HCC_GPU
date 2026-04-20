@@ -463,7 +463,7 @@ void defineFibroblastAgent(flamegpu::ModelDescription& model, bool include_state
         fib.newFunction("state_step", fib_state_step)
             .setAllowAgentDeath(true);
         fib.newFunction("activate", fib_activate);
-        fib.newFunction("build_density_field", fib_build_density_field);
+        fib.newFunction("pack_segments", fib_pack_segments);
     }
 }
 

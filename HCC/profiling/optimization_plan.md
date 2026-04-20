@@ -118,14 +118,45 @@ Single call taking 6 ms for a ~100k agent reduction. Suspiciously slow.
 | 1 — ECM density separable Gaussian | `agents/fibroblast.cuh` | 15.4 | 8.3 | 30.5 → 8–12 |
 | 2 — PDE solver substrate batching | `pde/pde_solver.cu/.cuh` | 24.8 | 6.7 | 24.3 → 6–8 |
 | 5 — ABM events aggregate (device counters) | `agents/cancer_cell.cuh`, `pde/pde_integration.cu`, `core/common.cuh` | ~6 (est) | <0.1 | 6 → <0.5 |
+| 6 — Fibroblast density thread-per-voxel gather | `agents/fibroblast.cuh`, `pde/pde_integration.cu`, `core/common.cuh`, `sim/model_{layers,definition}.cu` | 8.60 | 1.30 | 5.17 ms total → ~1 ms |
+| 7 — `lod_x_batched_kernel` shared-mem tiling (coalesced) | `pde/pde_solver.cu` | 6.50 | 4.38 | 1037 ms → ~300 ms (matches lod_y/z) |
 
-**Local wall time 280 steps g=50 G=3:** 22s → 15.8s (−28%).
+**Local wall time 100 steps g=50 G=3:** baseline 31.9 ms/step → 30.5 ms/step (−4.2%) after Phase 7 (on top of Phases 1/2/5/6). PDE solve: 6.50 → 4.38 ms/step (−33%).
+**Local wall time 280 steps g=50 G=3 (Phases 1–5 only):** 22s → 15.8s (−28%).
 **Correctness:** voxel-level diff between Phase 2 and Phase 2-rerun equals diff between Phase 1 and Phase 2 → all variation is RNG divergence, not a numerical bug. Final population counts and QSP trajectories stay in distribution across runs.
 
-### Remaining / deferred
-- **Priority 3 (memset audit)**: most user-code memsets run once/step, not per-substep. Local reward ~1 ms/step; deferred.
-- **Priority 4 (launch overhead)**: Phase 2 already cut PDE launches ~10× (480 → 48/substep group). Movement substep consolidation is biology-invariant; skip.
-- Next measurement: re-capture Delta A100 profile (`sbatch --export=ALL,NSYS=1 submit.sh -s 280 -g 50 -G 3`).
+## Delta A100 measured (v1 vs v2, 2026-04-20, 280 steps g=50 -G 3)
+
+| Metric | v1 | v2 | Speedup | Δ ms/step |
+|---|---|---|---|---|
+| ABM Step (NVTX wall) | 90.2 ms/step | 61.3 ms/step | 1.47× | **−28.9** |
+| Phase 1 — `fib_build_density_field_impl` | 10,199 ms | 5,170 ms | 2.0× | −17.9 |
+| Phase 2 — LOD x+y+z total | 7,154 ms | 1,623 ms | 4.4× | −19.8 |
+| Phase 2 — `apply_sources_uptakes` | 332 ms | 101 ms | 3.3× | −0.8 |
+| Phase 2 — `PDE Solve` NVTX range | 24.25 ms/step | 5.58 ms/step | 4.3× | −18.7 |
+| Phase 5 — `Aggregate ABM Events` | 2,020 ms | 12.6 ms | 160× | −7.2 |
+
+**Host-side API** (Priority 4 indirect): `cudaStreamSynchronize` 13.3 → 8.15 s (−39%); `cudaDeviceSynchronize` 6.61 → 1.77 s (−73%); `cudaLaunchKernel` 562k → 128k calls (−77%).
+
+**Memory** (Priority 3 deferred, as planned): memset/memcpy totals essentially unchanged.
+
+### Remaining opportunities (v2 Delta profile)
+- `fib_build_density_field_impl` still **45% of GPU time** (5170 ms). Thread-per-voxel gather (original plan P1 option) could give another 2–3×. **→ addressed in Phase 6 (local: 6.6× on ECM layer)**
+- `lod_x_batched_kernel` avg 86 µs vs `lod_y/z_batched` avg 24 µs — **3.5× asymmetry** suggests uncoalesced x-axis access in the batched kernel. Straightforward follow-up. **→ addressed in Phase 7 (local: PDE solve −33%)**
+- Priority 3 (memset audit): still deferred — now ~20% of total memory-op time, low absolute reward.
+- Priority 4 (launch overhead): already recovered most of it via Phase 2 batching.
+
+### Next local targets after Phase 7
+With ECM and PDE now sub-5 ms each, the next bars (local) are:
+- `movement` 9.7 ms/step (~32% of step) — 5–6 interleaved move layers per step; each agent type has its own move kernel. Consolidation is possible but biology-invariant changes are risky.
+- `qsp_solve_ms` 5.1 ms/step — CPU CVODE, deferred (Priority 4 of original plan).
+- `state_sources` 3.5 ms/step
+- `division` 2.4 ms/step
+- `broadcast_scan` 2.1 ms/step
+
+### Artifacts
+- `v1/hcc_prof.nsys-rep` — Delta baseline (pre-optimization)
+- `v2/hcc_prof.nsys-rep` — Delta post Phase 1/2/5
 
 ## Reference files
 

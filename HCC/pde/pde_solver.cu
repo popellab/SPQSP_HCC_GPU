@@ -212,6 +212,12 @@ __global__ void apply_sources_uptakes_batched_kernel(
     C_base[off] = fmaxf(0.0f, p_new);
 }
 
+// lod_x: threads parallelize over j (rows), but C is contiguous along i (columns).
+// Naive version has 32 threads stride nx*4B apart → uncoalesced global access.
+// Tiled version: block cooperatively loads 32 rows into shared memory (coalesced
+// along i), runs Thomas on each row in smem (one thread per row), writes back
+// coalesced. Shared memory row stride (nx+1) pads to avoid bank conflicts since
+// gcd(nx+1, 32) may equal 1 (holds for nx=50 → 51).
 __global__ void lod_x_batched_kernel(
     float* __restrict__ C_base,
     const float* __restrict__ denom_base,  // [NUM_SUBSTRATES * nx]
@@ -219,25 +225,53 @@ __global__ void lod_x_batched_kernel(
     const float* __restrict__ c1_arr,      // [NUM_SUBSTRATES]
     int nx, int ny, int nz, int V)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int k = blockIdx.y;
-    int s = blockIdx.z;
-    if (j >= ny) return;
+    constexpr int BLOCK_J = 32;
+    extern __shared__ float smem[];  // [BLOCK_J * (nx+1)]
 
-    float c1 = c1_arr[s];
-    if (c1 == 0.0f) return;  // non-diffusing substrate: skip LOD entirely
+    const int j0  = blockIdx.x * BLOCK_J;
+    const int k   = blockIdx.y;
+    const int s   = blockIdx.z;
+    const int tid = threadIdx.x;
 
-    float* line = C_base + (size_t)s * V + (size_t)k * ny*nx + (size_t)j * nx;
+    const float c1 = c1_arr[s];
+    if (c1 == 0.0f) return;
+
+    const int rows = min(BLOCK_J, ny - j0);
+    const int stride_smem = nx + 1;
+
+    float* C_slice = C_base + (size_t)s * V + (size_t)k * ny * nx;
     const float* denom = denom_base + s * nx;
     const float* cx    = cx_base    + s * nx;
 
-    line[0] /= denom[0];
-    for (int i = 1; i < nx; i++) {
-        line[i] += c1 * line[i-1];
-        line[i] /= denom[i];
+    // Coalesced load: for each row, 32 threads stream along contiguous i.
+    for (int r = 0; r < rows; r++) {
+        const float* row_src = C_slice + (size_t)(j0 + r) * nx;
+        for (int i = tid; i < nx; i += BLOCK_J) {
+            smem[r * stride_smem + i] = row_src[i];
+        }
     }
-    for (int i = nx-2; i >= 0; i--) {
-        line[i] -= cx[i] * line[i+1];
+    __syncthreads();
+
+    // Thomas sweep on shared memory; one thread per row.
+    if (tid < rows) {
+        float* line = smem + tid * stride_smem;
+        line[0] /= denom[0];
+        for (int i = 1; i < nx; i++) {
+            line[i] += c1 * line[i-1];
+            line[i] /= denom[i];
+        }
+        for (int i = nx - 2; i >= 0; i--) {
+            line[i] -= cx[i] * line[i+1];
+        }
+    }
+    __syncthreads();
+
+    // Coalesced writeback.
+    for (int r = 0; r < rows; r++) {
+        float* row_dst = C_slice + (size_t)(j0 + r) * nx;
+        for (int i = tid; i < nx; i += BLOCK_J) {
+            row_dst[i] = smem[r * stride_smem + i];
+        }
     }
 }
 
@@ -533,7 +567,8 @@ void PDESolver::solve_timestep() {
     {
         const int bx = 32;
         dim3 grid_x((ny + bx-1)/bx, nz, NUM_SUBSTRATES);
-        lod_x_batched_kernel<<<grid_x, bx>>>(
+        size_t smem_x = bx * (nx + 1) * sizeof(float);
+        lod_x_batched_kernel<<<grid_x, bx, smem_x>>>(
             d_conc_, d_thomas_denom_x_, d_thomas_c_x_, d_c1_,
             nx, ny, nz, V);
 

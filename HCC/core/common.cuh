@@ -86,6 +86,7 @@ constexpr int MAX_MDSC_PER_VOXEL = 1;           // Max MDSC per voxel (exclusive
 constexpr int N_DIVIDE_WAVES = 1;               // Wave-interleaved division rounds (cancer/tcell/treg)
 constexpr int MAX_MAC_PER_VOXEL = 1;            // Max macrophage per voxel (exclusive)
 constexpr int MAX_FIB_CHAIN_LENGTH = 5;         // Max segments per fibroblast chain (3 normal, 5 CAF)
+constexpr int MAX_FIB_SEGMENTS = 131072;        // Cap for packed fib-segment flat buffer (gather kernel)
 // ── Per-step event counters (device_event_counters[], env prop "event_counters_ptr") ──────────────
 // Reset each step. Written by agent device functions via atomicAdd.
 enum EventCounterIdx : int {

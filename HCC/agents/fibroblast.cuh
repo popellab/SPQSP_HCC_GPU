@@ -331,66 +331,43 @@ FLAMEGPU_AGENT_FUNCTION(fib_activate, flamegpu::MessageNone, flamegpu::MessageNo
 }
 
 // ============================================================================
-// Fibroblast: Build Gaussian density field for ECM deposition
-// Iterates over all chain_len segments, scattering a Gaussian kernel per segment.
+// Fibroblast: Pack chain segments into flat device arrays for gather kernel.
+// Thread-per-agent; atomicAdd on a single counter to claim base index, then
+// writes chain_len entries. The actual Gaussian deposition is performed by the
+// thread-per-voxel fib_density_gather kernel (in pde_integration.cu).
 // ============================================================================
-FLAMEGPU_AGENT_FUNCTION(fib_build_density_field, flamegpu::MessageNone, flamegpu::MessageNone) {
+FLAMEGPU_AGENT_FUNCTION(fib_pack_segments, flamegpu::MessageNone, flamegpu::MessageNone) {
     const int chain_len = FLAMEGPU->getVariable<int>("chain_len");
+    if (chain_len <= 0) return flamegpu::ALIVE;
+
     const int cell_state = FLAMEGPU->getVariable<int>("cell_state");
-
-    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
-    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
-    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
-    const int grid_xy = grid_x * grid_y;
-
     const float scale = (cell_state == FIB_CAF) ? 1.0f : 0.5f;
-
-    constexpr int radius = 10;
-    constexpr float variance = 9.0f;       // sigma^2 = 3^2
     constexpr float normalizer = 0.014784f;
-    constexpr int r2 = radius * radius;
+    const float w = scale * normalizer;
 
-    // Separable Gaussian: exp(-(dx²+dy²+dz²)/(2σ²)) = k1d[|dx|]·k1d[|dy|]·k1d[|dz|].
-    // Replaces 9261 expf()/segment with 11 expf() + cheap multiplies.
-    float k1d[radius + 1];
-    #pragma unroll
-    for (int i = 0; i <= radius; i++) {
-        k1d[i] = expf(-static_cast<float>(i * i) / (2.0f * variance));
-    }
-    const float s_n = scale * normalizer;
+    int* __restrict__ seg_x = reinterpret_cast<int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("fib_seg_x_ptr"));
+    int* __restrict__ seg_y = reinterpret_cast<int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("fib_seg_y_ptr"));
+    int* __restrict__ seg_z = reinterpret_cast<int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("fib_seg_z_ptr"));
+    float* __restrict__ seg_w = reinterpret_cast<float*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("fib_seg_w_ptr"));
+    int* __restrict__ counter = reinterpret_cast<int*>(
+        FLAMEGPU->environment.getProperty<uint64_t>("fib_seg_count_ptr"));
 
-    float* __restrict__ field_ptr = reinterpret_cast<float*>(
-        FLAMEGPU->environment.getProperty<uint64_t>("fib_density_field_ptr"));
+    const int base = atomicAdd(counter, chain_len);
+    if (base + chain_len > MAX_FIB_SEGMENTS) return flamegpu::ALIVE;  // overflow — drop
 
-    for (int seg = 0; seg < chain_len; seg++) {
-        const int cx = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", seg);
-        const int cy = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", seg);
-        const int cz = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", seg);
-
-        for (int dz = -radius; dz <= radius; dz++) {
-            const int nz = cz + dz;
-            if (nz < 0 || nz >= grid_z) continue;
-            const int dz2 = dz * dz;
-            const float kz = k1d[dz < 0 ? -dz : dz];
-            const int z_base = nz * grid_xy;
-
-            for (int dy = -radius; dy <= radius; dy++) {
-                const int ny = cy + dy;
-                if (ny < 0 || ny >= grid_y) continue;
-                const int dy2_dz2 = dy * dy + dz2;
-                if (dy2_dz2 > r2) continue;  // spherical cull: whole dx row outside
-                const float kyz = kz * k1d[dy < 0 ? -dy : dy];
-                const int row_base = z_base + ny * grid_x;
-
-                for (int dx = -radius; dx <= radius; dx++) {
-                    const int nx = cx + dx;
-                    if (nx < 0 || nx >= grid_x) continue;
-                    if (dx * dx + dy2_dz2 > r2) continue;  // spherical cull
-                    const float kernel_val = s_n * kyz * k1d[dx < 0 ? -dx : dx];
-                    atomicAdd(&field_ptr[row_base + nx], kernel_val);
-                }
-            }
-        }
+    for (int i = 0; i < chain_len; i++) {
+        const int cx = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_x", i);
+        const int cy = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_y", i);
+        const int cz = FLAMEGPU->getVariable<int, MAX_FIB_CHAIN_LENGTH>("seg_z", i);
+        const int dst = base + i;
+        seg_x[dst] = cx;
+        seg_y[dst] = cy;
+        seg_z[dst] = cz;
+        seg_w[dst] = w;
     }
 
     return flamegpu::ALIVE;

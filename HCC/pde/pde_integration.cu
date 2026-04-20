@@ -56,6 +56,16 @@ static unsigned int* d_vas_tip_id_grid = nullptr;
 static float* d_ecm_grid = nullptr;
 static float* d_fib_density_field = nullptr;
 
+// Packed fibroblast-segment buffers for thread-per-voxel gather kernel.
+// fib_pack_segments (agent fn) atomicAdds d_fib_seg_count to claim a base index,
+// then writes chain_len entries (x,y,z, weight) into the flat arrays.
+// fib_density_gather_kernel then reads these and writes every voxel of d_fib_density_field.
+static int*   d_fib_seg_x = nullptr;
+static int*   d_fib_seg_y = nullptr;
+static int*   d_fib_seg_z = nullptr;
+static float* d_fib_seg_w = nullptr;
+static int*   d_fib_seg_count = nullptr;
+
 // Flat occupancy arrays for GPU recruitment kernel (populated by agent write_to_occ_grid).
 // d_t_occ: T cell + TReg count per voxel (only CELL_TYPE_T and CELL_TYPE_TREG increment).
 //          Used with d_cancer_occ for combined cap check matching HCC isOpenToType logic.
@@ -255,6 +265,14 @@ void initialize_pde_solver(int grid_x, int grid_y, int grid_z,
     CUDA_CHECK(cudaMalloc(&d_fib_density_field, total_voxels * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_fib_density_field, 0, total_voxels * sizeof(float)));
 
+    // Packed fib-segment buffers (thread-per-voxel gather pipeline).
+    CUDA_CHECK(cudaMalloc(&d_fib_seg_x, MAX_FIB_SEGMENTS * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_fib_seg_y, MAX_FIB_SEGMENTS * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_fib_seg_z, MAX_FIB_SEGMENTS * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_fib_seg_w, MAX_FIB_SEGMENTS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_fib_seg_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_fib_seg_count, 0, sizeof(int)));
+
     // Allocate flat occupancy arrays for GPU recruitment kernel
     CUDA_CHECK(cudaMalloc(&d_t_occ, total_voxels * sizeof(unsigned int)));
     CUDA_CHECK(cudaMemset(d_t_occ, 0, total_voxels * sizeof(unsigned int)));
@@ -332,6 +350,18 @@ void set_pde_pointers_in_environment(flamegpu::ModelDescription& model) {
     model.Environment().newProperty<unsigned long long>("fib_density_field_ptr",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_density_field)));
 
+    // Packed fib-segment pointers — read by fib_pack_segments agent fn.
+    model.Environment().newProperty<unsigned long long>("fib_seg_x_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_seg_x)));
+    model.Environment().newProperty<unsigned long long>("fib_seg_y_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_seg_y)));
+    model.Environment().newProperty<unsigned long long>("fib_seg_z_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_seg_z)));
+    model.Environment().newProperty<unsigned long long>("fib_seg_w_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_seg_w)));
+    model.Environment().newProperty<unsigned long long>("fib_seg_count_ptr",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_fib_seg_count)));
+
     // Store flat occupancy array pointers for GPU recruitment kernel
     model.Environment().newProperty<unsigned long long>("t_occ_ptr",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(d_t_occ)));
@@ -360,6 +390,11 @@ void cleanup_pde_solver() {
         cudaFree(d_fib_density_field);
         d_fib_density_field = nullptr;
     }
+    if (d_fib_seg_x) { cudaFree(d_fib_seg_x); d_fib_seg_x = nullptr; }
+    if (d_fib_seg_y) { cudaFree(d_fib_seg_y); d_fib_seg_y = nullptr; }
+    if (d_fib_seg_z) { cudaFree(d_fib_seg_z); d_fib_seg_z = nullptr; }
+    if (d_fib_seg_w) { cudaFree(d_fib_seg_w); d_fib_seg_w = nullptr; }
+    if (d_fib_seg_count) { cudaFree(d_fib_seg_count); d_fib_seg_count = nullptr; }
     if (d_vas_tip_id_grid) {
         cudaFree(d_vas_tip_id_grid);
         d_vas_tip_id_grid = nullptr;
@@ -1117,15 +1152,126 @@ FLAMEGPU_HOST_FUNCTION(zero_occupancy_grid) {
 }
 
 // ============================================================================
-// Zero Fibroblast Density Field (reset before scatter)
-// Uses cudaMemset on flat device array — no D2H/H2D copy.
+// Fibroblast density: reset segment counter before fib_pack_segments agent fn.
 // ============================================================================
-FLAMEGPU_HOST_FUNCTION(zero_fib_density_field) {
-    nvtxRangePush("Zero Fib Density");
-    if (d_fib_density_field && g_pde_solver) {
-        int total_voxels = g_pde_solver->get_total_voxels();
-        cudaMemset(d_fib_density_field, 0, total_voxels * sizeof(float));
+FLAMEGPU_HOST_FUNCTION(reset_fib_seg_counter) {
+    nvtxRangePush("Reset Fib Seg Counter");
+    if (d_fib_seg_count) {
+        cudaMemsetAsync(d_fib_seg_count, 0, sizeof(int));
     }
+    nvtxRangePop();
+}
+
+// ============================================================================
+// Fibroblast density: thread-per-voxel Gaussian gather kernel.
+// Each thread owns one voxel, loops over packed fib segments (tiled through
+// shared memory), accumulates separable k1d contributions. No atomics on the
+// field, no memset — each voxel written exactly once.
+// ============================================================================
+namespace {
+    constexpr int FIB_GATHER_BLOCK = 256;   // voxels per block
+    constexpr int FIB_GATHER_TILE = 256;    // segments staged per iteration
+    constexpr int FIB_GATHER_RADIUS = 10;
+    constexpr float FIB_GATHER_VARIANCE = 9.0f;
+    constexpr int FIB_GATHER_R2 = FIB_GATHER_RADIUS * FIB_GATHER_RADIUS;
+}
+
+__global__ void fib_density_gather_kernel(
+    float* __restrict__ field,
+    const int* __restrict__ seg_x,
+    const int* __restrict__ seg_y,
+    const int* __restrict__ seg_z,
+    const float* __restrict__ seg_w,
+    int n_seg,
+    int gx, int gy, int gz)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nvox = gx * gy * gz;
+    const int gxy = gx * gy;
+
+    // Per-thread voxel coord (threads past nvox still participate in cooperative loads).
+    const bool active = (idx < nvox);
+    int vx = 0, vy = 0, vz = 0;
+    if (active) {
+        vz = idx / gxy;
+        const int rem = idx - vz * gxy;
+        vy = rem / gx;
+        vx = rem - vy * gx;
+    }
+
+    // Precompute k1d LUT once per thread (11 floats = 44 B — lives in registers).
+    float k1d[FIB_GATHER_RADIUS + 1];
+    #pragma unroll
+    for (int i = 0; i <= FIB_GATHER_RADIUS; i++) {
+        k1d[i] = expf(-static_cast<float>(i * i) / (2.0f * FIB_GATHER_VARIANCE));
+    }
+
+    __shared__ int   s_x[FIB_GATHER_TILE];
+    __shared__ int   s_y[FIB_GATHER_TILE];
+    __shared__ int   s_z[FIB_GATHER_TILE];
+    __shared__ float s_w[FIB_GATHER_TILE];
+
+    float acc = 0.0f;
+
+    for (int tile = 0; tile < n_seg; tile += FIB_GATHER_TILE) {
+        const int n_in_tile = min(FIB_GATHER_TILE, n_seg - tile);
+
+        // Cooperative load of segment tile into shared memory.
+        for (int i = threadIdx.x; i < n_in_tile; i += blockDim.x) {
+            s_x[i] = seg_x[tile + i];
+            s_y[i] = seg_y[tile + i];
+            s_z[i] = seg_z[tile + i];
+            s_w[i] = seg_w[tile + i];
+        }
+        __syncthreads();
+
+        if (active) {
+            for (int j = 0; j < n_in_tile; j++) {
+                const int dz = vz - s_z[j];
+                const int adz = dz < 0 ? -dz : dz;
+                if (adz > FIB_GATHER_RADIUS) continue;
+                const int dy = vy - s_y[j];
+                const int ady = dy < 0 ? -dy : dy;
+                if (ady > FIB_GATHER_RADIUS) continue;
+                const int dx = vx - s_x[j];
+                const int adx = dx < 0 ? -dx : dx;
+                if (adx > FIB_GATHER_RADIUS) continue;
+                const int d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > FIB_GATHER_R2) continue;
+                acc += s_w[j] * k1d[adx] * k1d[ady] * k1d[adz];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) field[idx] = acc;
+}
+
+FLAMEGPU_HOST_FUNCTION(fib_density_gather) {
+    nvtxRangePush("Fib Density Gather");
+    if (!g_pde_solver || !d_fib_density_field) { nvtxRangePop(); return; }
+
+    const int grid_x = FLAMEGPU->environment.getProperty<int>("grid_size_x");
+    const int grid_y = FLAMEGPU->environment.getProperty<int>("grid_size_y");
+    const int grid_z = FLAMEGPU->environment.getProperty<int>("grid_size_z");
+    const int nvox = grid_x * grid_y * grid_z;
+
+    int h_n_seg = 0;
+    cudaMemcpy(&h_n_seg, d_fib_seg_count, sizeof(int), cudaMemcpyDeviceToHost);
+    if (h_n_seg > MAX_FIB_SEGMENTS) {
+        std::cerr << "[WARN] fib seg count " << h_n_seg
+                  << " exceeds MAX_FIB_SEGMENTS=" << MAX_FIB_SEGMENTS
+                  << "; clamping." << std::endl;
+        h_n_seg = MAX_FIB_SEGMENTS;
+    }
+
+    const int blocks = (nvox + FIB_GATHER_BLOCK - 1) / FIB_GATHER_BLOCK;
+    fib_density_gather_kernel<<<blocks, FIB_GATHER_BLOCK>>>(
+        d_fib_density_field,
+        d_fib_seg_x, d_fib_seg_y, d_fib_seg_z, d_fib_seg_w,
+        h_n_seg, grid_x, grid_y, grid_z);
+    cudaDeviceSynchronize();
+
     nvtxRangePop();
 }
 
