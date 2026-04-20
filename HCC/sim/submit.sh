@@ -181,21 +181,28 @@ echo "================================================"
 # Build if needed
 # ============================================================================
 
-# If NSYS=1, also rebuild if the existing binary was not built with NVTX
-NEED_BUILD=0
-if [[ ! -x "${HCC_BIN}" ]]; then
-    NEED_BUILD=1
-elif [[ "${NSYS}" == "1" ]] && [[ -f "${PROJECT_DIR}/build/CMakeCache.txt" ]]; then
-    if ! grep -q "FLAMEGPU_ENABLE_NVTX:BOOL=ON" "${PROJECT_DIR}/build/CMakeCache.txt"; then
+# Always run build.sh — CMake/Ninja's dependency tracking handles incremental
+# compilation (fast when nothing changed; rebuilds touched files after a git pull).
+# This avoids the failure mode where `git pull` updates sources but the existing
+# binary is still used because it "exists".
+#
+# The NVTX flag toggles re-configuration: if the cached NVTX setting does not
+# match the requested one, force-delete CMakeCache.txt so cmake picks up the new
+# value (otherwise -DFLAMEGPU_ENABLE_NVTX changes are ignored).
+if [[ -f "${PROJECT_DIR}/build/CMakeCache.txt" ]]; then
+    CACHED_NVTX=$(grep -oP 'FLAMEGPU_ENABLE_NVTX:BOOL=\K\w+' "${PROJECT_DIR}/build/CMakeCache.txt" || echo "OFF")
+    WANT_NVTX="OFF"
+    [[ "${NSYS}" == "1" ]] && WANT_NVTX="ON"
+    if [[ "${CACHED_NVTX}" != "${WANT_NVTX}" ]]; then
         echo ""
-        echo "=== NSYS=1 but existing binary lacks FLAMEGPU2 NVTX — rebuilding with --nvtx ==="
-        NEED_BUILD=1
+        echo "=== NVTX setting changed (cached=${CACHED_NVTX}, want=${WANT_NVTX}) — invalidating CMake cache ==="
+        rm -f "${PROJECT_DIR}/build/CMakeCache.txt"
     fi
 fi
 
-if [[ "${NEED_BUILD}" == "1" ]]; then
+{
     echo ""
-    echo "=== Building hcc ==="
+    echo "=== Building hcc (incremental) ==="
     cd "${PROJECT_DIR}"
 
     BUILD_ARGS=(--cuda-arch "${CUDA_ARCH}")
@@ -226,7 +233,7 @@ if [[ "${NEED_BUILD}" == "1" ]]; then
     echo ""
     ./build.sh "${BUILD_ARGS[@]}"
     echo ""
-fi
+}
 
 # ============================================================================
 # Run simulation
